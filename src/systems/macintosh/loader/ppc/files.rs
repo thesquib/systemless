@@ -175,6 +175,7 @@ pub(super) fn ppc_pb_get_cat_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     vfs_resources: &[PpcVfsResourceRecord],
     default_dir_id: u32,
+    working_directories: &HashMap<i16, ProcessWorkingDirectory>,
 ) -> i16 {
     let pb = cpu.gpr[3];
     if pb == 0 {
@@ -197,6 +198,21 @@ pub(super) fn ppc_pb_get_cat_info(
     let Some(requested_dir_id) = memory.read_u32_be(pb + 48) else {
         return PPC_PARAM_ERR;
     };
+    // A working directory reference stands in for the volume and, with dirID 0,
+    // the directory. Inside Macintosh: Files (1992), 2-181.
+    let (vref, requested_dir_id) = working_directories.get(&vref).map_or(
+        (vref, requested_dir_id),
+        |record| {
+            (
+                record.volume_ref_num,
+                if requested_dir_id == 0 {
+                    record.dir_id
+                } else {
+                    requested_dir_id
+                },
+            )
+        },
+    );
     let effective_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
     // A negative index selects the directory by ID. ioNamePtr is output-only,
     // including when its buffer does not yet contain a valid Pascal string.
@@ -294,7 +310,9 @@ pub(super) fn ppc_pb_get_cat_info(
     if name_ptr != 0 && !ppc_write_pstring_bytes(memory, name_ptr, &output_name) {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
-    if memory.write_u16_be(pb + 22, resolved_vref as u16).is_none() {
+    // ioVRefNum is input-only here: callers enumerating by index reuse the block
+    // with vRefNum 0 meaning the default directory.
+    if pathname_volume.is_some() && memory.write_u16_be(pb + 22, resolved_vref as u16).is_none() {
         return PPC_PARAM_ERR;
     }
     if ppc_hle_trace_enabled() {
@@ -4119,7 +4137,7 @@ pub(super) fn ppc_open_res_file(
         *last_resource_error = PPC_PARAM_ERR;
         return -1;
     };
-    let normalized_name = ppc_normalize_vfs_path(&decode_mac_roman(&name_bytes));
+    let normalized_name = crate::trap::TrapDispatcher::normalize_hfs_lookup_path(&decode_mac_roman(&name_bytes));
     if normalized_name.is_empty() {
         *last_resource_error = PPC_PARAM_ERR;
         return -1;
