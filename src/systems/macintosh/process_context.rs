@@ -1059,6 +1059,7 @@ pub struct ProcessFileSystemState {
     pub(crate) vfs_directories: SharedProcessValue<Vec<ProcessVfsDirectory>>,
     pub(crate) next_vfs_dir_id: SharedProcessValue<u32>,
     pub(crate) default_dir_id: SharedProcessValue<u32>,
+    pub(crate) native_vfs_catalogue_published: Option<PublishedNativeVfsCatalogue>,
     pub(crate) classic_vfs_metadata: SharedProcessValue<HashMap<String, ProcessVfsMetadata>>,
     pub(crate) classic_locked_files: SharedProcessValue<HashSet<String>>,
     pub(crate) classic_next_vfs_file_id: SharedProcessValue<u32>,
@@ -1088,6 +1089,7 @@ impl Default for ProcessFileSystemState {
             vfs_directories: SharedProcessValue::default(),
             next_vfs_dir_id: SharedProcessValue::from_value(0),
             default_dir_id: SharedProcessValue::from_value(0),
+            native_vfs_catalogue_published: None,
             classic_vfs_metadata: SharedProcessValue::default(),
             classic_locked_files: SharedProcessValue::default(),
             classic_next_vfs_file_id: SharedProcessValue::from_value(32),
@@ -1310,6 +1312,19 @@ impl ProcessFileSystemState {
     /// pp. 2-27--2-29 and 2-85.
     pub(crate) fn publish_native_vfs_catalogue(&mut self) {
         // This runs after every execution slice, so it must not allocate per file.
+        let metadata_len = self.classic_vfs_metadata.with_mut(|metadata| metadata.len());
+        let unchanged = self.native_vfs_catalogue_published.as_ref().is_some_and(|published| {
+            published.matches(
+                &self.vfs_directories,
+                self.vfs_files
+                    .iter()
+                    .map(|file| (&file.path, file.file_type, file.creator, file.finder_flags))
+                    .chain(self.vfs_resource_files.iter().map(|file| {
+                        (&file.path, file.file_type, file.creator, file.finder_flags)
+                    })),
+                metadata_len,
+            )
+        });
         let mut parent_dir_ids = HashMap::<&str, u32>::new();
         let directories = &*self.vfs_directories;
         let files = self.vfs_files.iter().map(|file| {
@@ -1331,7 +1346,7 @@ impl ProcessFileSystemState {
             )
         });
         for (path, file_type, creator, finder_flags, dirty) in files.chain(resource_files) {
-            if path.is_empty() {
+            if path.is_empty() || (unchanged && !dirty) {
                 continue;
             }
             let parent_path = path
@@ -1358,6 +1373,25 @@ impl ProcessFileSystemState {
                     });
                 });
             });
+        }
+        if !unchanged {
+            let published = PublishedNativeVfsCatalogue {
+                directories: self
+                    .vfs_directories
+                    .iter()
+                    .map(|directory| (directory.path.clone(), directory.dir_id))
+                    .collect(),
+                files: self
+                    .vfs_files
+                    .iter()
+                    .map(|file| (file.path.clone(), file.file_type, file.creator, file.finder_flags))
+                    .chain(self.vfs_resource_files.iter().map(|file| {
+                        (file.path.clone(), file.file_type, file.creator, file.finder_flags)
+                    }))
+                    .collect(),
+                metadata_len: self.classic_vfs_metadata.with_mut(|metadata| metadata.len()),
+            };
+            self.native_vfs_catalogue_published = Some(published);
         }
         let deleted_paths = self.deleted_vfs_file_paths.clone();
         for path in deleted_paths {
@@ -1485,6 +1519,47 @@ impl ProcessFileSystemState {
                     .to_ascii_lowercase()
                     .starts_with(&prefix.to_ascii_lowercase())
         });
+    }
+}
+
+/// What the last full catalogue pass published, so unchanged slices can skip it.
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedNativeVfsCatalogue {
+    directories: Vec<(String, u32)>,
+    files: Vec<(String, u32, u32, u16)>,
+    metadata_len: usize,
+}
+
+impl PublishedNativeVfsCatalogue {
+    fn matches<'a>(
+        &self,
+        directories: &[ProcessVfsDirectory],
+        files: impl Iterator<Item = (&'a String, u32, u32, u16)>,
+        metadata_len: usize,
+    ) -> bool {
+        self.metadata_len == metadata_len
+            && self.directories.len() == directories.len()
+            && self
+                .directories
+                .iter()
+                .zip(directories)
+                .all(|((path, dir_id), directory)| {
+                    *dir_id == directory.dir_id && *path == directory.path
+                })
+            && files
+                .map(Some)
+                .chain(std::iter::once(None))
+                .zip(self.files.iter().map(Some).chain(std::iter::once(None)))
+                .all(|pair| match pair {
+                    (Some((path, file_type, creator, flags)), Some(old)) => {
+                        *path == old.0
+                            && file_type == old.1
+                            && creator == old.2
+                            && flags == old.3
+                    }
+                    (None, None) => true,
+                    _ => false,
+                })
     }
 }
 
@@ -15739,5 +15814,40 @@ mod tests {
         assert!(ctx.menu_tracking().is_none());
         assert_eq!(ctx.menu_tracking_snapshot(), None);
         assert_eq!(ctx.with_menu_tracking_ref(|s| s.is_some()), false);
+    }
+}
+
+#[cfg(test)]
+mod published_native_vfs_catalogue_tests {
+    use super::*;
+
+    #[test]
+    fn matches_only_identical_catalogues() {
+        let path = "Games/App".to_string();
+        let other = "Games/Other".to_string();
+        let published = PublishedNativeVfsCatalogue {
+            directories: Vec::new(),
+            files: vec![(path.clone(), 1, 2, 3)],
+            metadata_len: 1,
+        };
+        let check = |files: &[(&String, u32, u32, u16)], metadata_len| {
+            published.matches(&[], files.iter().copied(), metadata_len)
+        };
+        assert!(check(&[(&path, 1, 2, 3)], 1));
+        assert!(!check(&[(&path, 9, 2, 3)], 1), "type change");
+        assert!(!check(&[(&other, 1, 2, 3)], 1), "renamed file");
+        assert!(!check(&[(&path, 1, 2, 3), (&other, 1, 2, 3)], 1), "added file");
+        assert!(!check(&[], 1), "removed file");
+        assert!(!check(&[(&path, 1, 2, 3)], 0), "metadata removed");
+        let directory = ProcessVfsDirectory {
+            dir_id: 7,
+            parent_dir_id: 2,
+            path: "Games".to_string(),
+            creator: 0,
+            file_type: 0,
+            finder_flags: 0,
+            dirty: false,
+        };
+        assert!(!published.matches(&[directory], std::iter::once((&path, 1, 2, 3)), 1));
     }
 }
