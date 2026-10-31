@@ -2647,6 +2647,13 @@ fn native_menu_select_retains_custom_mdef_draw_and_choose_until_release() {
         Some(before.clone())
     );
     let tracking = loaded.toolbox_startup.execution.menu().snapshot().unwrap();
+    assert_eq!(
+        loaded
+            .memory
+            .read_u16_be(crate::memory::globals::addr::TOP_MENU_ITEM)
+            .map(|value| value as i16),
+        Some(tracking.content_top),
+    );
 
     loaded.set_input_snapshot(PpcInputSnapshot {
         mouse_button: false,
