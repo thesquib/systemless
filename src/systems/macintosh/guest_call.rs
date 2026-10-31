@@ -5954,6 +5954,7 @@ mod tests {
                     error_name: 0,
                 },
                 created_connection: true,
+                first_created_id: id,
             };
             for id in [1, 2] {
                 let request = GuestCallRequest::for_task(

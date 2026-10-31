@@ -1936,6 +1936,52 @@ fn nameless_disk_find_uses_container_name_to_find_loaded_fragment() {
 }
 
 #[test]
+fn failed_mem_fragment_load_removes_dependencies_it_connected() {
+    let fragment = synthetic_pef_with_library_import(b"DepLib", b"DepSymbol");
+    let library = PpcCfmLibraryFragment {
+        name: "DepLib".to_string(),
+        bytes: synthetic_pef_with_exports(),
+    };
+    let calls = SharedGuestCallStack::default();
+    let owner = PpcProcessMemoryManager::with_heap(PPC_HEAP_BASE, PPC_HEAP_BASE + 0x100000);
+    let mut manager = owner.0.borrow_mut();
+    let mut memory = PpcSectionMem::new();
+    memory.add_region(0x5000, fragment.clone());
+    memory.add_region(0x6000, vec![0; 0x200]);
+    memory.add_region(PPC_HEAP_BASE, vec![0; 0x100000]);
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[3] = 0x5000;
+    cpu.gpr[4] = fragment.len() as u32;
+    cpu.gpr[6] = PPC_CFM_LOAD_NEW_COPY;
+    cpu.gpr[7] = 0x6000;
+    cpu.gpr[8] = 0x6004;
+    cpu.gpr[9] = 0x6010;
+    let mut connections = Vec::new();
+    let mut next_connection = PPC_FIRST_CFM_CONNECTION_ID;
+    let mut import_run_state = PpcImportRunState::from_parts(Vec::new(), 0, ppc_import_layout());
+    let mut cursor = PPC_HEAP_BASE;
+
+    let action = ppc_get_mem_fragment(
+        &mut cpu,
+        &calls,
+        &mut manager,
+        &mut memory,
+        &mut cursor,
+        PPC_HEAP_BASE + 0x100000,
+        PPC_STACK_BASE,
+        &mut connections,
+        &[library],
+        &mut next_connection,
+        &mut import_run_state,
+        None,
+        None,
+    );
+
+    assert!(!matches!(action, PpcImportAction::Continue | PpcImportAction::Return(0)));
+    assert!(connections.is_empty());
+}
+
+#[test]
 fn code_fragment_manager_namespace_exports_the_fragment_loaders() {
     for library in ["CodeFragmentMgr", "CarbonCore.vlib", "InterfaceLib"] {
         assert_eq!(

@@ -584,6 +584,8 @@ pub(crate) struct CfmLoadOperation {
     pub(crate) main_address: u32,
     pub(crate) outputs: CfmLoadOutputs,
     pub(crate) created_connection: bool,
+    /// Dependencies connected for this load hold the ids from here up to `id`.
+    pub(crate) first_created_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -675,7 +677,9 @@ impl CfmLoadOperation {
             }
         };
         if result.is_err() && self.created_connection {
-            connections.retain(|connection| connection.id != self.id.0);
+            connections.retain(|connection| {
+                !(self.first_created_id..=self.id.0).contains(&connection.id)
+            });
         }
         result
     }
@@ -744,6 +748,7 @@ mod tests {
                 error_name: OUTPUT + 16,
             },
             created_connection,
+            first_created_id: 7,
         }
     }
 
@@ -1494,6 +1499,21 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn failed_initializer_removes_dependencies_connected_for_the_load() {
+        let mut connections = vec![connection(4), connection(5), connection(6), connection(7)];
+        let mut op = operation(true);
+        op.first_created_id = 5;
+        assert_eq!(
+            op.complete(1, &mut connections, |_| true),
+            Err(CfmLoadError::InitializationFailed)
+        );
+        assert_eq!(
+            connections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![4]
+        );
+    }
+
     #[test]
     fn connection_references_commit_only_with_successful_load_and_close_outputs() {
         let mut connections = vec![connection(7)];
