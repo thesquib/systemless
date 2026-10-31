@@ -243,10 +243,8 @@ pub(crate) fn ppc_get_named_resource(
     let index = if current_only || current_match.is_some() {
         current_match
     } else {
-        vfs_resources.iter().position(|record| {
-            record.ref_num != PPC_CLOSED_RESOURCE_REF_NUM
-                && record.res_type == res_type
-                && ppc_resource_name_eq(&record.name, &name)
+        ppc_resource_chain_position(vfs_resources, current_resource_refnum, |record| {
+            record.res_type == res_type && ppc_resource_name_eq(&record.name, &name)
         })
     };
     let Some(index) = index else {
@@ -790,12 +788,20 @@ pub(crate) fn ppc_vfs_resource_index(
     if current_only || current_match.is_some() {
         return current_match;
     }
+    ppc_resource_chain_position(vfs_resources, current_resource_refnum, |record| {
+        record.res_type == res_type && record.res_id == res_id
+    })
+}
+
+fn ppc_resource_chain_position(
+    vfs_resources: &[PpcVfsResourceRecord],
+    current_resource_refnum: i16,
+    matches: impl Fn(&PpcVfsResourceRecord) -> bool,
+) -> Option<usize> {
     // Refnums rise with open order, so the highest one below the current file is
     // the next file down the chain.
     let is_match = |record: &PpcVfsResourceRecord| {
-        record.ref_num != PPC_CLOSED_RESOURCE_REF_NUM
-            && record.res_type == res_type
-            && record.res_id == res_id
+        record.ref_num != PPC_CLOSED_RESOURCE_REF_NUM && matches(record)
     };
     let mut chain_match: Option<(usize, i16)> = None;
     for (index, record) in vfs_resources.iter().enumerate() {
