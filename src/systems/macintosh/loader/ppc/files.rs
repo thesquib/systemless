@@ -732,9 +732,11 @@ pub(super) fn ppc_pbh_get_v_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     default_dir_id: u32,
     working_directories: &HashMap<i16, ProcessWorkingDirectory>,
+    hierarchical: bool,
 ) -> i16 {
     let pb = cpu.gpr[3];
-    if pb == 0 || !ppc_memory_can_write_bytes(memory, pb, 122) {
+    let pb_len = if hierarchical { 122 } else { 64 };
+    if pb == 0 || !ppc_memory_can_write_bytes(memory, pb, pb_len) {
         return PPC_PARAM_ERR;
     }
     let Some(name_ptr) = memory.read_u32_be(pb + 18) else {
@@ -866,6 +868,15 @@ pub(super) fn ppc_pbh_get_v_info(
         memory.write_u16_be(pb + 56, volume.allocation_start),
         memory.write_u32_be(pb + 58, volume.next_catalog_id),
         memory.write_u16_be(pb + 62, volume.free_blocks),
+    ];
+    if writes.iter().any(Option::is_none) {
+        return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
+    }
+    // PBGetVInfo callers supply a VolumeParam, which ends at ioVFrBlk.
+    if !hierarchical {
+        return ppc_complete_pb(memory, pb, PPC_NO_ERR);
+    }
+    let writes = [
         memory.write_u16_be(pb + 64, 0x4244),
         memory.write_u16_be(pb + 66, 1),
         memory.write_u16_be(pb + 68, (-33i16) as u16),

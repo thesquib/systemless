@@ -11334,3 +11334,23 @@ fn pb_write_preserves_unwritten_tail_and_extends_only_past_eof() {
         assert_eq!(loaded.files[0].position, offset + count);
     }
 }
+
+#[test]
+fn pb_get_v_info_writes_only_the_volume_param_record() {
+    let pef = synthetic_pef_with_import(b"PBGetVInfoSync");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let pb = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(pb, vec![0xa5; 0x100]);
+    loaded.memory.write_u32_be(pb + 18, 0).unwrap();
+    loaded.memory.write_u16_be(pb + 22, 0).unwrap();
+    loaded.memory.write_u16_be(pb + 28, 0).unwrap();
+    loaded.cpu.gpr[3] = pb;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], 0);
+    for offset in 64..122 {
+        assert_eq!(loaded.memory.read_u8(pb + offset), Some(0xa5), "{offset}");
+    }
+}

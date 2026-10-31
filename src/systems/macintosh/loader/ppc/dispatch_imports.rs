@@ -1838,6 +1838,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::HSetVol
         | PpcImportDispatcherTarget::FlushVol
         | PpcImportDispatcherTarget::PBFlushVol
+        | PpcImportDispatcherTarget::PBGetVInfo
         | PpcImportDispatcherTarget::PBHGetVInfo
         | PpcImportDispatcherTarget::PBGetVolumeInfo
         | PpcImportDispatcherTarget::FSGetVolumeInfo
