@@ -3117,8 +3117,8 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "HNoPurge") => PpcImportDispatcherTarget::HNoPurge,
         ("InterfaceLib", "HPurge") => PpcImportDispatcherTarget::HPurge,
         ("InterfaceLib", "TickCount") => PpcImportDispatcherTarget::TickCount,
-        ("InterfaceLib", "GetZone") => PpcImportDispatcherTarget::GetZone,
-        ("InterfaceLib", "SetZone") => PpcImportDispatcherTarget::SetZone,
+        ("InterfaceLib", "GetZone" | "LMGetTheZone") => PpcImportDispatcherTarget::GetZone,
+        ("InterfaceLib", "SetZone" | "LMSetTheZone") => PpcImportDispatcherTarget::SetZone,
         // The ApplZone and SysZone low-memory globals hold the zones that
         // ApplicationZone and SystemZone return.
         ("InterfaceLib", "LMGetApplZone") => PpcImportDispatcherTarget::GetApplZone,
@@ -3148,7 +3148,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "TempTopMem") => PpcImportDispatcherTarget::TempTopMem,
         ("InterfaceLib", "MemError" | "LMGetMemErr") => PpcImportDispatcherTarget::MemError,
         ("InterfaceLib", "CurResFile" | "LMGetCurMap") => PpcImportDispatcherTarget::CurResFile,
-        ("InterfaceLib", "UseResFile") => PpcImportDispatcherTarget::UseResFile,
+        ("InterfaceLib", "UseResFile" | "LMSetCurMap") => PpcImportDispatcherTarget::UseResFile,
         ("InterfaceLib", "CloseResFile") => PpcImportDispatcherTarget::CloseResFile,
         ("InterfaceLib", "OpenResFile") => PpcImportDispatcherTarget::OpenResFile,
         ("InterfaceLib", "OpenRFPerm") => PpcImportDispatcherTarget::OpenRFPerm,
@@ -4209,6 +4209,21 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("InterfaceLib", "LMGetScrVRes") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetScrVRes)
+        }
+        ("InterfaceLib", "LMGetFractEnable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetFractEnable)
+        }
+        ("InterfaceLib", "LMSetFractEnable" | "SetFractEnable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetFractEnable)
+        }
+        ("InterfaceLib", "SetFScaleDisable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetFScaleDisable)
+        }
+        ("InterfaceLib", "LMSetLastSPExtra") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetLastSpExtra)
+        }
+        ("InterfaceLib", "LMSetMenuDisable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetMenuDisable)
         }
         ("InterfaceLib", "LMGetTopMapHndl") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetTopMapHndl)
