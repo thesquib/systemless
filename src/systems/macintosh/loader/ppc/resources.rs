@@ -790,11 +790,27 @@ pub(crate) fn ppc_vfs_resource_index(
     if current_only || current_match.is_some() {
         return current_match;
     }
-    vfs_resources.iter().position(|record| {
+    // Refnums rise with open order, so the highest one below the current file is
+    // the next file down the chain.
+    let is_match = |record: &PpcVfsResourceRecord| {
         record.ref_num != PPC_CLOSED_RESOURCE_REF_NUM
             && record.res_type == res_type
             && record.res_id == res_id
-    })
+    };
+    let mut chain_match: Option<(usize, i16)> = None;
+    for (index, record) in vfs_resources.iter().enumerate() {
+        if is_match(record)
+            && record.ref_num < current_resource_refnum
+            && chain_match.is_none_or(|(_, ref_num)| record.ref_num > ref_num)
+        {
+            chain_match = Some((index, record.ref_num));
+        }
+    }
+    // shortcut: files opened after the current one stay visible, unlike the real
+    // chain; remove this fallback once callers are known not to rely on it.
+    chain_match
+        .map(|(index, _)| index)
+        .or_else(|| vfs_resources.iter().position(is_match))
 }
 
 fn ppc_write_empty_pstring(memory: &mut PpcSectionMem, addr: u32) -> bool {
