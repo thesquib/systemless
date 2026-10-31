@@ -2279,6 +2279,14 @@ fn expand_installer_maker_payload(
     Ok(Some(payload))
 }
 
+/// Where an installer's per-language folder lands in the shared application tree.
+// shortcut: US only and inferred from the catalog layout, parse the installer's actions when another title needs it.
+fn vise_locale_overlay_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("US/")?;
+    let rest = rest.strip_prefix("RSRC/").unwrap_or(rest);
+    Some(format!("Universal/App/RSRC/{rest}"))
+}
+
 fn expand_vise_payload(
     name: &str,
     data: &[u8],
@@ -2359,7 +2367,23 @@ fn expand_vise_payload(
         installer_roots: vec![name.to_string()],
         skipped_disk_image_errors: Vec::new(),
     };
-    for entry in archive.entries {
+    let mut entries = archive.entries;
+    if entries
+        .iter()
+        .any(|entry| entry.path.starts_with("Universal/App/RSRC/"))
+    {
+        let overlaid = entries
+            .iter()
+            .filter_map(|entry| vise_locale_overlay_path(&entry.path))
+            .collect::<std::collections::HashSet<_>>();
+        entries.retain(|entry| !overlaid.contains(&entry.path));
+        for entry in &mut entries {
+            if let Some(path) = vise_locale_overlay_path(&entry.path) {
+                entry.path = path;
+            }
+        }
+    }
+    for entry in entries {
         let extract_fork = |packed_offset: usize,
                             packed: &[u8],
                             unpacked_offset: usize,
@@ -4248,6 +4272,19 @@ mod tests {
             finder_flags: 0,
             executable_priority: 0,
         }
+    }
+
+    #[test]
+    fn vise_locale_overlay_maps_language_folder_into_shared_resources() {
+        assert_eq!(
+            vise_locale_overlay_path("US/PM7.0 RSRC").as_deref(),
+            Some("Universal/App/RSRC/PM7.0 RSRC")
+        );
+        assert_eq!(
+            vise_locale_overlay_path("US/RSRC/Plugins/ColorPkr.add").as_deref(),
+            Some("Universal/App/RSRC/Plugins/ColorPkr.add")
+        );
+        assert_eq!(vise_locale_overlay_path("Universal/App/RSRC/a"), None);
     }
 
     #[test]
