@@ -116,13 +116,20 @@ pub(super) fn dispatch_font_import(context: PpcFontDispatchContext<'_>) -> Optio
         // SysFontSize, using 12 points when that low-memory value is zero.
         // Systemless currently models the default system font at 12 points.
         PpcImportDispatcherTarget::GetDefFontSize => Some(PpcImportAction::Return(12)),
-        PpcImportDispatcherTarget::GetFontName => {
+        PpcImportDispatcherTarget::GetFontName | PpcImportDispatcherTarget::GetFontNameC => {
             let font_id = cpu.gpr[3] as u16 as i16;
             let name = font_name_for_id(font_id)
                 .map(str::to_owned)
                 .or_else(|| ppc_vfs_font_name_for_id(vfs_resources, font_id))
                 .unwrap_or_default();
-            let _ = ppc_write_pstring_bytes(memory, cpu.gpr[4], name.as_bytes());
+            if binding.dispatcher_target == PpcImportDispatcherTarget::GetFontNameC {
+                let mut bytes = name.into_bytes();
+                bytes.truncate(255);
+                bytes.push(0);
+                let _ = memory.write_bytes(cpu.gpr[4], &bytes);
+            } else {
+                let _ = ppc_write_pstring_bytes(memory, cpu.gpr[4], name.as_bytes());
+            }
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::InitFonts => {
@@ -181,7 +188,7 @@ pub(super) fn dispatch_font_import(context: PpcFontDispatchContext<'_>) -> Optio
                 char_extra,
             ))))
         }
-        PpcImportDispatcherTarget::StringWidth => {
+        PpcImportDispatcherTarget::StringWidth | PpcImportDispatcherTarget::StringWidthC => {
             let text_font = ppc_current_text_font(memory, current_gworld);
             let text_face = ppc_current_text_style(memory, current_gworld);
             let width = ppc_read_pascal_string(memory, cpu.gpr[3])
@@ -355,7 +362,7 @@ pub(super) fn dispatch_font_import(context: PpcFontDispatchContext<'_>) -> Optio
                 FONT_NOT_OUTLINE_ERR,
             )))
         }
-        PpcImportDispatcherTarget::DrawString => {
+        PpcImportDispatcherTarget::DrawString | PpcImportDispatcherTarget::DrawStringC => {
             if let Some(bytes) = ppc_read_pascal_string(memory, cpu.gpr[3]) {
                 let text_font = ppc_current_text_font(memory, current_gworld);
                 let text_style = ppc_current_text_style(memory, current_gworld);
@@ -496,7 +503,7 @@ pub(super) fn dispatch_font_import(context: PpcFontDispatchContext<'_>) -> Optio
             }
             Some(PpcImportAction::ReturnPreserve)
         }
-        PpcImportDispatcherTarget::GetFNum => {
+        PpcImportDispatcherTarget::GetFNum | PpcImportDispatcherTarget::GetFNumC => {
             // Inside Macintosh: Text (1993), 4-52: GetFNum maps a Str255 font
             // family name to its ID and returns zero when no family matches.
             let font_id = ppc_read_pstring_bytes(memory, cpu.gpr[3])

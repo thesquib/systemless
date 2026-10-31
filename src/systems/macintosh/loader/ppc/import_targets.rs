@@ -359,6 +359,16 @@ pub enum PpcImportDispatcherTarget {
     GetAppFont,
     GetDefFontSize,
     GetFontName,
+    GetFontNameC,
+    SetMemErr,
+    SetResErr,
+    ScreenRes,
+    GetFNumC,
+    StringWidthC,
+    DrawStringC,
+    EqualStringC,
+    RelStringC,
+    UpperStringC,
     GetMBarHeight,
     HideMenuBar,
     ShowMenuBar,
@@ -2867,6 +2877,58 @@ pub(crate) fn dispatcher_target_for_import(
             | "IconIDToRgn",
         ) => PpcImportDispatcherTarget::ReturnNoErr,
         ("InterfaceLib", "ReserveMemSys") => PpcImportDispatcherTarget::NoOpPreserve,
+        // A single process holds every byte range, so locks always succeed.
+        ("InterfaceLib", "PBLockRangeSync" | "PBUnlockRangeSync") => {
+            PpcImportDispatcherTarget::ReturnNoErr
+        }
+        ("InterfaceLib", "PBGetVolSync") => PpcImportDispatcherTarget::FileCompatibility(
+            PpcFileCompatibilityOperation::PbHGetVolSync,
+        ),
+        ("InterfaceLib", "LMSetMemErr") => PpcImportDispatcherTarget::SetMemErr,
+        ("InterfaceLib", "LMSetResErr") => PpcImportDispatcherTarget::SetResErr,
+        ("InterfaceLib", "ScreenRes") => PpcImportDispatcherTarget::ScreenRes,
+        ("InterfaceLib", "LMGetTheGDevice") => PpcImportDispatcherTarget::GetGDevice,
+        // No SCSI bus: scCommErr. No Edition, Component or Translation managers: paramErr.
+        (
+            "InterfaceLib",
+            "SCSIGet" | "SCSISelect" | "SCSICmd" | "SCSIRead" | "SCSIRBlind" | "SCSIWrite"
+            | "SCSIWBlind" | "SCSIComplete" | "SCSIStat" | "SCSIAction",
+        ) => PpcImportDispatcherTarget::ReturnError(2),
+        (
+            "InterfaceLib",
+            "OpenEdition" | "CloseEdition" | "EditionHasFormat" | "ReadEdition"
+            | "SetEditionFormatMark" | "GetEditionInfo" | "GoToPublisherSection"
+            | "GetLastEditionContainerUsed" | "NewSection" | "RegisterSection"
+            | "UnRegisterSection" | "IsRegisteredSection" | "AssociateSection"
+            | "NewSubscriberDialog" | "SectionOptionsDialog" | "OpenComponentResFile"
+            | "RegisterComponentResource" | "PBCreateFileIDRefSync" | "PPostEvent"
+            | "GetCompressedPixMapInfo",
+        ) => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
+        (
+            "Translation",
+            "CanDocBeOpened" | "ExtendFileTypeList" | "GetFileTranslationPaths"
+            | "GetPathFromTranslationDialog" | "TranslateFile",
+        ) => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
+        // No Text Encoding Converter is installed: kTECNoConversionPathErr.
+        (
+            "TextCommon" | "UnicodeConverter" | "TextEncodingConverter" | "InterfaceLib",
+            "TECGetInfo" | "GetTextEncodingFormat" | "CreateTextToUnicodeInfo"
+            | "CreateUnicodeToTextInfo" | "TruncateForTextToUnicode" | "TruncateForUnicodeToText"
+            | "SetFallbackUnicodeToText",
+        ) => PpcImportDispatcherTarget::ReturnError(-8749),
+        // shortcut: nil or zero results and ignored drawing, implement when a title depends on them.
+        (
+            "InterfaceLib",
+            "OpenComponent" | "CloseComponentResFile" | "UnregisterComponent" | "GetNextFOND"
+            | "GetMCInfo" | "DeltaPoint",
+        )
+        | ("QuickTimeLib", "MCIsPlayerEvent") => PpcImportDispatcherTarget::ReturnNoErr,
+        (
+            "InterfaceLib",
+            "PicComment" | "SpaceExtra" | "SysBreakStr" | "DisposeMCInfo" | "CopyPixMap"
+            | "ResizePalette" | "ColorBit" | "InvertPoly",
+        )
+        | ("QuickTimeLib", "CustomGetFilePreview") => PpcImportDispatcherTarget::NoOpPreserve,
         ("InterfaceLib", "AEInstallSpecialHandler") => {
             PpcImportDispatcherTarget::AEInstallSpecialHandler
         }
@@ -3426,7 +3488,7 @@ pub(crate) fn dispatcher_target_for_import(
             "EnableItem" | "enableitem" | "EnableMenuItem" | "enablemenuitem",
         ) => PpcImportDispatcherTarget::EnableMenuItem,
         (
-            "InterfaceLib" | "AppearanceLib" | "CarbonLib",
+            "InterfaceLib" | "AppearanceLib" | "CarbonLib" | "MenusLib",
             "DisableItem" | "disableitem" | "DisableMenuItem" | "disablemenuitem",
         ) => PpcImportDispatcherTarget::DisableMenuItem,
         ("InterfaceLib" | "AppearanceLib" | "MenusLib", "IsMenuItemEnabled") => {
@@ -3808,6 +3870,13 @@ pub(crate) fn dispatcher_target_for_import(
             PpcImportDispatcherTarget::GetDefFontSize
         }
         ("InterfaceLib" | "CarbonLib", "GetFontName") => PpcImportDispatcherTarget::GetFontName,
+        ("InterfaceLib", "getfontname") => PpcImportDispatcherTarget::GetFontNameC,
+        ("InterfaceLib", "getfnum") => PpcImportDispatcherTarget::GetFNumC,
+        ("InterfaceLib", "stringwidth") => PpcImportDispatcherTarget::StringWidthC,
+        ("InterfaceLib", "drawstring") => PpcImportDispatcherTarget::DrawStringC,
+        ("InterfaceLib", "equalstring") => PpcImportDispatcherTarget::EqualStringC,
+        ("InterfaceLib", "relstring") => PpcImportDispatcherTarget::RelStringC,
+        ("InterfaceLib", "upperstring") => PpcImportDispatcherTarget::UpperStringC,
         (
             "InterfaceLib" | "AppearanceLib" | "CarbonLib",
             "GetMBarHeight" | "getmbarheight" | "LMGetMBarHeight" | "lmgetmbarheight",

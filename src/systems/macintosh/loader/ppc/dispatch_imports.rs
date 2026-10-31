@@ -753,7 +753,18 @@ pub(crate) fn dispatch_supported_import(
         return Some(action);
     }
 
-    if let Some(action) =
+    // The lowercase C entry points convert in place around the Pascal routine,
+    // as the InterfaceLib glue does.
+    let c_string_font_input = matches!(
+        binding.dispatcher_target,
+        PpcImportDispatcherTarget::GetFNumC
+            | PpcImportDispatcherTarget::StringWidthC
+            | PpcImportDispatcherTarget::DrawStringC
+    );
+    if c_string_font_input {
+        dispatch_stdc::ppc_c2pstr(cpu, memory);
+    }
+    let font_action =
         dispatch_fonts::dispatch_font_import(dispatch_fonts::PpcFontDispatchContext {
             binding,
             cpu,
@@ -775,8 +786,11 @@ pub(crate) fn dispatch_supported_import(
             handles,
             current_resource_refnum: *current_resource_refnum,
             last_resource_error,
-        })
-    {
+        });
+    if c_string_font_input {
+        dispatch_stdc::ppc_p2cstr(cpu, memory);
+    }
+    if let Some(action) = font_action {
         return Some(action);
     }
 
@@ -1507,6 +1521,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::TempTopMem
         | PpcImportDispatcherTarget::PurgeMem
         | PpcImportDispatcherTarget::PurgeMemSys
+        | PpcImportDispatcherTarget::SetMemErr
         | PpcImportDispatcherTarget::MemError => {
             unreachable!("memory imports return through dispatch_memory_import")
         }
@@ -1829,6 +1844,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::OpenResFile
         | PpcImportDispatcherTarget::OpenRFPerm
         | PpcImportDispatcherTarget::HOpenResFile
+        | PpcImportDispatcherTarget::SetResErr
         | PpcImportDispatcherTarget::ResError
         | PpcImportDispatcherTarget::GetVol
         | PpcImportDispatcherTarget::GetWDInfo
@@ -2231,7 +2247,11 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::GetSysFont
         | PpcImportDispatcherTarget::GetAppFont
         | PpcImportDispatcherTarget::GetDefFontSize
-        | PpcImportDispatcherTarget::GetFontName => {
+        | PpcImportDispatcherTarget::GetFontName
+        | PpcImportDispatcherTarget::GetFontNameC
+        | PpcImportDispatcherTarget::GetFNumC
+        | PpcImportDispatcherTarget::StringWidthC
+        | PpcImportDispatcherTarget::DrawStringC => {
             unreachable!("Font Manager imports return through dispatch_font_import")
         }
         PpcImportDispatcherTarget::DMGetDisplayIDByGDevice
@@ -2411,6 +2431,10 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::SysEnvirons
         | PpcImportDispatcherTarget::SVersion
         | PpcImportDispatcherTarget::EqualString
+        | PpcImportDispatcherTarget::EqualStringC
+        | PpcImportDispatcherTarget::RelStringC
+        | PpcImportDispatcherTarget::UpperStringC
+        | PpcImportDispatcherTarget::ScreenRes
         | PpcImportDispatcherTarget::RelString
         | PpcImportDispatcherTarget::InitEditionPackVersion
         | PpcImportDispatcherTarget::StuffHex

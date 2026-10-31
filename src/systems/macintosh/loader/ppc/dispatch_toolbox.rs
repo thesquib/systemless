@@ -54,6 +54,40 @@ pub(super) fn dispatch_toolbox_import(
             );
             Some(PpcImportAction::Return(ppc_i16_result(result)))
         }
+        PpcImportDispatcherTarget::EqualStringC | PpcImportDispatcherTarget::RelStringC => {
+            let left = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[3], 255);
+            let right = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[4], 255);
+            let case_sensitive = cpu.gpr[5] & 0xff != 0;
+            let diac_sensitive = cpu.gpr[6] & 0xff != 0;
+            Some(PpcImportAction::Return(
+                if binding.dispatcher_target == PpcImportDispatcherTarget::EqualStringC {
+                    u32::from(crate::text_utils::evaluate_equal_string(
+                        &left,
+                        &right,
+                        case_sensitive,
+                        diac_sensitive,
+                    ))
+                } else {
+                    ppc_i16_result(crate::text_utils::evaluate_rel_string(
+                        &left,
+                        &right,
+                        case_sensitive,
+                        diac_sensitive,
+                    ))
+                },
+            ))
+        }
+        PpcImportDispatcherTarget::ScreenRes => {
+            let _ = memory.write_u16_be(cpu.gpr[3], 72);
+            let _ = memory.write_u16_be(cpu.gpr[4], 72);
+            Some(PpcImportAction::ReturnPreserve)
+        }
+        PpcImportDispatcherTarget::UpperStringC => {
+            let mut bytes = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[3], 255);
+            crate::text_utils::evaluate_upper_string(&mut bytes, cpu.gpr[4] & 0xff != 0);
+            let _ = memory.write_bytes(cpu.gpr[3], &bytes);
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::InitEditionPackVersion => {
             // As with the classic _Pack11 InitEditionPack path, initialization
             // succeeds for the process-owned Edition Manager stub.

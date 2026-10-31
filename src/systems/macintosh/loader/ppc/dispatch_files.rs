@@ -424,6 +424,10 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 default_dir_id,
             ) as u16 as u32))
         }
+        PpcImportDispatcherTarget::SetResErr => {
+            *last_resource_error = cpu.gpr[3] as u16 as i16;
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::ResError => Some(PpcImportAction::Return(ppc_i16_result(
             *last_resource_error,
         ))),
@@ -1339,6 +1343,9 @@ pub(super) fn ppc_dispatch_file_compatibility(
                 };
                 let named_dir_id = named_path
                     .and_then(|path| ppc_directory_id_for_path(vfs_directories, &path));
+                if ppc_hle_trace_enabled() {
+                    eprintln!("[PPC-TRACE] PBOpenWD name={name:?} parent={parent_dir_id} -> {named_dir_id:?}");
+                }
                 let Some(named_dir_id) = named_dir_id else {
                     return PpcImportAction::Return(ppc_i16_result(ppc_complete_pb(
                         memory,

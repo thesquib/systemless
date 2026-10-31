@@ -3392,7 +3392,7 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
         assert_eq!(loaded.memory.read_u32_be(pb + 100), Some(42));
         assert_eq!(
             ppc_read_pstring_bytes(&mut loaded.memory, name_ptr),
-            Some(b"ToolBot Power Supply".to_vec())
+            Some(b"Gridz\xaa CD:ToolBot Power Supply".to_vec())
         );
     }
 
@@ -11450,4 +11450,56 @@ fn pb_get_v_info_writes_only_the_volume_param_record() {
     for offset in 64..122 {
         assert_eq!(loaded.memory.read_u8(pb + offset), Some(0xa5), "{offset}");
     }
+}
+
+#[test]
+fn c_string_text_entry_points_take_and_return_c_strings() {
+    let pef = synthetic_pef_with_import(b"upperstring");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "upperstring"),
+        PpcImportDispatcherTarget::UpperStringC
+    );
+    let text = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(text, vec![0; 16]);
+    loaded.memory.write_bytes(text, b"abc\0").unwrap();
+    loaded.cpu.gpr[3] = text;
+    loaded.cpu.gpr[4] = 0;
+
+    loaded.run_with_hle_imports(64);
+
+    assert_eq!(loaded.memory.read_u8(text), Some(b'A'));
+    assert_eq!(loaded.memory.read_u8(text + 2), Some(b'C'));
+    assert_eq!(loaded.memory.read_u8(text + 3), Some(0));
+}
+
+#[test]
+fn fs_make_fs_spec_resolves_a_boot_volume_full_path() {
+    let pef = synthetic_pef_with_import(b"FSMakeFSSpec");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let name_ptr = PPC_DATA_BASE + 0x1000;
+    let spec_ptr = PPC_DATA_BASE + 0x1100;
+    loaded.memory.add_region(name_ptr, vec![0; 0x200]);
+    write_ppc_pstring(
+        &mut loaded.memory,
+        name_ptr,
+        b"MacintoshHD:System Folder:Preferences:Test App Prefs",
+    );
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "System Folder/Preferences/Test App Prefs".to_string(),
+        data: (b"prefs".to_vec()).into(),
+        creator: 0,
+        file_type: 0,
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded.cpu.gpr[3] = 0;
+    loaded.cpu.gpr[4] = 0;
+    loaded.cpu.gpr[5] = name_ptr;
+    loaded.cpu.gpr[6] = spec_ptr;
+
+    loaded.run_with_hle_imports(64);
+
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(loaded.memory.read_u32_be(spec_ptr + 2), Some(PPC_PREFERENCES_DIR_ID));
 }
