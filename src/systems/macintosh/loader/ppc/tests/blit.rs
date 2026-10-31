@@ -4052,11 +4052,27 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
 
     #[test]
     fn copybits_translates_through_the_current_offscreen_gworld_table() {
+        assert_eq!(copybits_from_offscreen_port(false), 42);
+    }
+
+    #[test]
+    fn copybits_to_the_screen_keeps_the_main_device_table_from_an_offscreen_port() {
+        assert_ne!(copybits_from_offscreen_port(true), 42);
+    }
+
+    fn copybits_from_offscreen_port(dst_is_screen: bool) -> u8 {
         let pef = synthetic_pef_with_import(b"CopyBits");
         let mut loaded = load_pef_application(&pef).unwrap();
         let scratch = PPC_HEAP_BASE + 0x15000;
         let src_pixels = scratch;
-        let dst_pixels = scratch + 0x10;
+        let port_pixels = scratch + 0x10;
+        let screen_base = loaded
+            .gworlds
+            .iter()
+            .find(|record| record.port == PPC_MAIN_GWORLD)
+            .unwrap()
+            .base_addr;
+        let dst_pixels = if dst_is_screen { screen_base } else { port_pixels };
         let src_pixmap = scratch + 0x20;
         let dst_pixmap = scratch + 0x60;
         let src_ctable_handle = scratch + 0xa0;
@@ -4096,7 +4112,7 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
             port,
             pixmap_handle: 0,
             pixmap: dst_pixmap,
-            base_addr: dst_pixels,
+            base_addr: port_pixels,
             gdevice: PPC_MAIN_GDEVICE,
             width: 1,
             height: 1,
@@ -4117,7 +4133,7 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
         let probe = loaded.run_with_hle_imports(64);
 
         assert_eq!(probe.unsupported_import_index, None);
-        assert_eq!(loaded.memory.read_u8(dst_pixels), Some(42));
+        loaded.memory.read_u8(dst_pixels).unwrap()
     }
 
     #[test]

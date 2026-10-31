@@ -4612,8 +4612,9 @@ pub(crate) fn ppc_copy_bits(
         // A GWorld made without noNewDevice has its own device built from its
         // table, but its record shares the main device. Imaging With QuickDraw
         // (1994), chapter 6.
-        // shortcut: a noNewDevice GWorld explicitly on the main device also takes
-        // this path; record the flag on PpcGWorldRecord if a title needs it.
+        // shortcut: the shared record cannot tell a selected main device from the
+        // implicit one, so screen destinations keep the main table and a noNewDevice
+        // GWorld on the main device uses its own; track the device if a title needs it.
         let screen_base = gworlds
             .iter()
             .find(|record| record.port == PPC_MAIN_GWORLD)
@@ -4625,6 +4626,7 @@ pub(crate) fn ppc_copy_bits(
                     && record.port != PPC_MAIN_GWORLD
                     && record.gdevice == PPC_MAIN_GDEVICE
                     && Some(record.base_addr) != screen_base
+                    && Some(dst_bits.base_addr) != screen_base
             })
             .filter(|_| current_gdevice == PPC_MAIN_GDEVICE)
             .and_then(|_| ppc_live_gworld_ctable_handle(memory, gworlds, current_gworld));
