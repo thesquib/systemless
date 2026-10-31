@@ -504,6 +504,7 @@ pub(crate) fn dispatch_supported_import(
             current_resource_refnum,
             resource_policy,
             last_resource_error,
+            toolbox_startup,
         },
     ) {
         return Some(action);
@@ -1882,6 +1883,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::FSMakeFSSpec
         | PpcImportDispatcherTarget::PBGetFCBInfo
         | PpcImportDispatcherTarget::FindFolder
+        | PpcImportDispatcherTarget::GetAliasInfo
         | PpcImportDispatcherTarget::ResolveAliasFile
         | PpcImportDispatcherTarget::ResolveAliasFileWithMountFlags
         | PpcImportDispatcherTarget::GetIconRefFromFile

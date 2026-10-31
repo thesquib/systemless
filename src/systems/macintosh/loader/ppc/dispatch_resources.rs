@@ -15,6 +15,7 @@ pub(super) struct PpcResourceDispatchContext<'a> {
     pub(super) current_resource_refnum: &'a mut i16,
     pub(super) resource_policy: &'a SharedProcessResourcePolicy,
     pub(super) last_resource_error: &'a mut i16,
+    pub(super) toolbox_startup: &'a mut PpcToolboxStartupState,
 }
 
 pub(super) fn dispatch_resource_import(
@@ -35,6 +36,7 @@ pub(super) fn dispatch_resource_import(
         current_resource_refnum,
         resource_policy,
         last_resource_error,
+        toolbox_startup,
     } = context;
 
     // Read-only resource access may load and inspect resources, but cannot
@@ -123,7 +125,7 @@ pub(super) fn dispatch_resource_import(
                     *current_resource_refnum
                 );
             }
-            Some(PpcImportAction::Return(ppc_get_resource(
+            let handle = ppc_get_resource(
                 cpu,
                 process_memory_manager,
                 memory,
@@ -136,7 +138,38 @@ pub(super) fn dispatch_resource_import(
                 false,
                 resource_policy.res_load(),
                 last_resource_error,
-            )))
+            );
+            let font_id = cpu.gpr[4] as i16;
+            if handle != 0
+                || cpu.gpr[3] != u32::from_be_bytes(*b"FOND")
+                || !crate::quickdraw::fonts::FONT_NAMES
+                    .iter()
+                    .any(|(id, _)| *id == font_id)
+            {
+                return Some(PpcImportAction::Return(handle));
+            }
+            // Built-in fonts have no resource file, but the real System's fonts have FONDs.
+            let handle = match toolbox_startup.synthetic_fonds.get(&font_id) {
+                Some(&handle) if handles.iter().any(|record| record.handle == handle) => handle,
+                _ => {
+                    let mut allocator = PpcProcessAllocatorView {
+                        memory_manager: process_memory_manager,
+                    };
+                    let handle = ppc_allocator_view_allocate_handle_with_bytes(
+                        Some(&mut allocator),
+                        memory,
+                        heap_cursor,
+                        heap_limit,
+                        last_mem_error,
+                        handles,
+                        &ppc_synthetic_fond_bytes(font_id),
+                    );
+                    toolbox_startup.synthetic_fonds.insert(font_id, handle);
+                    handle
+                }
+            };
+            *last_resource_error = PPC_NO_ERR;
+            Some(PpcImportAction::Return(handle))
         }
         PpcImportDispatcherTarget::Get1Resource => {
             if ppc_hle_trace_enabled() {
@@ -870,4 +903,31 @@ fn ppc_get_icon_suite(
     *last_mem_error = PPC_NO_ERR;
     *last_resource_error = PPC_NO_ERR;
     PPC_NO_ERR
+}
+
+/// A FamRec with one 12-point association and no width, kerning or style tables.
+/// shortcut: fixed metrics for every family, read the built-in face's metrics if a guest lays out with them.
+fn ppc_synthetic_fond_bytes(font_id: i16) -> Vec<u8> {
+    let mut fond = vec![0; 60];
+    fond[2..4].copy_from_slice(&font_id.to_be_bytes());
+    fond[6..8].copy_from_slice(&255i16.to_be_bytes());
+    fond[8..10].copy_from_slice(&0x0C00i16.to_be_bytes());
+    fond[10..12].copy_from_slice(&(-0x0400i16).to_be_bytes());
+    fond[14..16].copy_from_slice(&0x1000i16.to_be_bytes());
+    fond[50..52].copy_from_slice(&2i16.to_be_bytes());
+    fond[54..56].copy_from_slice(&12i16.to_be_bytes());
+    fond[58..60].copy_from_slice(&font_id.to_be_bytes());
+    fond
+}
+
+#[cfg(test)]
+mod synthetic_fond_tests {
+    #[test]
+    fn synthetic_fond_associates_the_family_with_one_strike() {
+        let fond = super::ppc_synthetic_fond_bytes(20);
+        let associations = crate::quickdraw::fonts::parse_fond_associations(20, &fond).unwrap();
+        assert_eq!(associations.len(), 1);
+        assert_eq!(associations[0].font_resource_id, 20);
+        assert_eq!(associations[0].size, 12);
+    }
 }

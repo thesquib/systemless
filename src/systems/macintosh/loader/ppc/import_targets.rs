@@ -558,6 +558,7 @@ pub enum PpcImportDispatcherTarget {
     UpdateAlias,
     ResolveAlias,
     FollowFinderAlias,
+    GetAliasInfo,
     MatchAlias,
     ResolveAliasFile,
     ResolveAliasFileWithMountFlags,
@@ -4372,6 +4373,7 @@ pub(crate) fn dispatcher_target_for_import(
             PpcPrintingCompatibilityOperation::PrJobInit,
         ),
         ("InterfaceLib", "MatchAlias") => PpcImportDispatcherTarget::MatchAlias,
+        ("InterfaceLib", "GetAliasInfo") => PpcImportDispatcherTarget::GetAliasInfo,
         ("InterfaceLib", "ResolveAliasFile") => PpcImportDispatcherTarget::ResolveAliasFile,
         ("InterfaceLib", "ResolveAliasFileWithMountFlags") => {
             PpcImportDispatcherTarget::ResolveAliasFileWithMountFlags
