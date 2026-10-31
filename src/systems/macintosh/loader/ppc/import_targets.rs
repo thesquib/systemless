@@ -2873,9 +2873,10 @@ pub(crate) fn dispatcher_target_for_import(
             | "GetPortNameFromProcessSerialNumber"
             | "GetSpecificHighLevelEvent"
             | "AEInstallCoercionHandler"
-            | "AEGetEventHandler"
             | "IconIDToRgn",
         ) => PpcImportDispatcherTarget::ReturnNoErr,
+        // errAEHandlerNotFound: callers install their own handler when none is reported.
+        ("InterfaceLib", "AEGetEventHandler") => PpcImportDispatcherTarget::ReturnError(-1717),
         ("InterfaceLib", "ReserveMemSys") => PpcImportDispatcherTarget::NoOpPreserve,
         // A single process holds every byte range, so locks always succeed.
         ("InterfaceLib", "PBLockRangeSync" | "PBUnlockRangeSync") => {
