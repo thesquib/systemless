@@ -2853,6 +2853,20 @@ pub(crate) fn dispatcher_target_for_import(
         ("StdCLib", "_BreakPoint") | ("StdCLib", "__NubAt3") => {
             PpcImportDispatcherTarget::NoOpPreserve
         }
+        // No other process exists to exchange PPC Toolbox or high-level events
+        // with, so these succeed without any peer to observe them.
+        (
+            "InterfaceLib",
+            "PPCInit"
+            | "PPCOpenSync"
+            | "PPCCloseSync"
+            | "GetPortNameFromProcessSerialNumber"
+            | "GetSpecificHighLevelEvent"
+            | "AEInstallCoercionHandler"
+            | "AEGetEventHandler"
+            | "IconIDToRgn",
+        ) => PpcImportDispatcherTarget::ReturnNoErr,
+        ("InterfaceLib", "ReserveMemSys") => PpcImportDispatcherTarget::NoOpPreserve,
         ("InterfaceLib", "AEInstallSpecialHandler") => {
             PpcImportDispatcherTarget::AEInstallSpecialHandler
         }

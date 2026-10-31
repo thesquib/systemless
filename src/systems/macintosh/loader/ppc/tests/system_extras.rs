@@ -418,6 +418,16 @@ fn fractional_width_setters_share_the_low_memory_global() {
 }
 
 #[test]
+fn peerless_interprocess_imports_succeed() {
+    let mut loaded = loaded_with(b"PPCInit");
+    for symbol in ["PPCInit", "PPCOpenSync", "GetSpecificHighLevelEvent"] {
+        loaded.cpu.gpr[3] = 1;
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        assert_eq!(loaded.cpu.gpr[3], 0, "{symbol}");
+    }
+}
+
+#[test]
 fn screen_resolution_accessors_report_the_seeded_72_dpi() {
     let mut loaded = loaded_with(b"LMGetScrHRes");
     for symbol in ["LMGetScrHRes", "LMGetScrVRes"] {
