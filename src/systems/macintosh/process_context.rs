@@ -1309,11 +1309,12 @@ impl ProcessFileSystemState {
     /// therefore do not participate in this compatibility pass. Files (1992),
     /// pp. 2-27--2-29 and 2-85.
     pub(crate) fn publish_native_vfs_catalogue(&mut self) {
-        let directories = (*self.vfs_directories).clone();
-        // Publication needs metadata only; cloning records copies their fork bytes.
+        // This runs after every execution slice, so it must not allocate per file.
+        let mut parent_dir_ids = HashMap::<&str, u32>::new();
+        let directories = &*self.vfs_directories;
         let files = self.vfs_files.iter().map(|file| {
             (
-                file.path.clone(),
+                &file.path,
                 file.file_type,
                 file.creator,
                 file.finder_flags,
@@ -1322,21 +1323,24 @@ impl ProcessFileSystemState {
         });
         let resource_files = self.vfs_resource_files.iter().map(|file| {
             (
-                file.path.clone(),
+                &file.path,
                 file.file_type,
                 file.creator,
                 file.finder_flags,
                 file.dirty,
             )
         });
-        let records = files.chain(resource_files).collect::<Vec<_>>();
-        let deleted_paths = self.deleted_vfs_file_paths.clone();
-
-        for (path, file_type, creator, finder_flags, dirty) in records {
+        for (path, file_type, creator, finder_flags, dirty) in files.chain(resource_files) {
             if path.is_empty() {
                 continue;
             }
-            let parent_dir_id = process_vfs_parent_dir_id(&directories, &path);
+            let parent_path = path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .unwrap_or("");
+            let parent_dir_id = *parent_dir_ids
+                .entry(parent_path)
+                .or_insert_with(|| process_vfs_parent_dir_id(directories, path));
             self.classic_next_vfs_file_id.with_mut(|next_file_id| {
                 self.classic_next_vfs_timestamp.with_mut(|next_timestamp| {
                     self.classic_vfs_metadata.with_mut(|metadata| {
@@ -1344,7 +1348,7 @@ impl ProcessFileSystemState {
                             metadata,
                             next_file_id,
                             next_timestamp,
-                            &path,
+                            path,
                             parent_dir_id,
                             file_type,
                             creator,
@@ -1355,6 +1359,7 @@ impl ProcessFileSystemState {
                 });
             });
         }
+        let deleted_paths = self.deleted_vfs_file_paths.clone();
         for path in deleted_paths {
             // Delete removes the native records immediately. A queued host
             // notification must not delete a replacement created at that path.
@@ -1508,20 +1513,26 @@ fn publish_native_vfs_metadata(
     touch: bool,
 ) {
     let timestamp = *next_timestamp;
-    let entry = metadata.entry(path.to_string()).or_insert_with(|| {
+    if !metadata.contains_key(path) {
         let file_id = *next_file_id;
         *next_file_id = next_file_id.saturating_add(1);
         *next_timestamp = next_timestamp.saturating_add(1);
-        ProcessVfsMetadata {
-            file_id,
-            parent_dir_id,
-            file_type,
-            creator,
-            finder_flags,
-            created_date: timestamp,
-            modified_date: timestamp,
-        }
-    });
+        metadata.insert(
+            path.to_string(),
+            ProcessVfsMetadata {
+                file_id,
+                parent_dir_id,
+                file_type,
+                creator,
+                finder_flags,
+                created_date: timestamp,
+                modified_date: timestamp,
+            },
+        );
+    }
+    let Some(entry) = metadata.get_mut(path) else {
+        return;
+    };
     entry.parent_dir_id = parent_dir_id;
     entry.file_type = file_type;
     entry.creator = creator;
