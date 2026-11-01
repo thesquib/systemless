@@ -1205,6 +1205,73 @@ fn get_mouse_returns_current_port_local_coordinates() {
 }
 
 #[test]
+fn get_mouse_honors_guest_low_memory_warp_across_slices() {
+    let mut code = Vec::new();
+    for word in [
+        d_form_u(15, 7, 0, 300),
+        d_form_u(24, 7, 7, 400),
+        d_form_u(36, 7, 0, 0x0830),
+    ] {
+        code.extend_from_slice(&word.to_be_bytes());
+    }
+    code.extend_from_slice(&synthetic_code());
+    let pef = synthetic_pef_with_loader_code_and_data(
+        synthetic_loader(b"InterfaceLib", b"GetMouse"),
+        &code,
+        &[0; 8],
+    );
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let point = PPC_DATA_BASE + 0x1120;
+    loaded.memory.add_region(point, vec![0; 4]);
+    ppc_write_rect(&mut loaded.memory, PPC_MAIN_PIXMAP + 6, -80, -120, 520, 680).unwrap();
+    loaded.set_input_snapshot(PpcInputSnapshot {
+        mouse_v: 404,
+        mouse_h: 526,
+        ..PpcInputSnapshot::default()
+    });
+    loaded.input_sprocket.device_mouse_v = Some(400);
+    loaded.input_sprocket.device_mouse_h = Some(520);
+    loaded.cpu.gpr[3] = point;
+    let first = loaded.run_with_hle_imports(64);
+    assert_eq!(first.handled_import_count, 1);
+    assert_eq!(loaded.memory.read_u16_be(point), Some(220));
+    assert_eq!(loaded.memory.read_u16_be(point + 2), Some(280));
+    assert_eq!(loaded.process_input.mouse_state_snapshot().0, (300, 400));
+    assert_eq!(loaded.input_sprocket.device_mouse_v, Some(300));
+    assert_eq!(loaded.input_sprocket.device_mouse_h, Some(400));
+    assert_eq!(loaded.input_sprocket.device_mouse_v_carry, -4);
+    assert_eq!(loaded.input_sprocket.device_mouse_h_carry, 6);
+
+    // A new slice without another host input must retain the guest warp.
+    loaded.cpu.pc = loaded.entry_pc + 12;
+    loaded.cpu.lr = PPC_HALT_PC;
+    loaded.cpu.gpr[3] = point;
+    let second = loaded.run_with_hle_imports(64);
+    assert_eq!(second.handled_import_count, 1);
+    assert_eq!(loaded.memory.read_u16_be(point), Some(220));
+    assert_eq!(loaded.memory.read_u16_be(point + 2), Some(280));
+
+    // The guest can also write Mouse at the end of a slice before calling
+    // GetMouse. The next slice must not overwrite that write with host state.
+    let mut boundary = load_pef_application(&pef).unwrap();
+    boundary.memory.add_region(point, vec![0; 4]);
+    ppc_write_rect(&mut boundary.memory, PPC_MAIN_PIXMAP + 6, -80, -120, 520, 680).unwrap();
+    boundary.set_input_snapshot(PpcInputSnapshot {
+        mouse_v: 404,
+        mouse_h: 526,
+        ..PpcInputSnapshot::default()
+    });
+    boundary.cpu.gpr[3] = point;
+    let partial = boundary.run_with_hle_imports(3);
+    assert_eq!(partial.handled_import_count, 0);
+    assert_eq!(boundary.process_input.mouse_state_snapshot().0, (300, 400));
+    let resumed = boundary.run_with_hle_imports(64);
+    assert_eq!(resumed.handled_import_count, 1);
+    assert_eq!(boundary.memory.read_u16_be(point), Some(220));
+    assert_eq!(boundary.memory.read_u16_be(point + 2), Some(280));
+}
+
+#[test]
 fn getkeys_poll_fast_forward_requires_repeated_idle_caller() {
     let key_map_ptr = PPC_DATA_BASE + 0x1000;
     let mut memory = PpcSectionMem::new();
@@ -1556,4 +1623,44 @@ fn hle_run_mirrors_shared_process_input_into_powerpc_low_memory() {
     assert_eq!(loaded.memory.read_u8(addr::KEY_MAP_LM + 2), Some(0x20));
     assert_eq!(loaded.memory.read_u16_be(addr::MOUSE_LOC2), Some(115));
     assert_eq!(loaded.memory.read_u16_be(addr::MOUSE_LOC2 + 2), Some(210));
+}
+
+#[test]
+fn wait_next_event_charges_toolbox_time_without_losing_queued_input() {
+    let pef = synthetic_pef_with_import(b"WaitNextEvent");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let event_ptr = PPC_DATA_BASE + 0x1100;
+    loaded.memory.add_region(event_ptr, vec![0; 16]);
+    loaded.cpu.gpr[3] = u32::from(u16::MAX);
+    loaded.cpu.gpr[4] = event_ptr;
+    loaded.cpu.gpr[5] = 0;
+    loaded.cpu.gpr[6] = 0;
+    let empty = loaded.run_with_hle_imports(64);
+    assert_eq!(empty.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], 0);
+    assert!(
+        ppc_run_result_cycles(empty.result) > 64,
+        "the Toolbox call must consume guest time"
+    );
+
+    loaded.set_event_queue([PpcQueuedEvent {
+        what: 1,
+        message: 0,
+        when: 0,
+        where_v: 120,
+        where_h: 180,
+        modifiers: 0,
+    }]);
+    loaded.cpu.pc = loaded.entry_pc;
+    loaded.cpu.lr = PPC_HALT_PC;
+    loaded.cpu.gpr[3] = u32::from(u16::MAX);
+    loaded.cpu.gpr[4] = event_ptr;
+    loaded.cpu.gpr[5] = 0;
+    loaded.cpu.gpr[6] = 0;
+    let input = loaded.run_with_hle_imports(64);
+    assert_eq!(input.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], 1);
+    assert_eq!(loaded.memory.read_u16_be(event_ptr), Some(1));
+    assert!(loaded.event_queue().is_empty());
+    assert!(ppc_run_result_cycles(input.result) > 64);
 }

@@ -1975,7 +1975,7 @@ pub struct TrapDispatcher {
     /// Full trap word currently being dispatched. Some OS traps share the
     /// low 8-bit trap number and require bit 8 to distinguish variants.
     pub(crate) current_trap_word: u16,
-    /// Whether the last GetNextEvent returned no event and did no host-visible work.
+    /// Whether the last event poll returned immediately with no event or host-visible work.
     pub(crate) last_null_event_poll: bool,
     /// Whether the last default SoundDispatch was the bounded channel-status query.
     pub(crate) last_bounded_sound_status: bool,
@@ -4895,10 +4895,14 @@ impl TrapDispatcher {
         self.vfs_volume_by_name(root)
     }
 
+    pub(crate) fn resource_fork_backing_path(path: &str) -> Option<&str> {
+        path.strip_prefix("__rsrc__")
+            .or_else(|| path.strip_prefix(crate::loader::ppc::PPC_OPEN_RESOURCE_FORK_PREFIX))
+    }
+
     /// Return whether the path's mounted volume has its hardware-lock bit.
-    /// Resource-fork mirrors use a `__rsrc__` prefix.
     pub(crate) fn vfs_path_is_read_only(&self, path: &str) -> bool {
-        let path = path.strip_prefix("__rsrc__").unwrap_or(path);
+        let path = Self::resource_fork_backing_path(path).unwrap_or(path);
         self.vfs_volume_for_path(path)
             .is_some_and(|volume| volume.attributes & 0x0080 != 0)
     }
@@ -6538,6 +6542,21 @@ impl TrapDispatcher {
         })
     }
 
+    /// Translate the internal application-map key into its guest FCB reference.
+    pub(crate) fn guest_current_resource_refnum(&self, bus: &MacMemoryBus) -> u16 {
+        let refnum = self.current_resource_refnum();
+        if refnum == 0 {
+            bus.read_word(crate::memory::globals::addr::CUR_APREF_NUM)
+        } else {
+            refnum
+        }
+    }
+
+    pub(crate) fn sync_guest_curmap(&self, bus: &mut MacMemoryBus) {
+        let refnum = self.guest_current_resource_refnum(bus);
+        bus.write_word(0x0A5A, refnum);
+    }
+
     pub(crate) fn set_current_resource_refnum(&mut self, bus: &mut MacMemoryBus, refnum: u16) {
         let selected = self.with_resource_manager_mut(|resource_manager| {
             let mut selected = 0;
@@ -6553,7 +6572,7 @@ impl TrapDispatcher {
         });
         self.process_file_system.resource_manager.current_resource_file
             .with_mut(|current_file| *current_file = selected as i16);
-        bus.write_word(0x0A5A, self.current_resource_refnum());
+        self.sync_guest_curmap(bus);
     }
 
     pub(crate) fn set_resource_file_name(&mut self, refnum: u16, name: impl Into<String>) {
@@ -6914,7 +6933,7 @@ impl TrapDispatcher {
 
         self.write_refnums.remove(&refnum);
         Self::clear_file_fcb(bus, refnum);
-        bus.write_word(0x0A5A, self.current_resource_refnum());
+        self.sync_guest_curmap(bus);
 
         if trace_resfile_enabled() {
             eprintln!(
@@ -7670,9 +7689,9 @@ impl TrapDispatcher {
         // still end the batch through the default-table check below.
         (matches!(
             trap,
-            0xa853 | 0xa855 | 0xa858 | 0xa8ad | 0xa972 | 0xa975 | 0xa97f | 0xa9b4 | 0xaa31 | 0xaa32
+            0xa853 | 0xa855 | 0xa858 | 0xa8a7 | 0xa8ad | 0xa972 | 0xa975 | 0xa97f | 0xa9b4 | 0xaa31 | 0xaa32
         )
-            || (trap == 0xa970 && self.last_null_event_poll)
+            || (matches!(trap, 0xa860 | 0xa970) && self.last_null_event_poll)
             || (trap == 0xa800 && self.last_bounded_sound_status))
             && (self.trap_table_cell_is_default(bus, trap)
                 // Some profiles have a permanent come-from head. Resolve its
@@ -8038,7 +8057,7 @@ impl TrapDispatcher {
                 current_file: 0,
             });
         });
-        bus.write_word(0x0A5A, 0);
+        self.sync_guest_curmap(bus);
         // Some classic runtimes locate relocation resources by walking the
         // Resource Manager's guest-visible map through TopMapHndl. Keep the
         // HLE indexes above, but also expose the serialized application map

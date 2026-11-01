@@ -12,7 +12,7 @@ architectures:
 - 68k
 default_architecture: 68k
 category: Arcade
-launch_enabled: true
+launch_enabled: false
 compatibility:
   status: playable
   verified:
@@ -43,7 +43,7 @@ artifacts:
     - https://classicmacdemos.com/crystal-quest
     - https://classicmacdemos.com/download/crystal-quest/
     - https://static.classicmacdemos.com/demos/crystal-quest/README.txt
-    license: Casady & Greene Crystal Quest promotional sample distribution
+    license: Maintainer-accepted freely distributed promotional demo
     rights_holder: Crystal Quest rights holders
     permission: >-
       Casady & Greene packaged and distributed this self-contained title as Crystal
@@ -52,6 +52,9 @@ artifacts:
       Classic Macintosh Game Demos documents the sample on four contemporary demo discs
       and continues to offer this specific archive as the demo. Only the original sample
       is staged, not the commercial release or its modern revival.
+      Hosting was accepted by the Systemless maintainer on 1 November 2026 under the
+      policy for unchanged, freely circulated promotional demos (see #5273). Preserve the
+      complete unchanged archive and remove it if a rights holder objects.
     notes: >-
       Unchanged 252,570-byte StuffIt archive from Classic Macintosh Game Demos;
       SHA-256 88cf365c6985786e383acec7582ea6467b448f6f12c43cb9f46cd1fd1a552f0e.

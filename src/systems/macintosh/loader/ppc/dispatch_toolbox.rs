@@ -41,6 +41,19 @@ pub(super) fn dispatch_toolbox_import(
         PpcImportDispatcherTarget::EqualString => {
             Some(PpcImportAction::Return(ppc_equal_string(cpu, memory)))
         }
+        PpcImportDispatcherTarget::UpperCString => {
+            // void upperstring(char *theString, Boolean diacSens): the C glue
+            // for UpperString (Inside Macintosh: Text, pp. 5-64--5-65). The
+            // string is converted in place and its length is unchanged.
+            if let Some(mut bytes) = ppc_read_bounded_c_string(memory, cpu.gpr[3]) {
+                crate::text_utils::evaluate_upper_string(&mut bytes, cpu.gpr[4] != 0);
+                let _ = memory.write_bytes(cpu.gpr[3], &bytes);
+            }
+            Some(PpcImportAction::ReturnPreserve)
+        }
+        PpcImportDispatcherTarget::EqualCString => {
+            Some(PpcImportAction::Return(ppc_equal_c_string(cpu, memory)))
+        }
         PpcImportDispatcherTarget::RelString => {
             let left = ppc_read_pstring_bytes(memory, cpu.gpr[3])?;
             let right = ppc_read_pstring_bytes(memory, cpu.gpr[4])?;
@@ -54,38 +67,21 @@ pub(super) fn dispatch_toolbox_import(
             );
             Some(PpcImportAction::Return(ppc_i16_result(result)))
         }
-        PpcImportDispatcherTarget::EqualStringC | PpcImportDispatcherTarget::RelStringC => {
+        PpcImportDispatcherTarget::RelStringC => {
             let left = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[3], 255);
             let right = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[4], 255);
-            let case_sensitive = cpu.gpr[5] & 0xff != 0;
-            let diac_sensitive = cpu.gpr[6] & 0xff != 0;
-            Some(PpcImportAction::Return(
-                if binding.dispatcher_target == PpcImportDispatcherTarget::EqualStringC {
-                    u32::from(crate::text_utils::evaluate_equal_string(
-                        &left,
-                        &right,
-                        case_sensitive,
-                        diac_sensitive,
-                    ))
-                } else {
-                    ppc_i16_result(crate::text_utils::evaluate_rel_string(
-                        &left,
-                        &right,
-                        case_sensitive,
-                        diac_sensitive,
-                    ))
-                },
-            ))
+            Some(PpcImportAction::Return(ppc_i16_result(
+                crate::text_utils::evaluate_rel_string(
+                    &left,
+                    &right,
+                    cpu.gpr[5] & 0xff != 0,
+                    cpu.gpr[6] & 0xff != 0,
+                ),
+            )))
         }
         PpcImportDispatcherTarget::ScreenRes => {
             let _ = memory.write_u16_be(cpu.gpr[3], 72);
             let _ = memory.write_u16_be(cpu.gpr[4], 72);
-            Some(PpcImportAction::ReturnPreserve)
-        }
-        PpcImportDispatcherTarget::UpperStringC => {
-            let mut bytes = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[3], 255);
-            crate::text_utils::evaluate_upper_string(&mut bytes, cpu.gpr[4] & 0xff != 0);
-            let _ = memory.write_bytes(cpu.gpr[3], &bytes);
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::InitEditionPackVersion => {
@@ -236,6 +232,37 @@ pub(crate) fn ppc_sys_environs(memory: &mut PpcSectionMem, rec_ptr: u32) -> i16 
 
 pub(crate) fn ppc_read_pstring(memory: &mut PpcSectionMem, addr: u32) -> Option<String> {
     Some(decode_mac_roman(&ppc_read_pstring_bytes(memory, addr)?))
+}
+
+/// Read a NUL-terminated string of at most 255 bytes, the Str255 bound used by
+/// the lowercase C-string glue. Unreadable or unterminated strings fail.
+fn ppc_read_bounded_c_string(memory: &mut PpcSectionMem, address: u32) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for offset in 0..=u32::from(u8::MAX) {
+        match memory.read_u8(address.checked_add(offset)?)? {
+            0 => return Some(bytes),
+            byte => bytes.push(byte),
+        }
+    }
+    None
+}
+
+/// `Boolean equalstring(const char *str1, const char *str2, Boolean caseSens,
+/// Boolean diacSens)`: the C-string glue for EqualString (Universal Interfaces
+/// 3.x, TextUtils.h). Comparison rules are EqualString's.
+pub(crate) fn ppc_equal_c_string(cpu: &PpcCpu, memory: &mut PpcSectionMem) -> u32 {
+    let (Some(a), Some(b)) = (
+        ppc_read_bounded_c_string(memory, cpu.gpr[3]),
+        ppc_read_bounded_c_string(memory, cpu.gpr[4]),
+    ) else {
+        return 0;
+    };
+    u32::from(crate::text_utils::evaluate_equal_string(
+        &a,
+        &b,
+        (cpu.gpr[5] & 0xff) != 0,
+        (cpu.gpr[6] & 0xff) != 0,
+    ))
 }
 
 pub(crate) fn ppc_equal_string(cpu: &PpcCpu, memory: &mut PpcSectionMem) -> u32 {

@@ -498,6 +498,9 @@ pub(crate) fn dispatch_supported_import(
             heap_limit,
             last_mem_error,
             handles,
+            files,
+            writable_refnums,
+            vfs_files,
             resource_files,
             vfs_resource_files,
             vfs_resources,
@@ -760,7 +763,6 @@ pub(crate) fn dispatch_supported_import(
         binding.dispatcher_target,
         PpcImportDispatcherTarget::GetFNumC
             | PpcImportDispatcherTarget::StringWidthC
-            | PpcImportDispatcherTarget::DrawStringC
     );
     if c_string_font_input {
         dispatch_stdc::ppc_c2pstr(cpu, memory);
@@ -1843,6 +1845,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::CurResFile
         | PpcImportDispatcherTarget::UseResFile
         | PpcImportDispatcherTarget::OpenResFile
+        | PpcImportDispatcherTarget::OpenResFileCString
         | PpcImportDispatcherTarget::OpenRFPerm
         | PpcImportDispatcherTarget::HOpenResFile
         | PpcImportDispatcherTarget::SetResErr
@@ -2056,6 +2059,7 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::DrawChar
         | PpcImportDispatcherTarget::DrawText
         | PpcImportDispatcherTarget::DrawString
+        | PpcImportDispatcherTarget::DrawCString
         | PpcImportDispatcherTarget::TextFont
         | PpcImportDispatcherTarget::TextFace
         | PpcImportDispatcherTarget::TextMode
@@ -2089,6 +2093,7 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::FrameRoundRect
         | PpcImportDispatcherTarget::PaintRoundRect
         | PpcImportDispatcherTarget::EraseRoundRect
+        | PpcImportDispatcherTarget::InvertRoundRect
         | PpcImportDispatcherTarget::FillRoundRect => {
             unreachable!("QuickDraw imports return through dispatch_quickdraw_import")
         }
@@ -2252,8 +2257,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::GetFontName
         | PpcImportDispatcherTarget::GetFontNameC
         | PpcImportDispatcherTarget::GetFNumC
-        | PpcImportDispatcherTarget::StringWidthC
-        | PpcImportDispatcherTarget::DrawStringC => {
+        | PpcImportDispatcherTarget::StringWidthC => {
             unreachable!("Font Manager imports return through dispatch_font_import")
         }
         PpcImportDispatcherTarget::DMGetDisplayIDByGDevice
@@ -2433,9 +2437,9 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::SysEnvirons
         | PpcImportDispatcherTarget::SVersion
         | PpcImportDispatcherTarget::EqualString
-        | PpcImportDispatcherTarget::EqualStringC
+        | PpcImportDispatcherTarget::EqualCString
         | PpcImportDispatcherTarget::RelStringC
-        | PpcImportDispatcherTarget::UpperStringC
+        | PpcImportDispatcherTarget::UpperCString
         | PpcImportDispatcherTarget::ScreenRes
         | PpcImportDispatcherTarget::RelString
         | PpcImportDispatcherTarget::InitEditionPackVersion
@@ -3338,6 +3342,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::EventAvail
         | PpcImportDispatcherTarget::OSEventAvail
         | PpcImportDispatcherTarget::PostEvent
+        | PpcImportDispatcherTarget::PPostEvent
         | PpcImportDispatcherTarget::Button
         | PpcImportDispatcherTarget::StillDown
         | PpcImportDispatcherTarget::WaitMouseUp

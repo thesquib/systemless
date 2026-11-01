@@ -5717,7 +5717,7 @@ impl super::TrapDispatcher {
                 let event_ptr = bus.read_long(sp + 8);
                 let event_mask = bus.read_word(sp + 12);
 
-                self.service_invalid_menu_bar(bus);
+                self.event_poll_requires_yield = self.service_invalid_menu_bar(bus);
 
                 // tick_count is maintained by the runner via advance_guest_tick()
                 self.event_counter = self.event_counter.wrapping_add(1);
@@ -5756,6 +5756,15 @@ impl super::TrapDispatcher {
                             self.debug_mouse_moved_event_count.saturating_add(1);
                     }
                 }
+
+                // A null poll with no sleep or retained SystemTask return is
+                // bounded host work only if the menu-bar service did not draw.
+                // Keep real events, mouse-region events and sleeping waits as
+                // browser slice boundaries.
+                self.last_null_event_poll = !has_event
+                    && sleep == 0
+                    && !self.event_poll_requires_yield
+                    && self.system_task_wne_returns.is_empty();
 
                 if !has_event && sleep != 0 {
                     // WaitNextEvent returns a null event only after the caller's
@@ -7139,7 +7148,7 @@ impl super::TrapDispatcher {
                     // IM:I I-116: invalid refnum leaves the current file
                     // unchanged and ResError returns resFNotFound.
                     bus.write_word(0x0A60, (-193i16) as u16);
-                    bus.write_word(0x0A5A, self.current_resource_refnum());
+                    self.sync_guest_curmap(bus);
                 }
                 cpu.write_reg(Register::A7, sp + 2);
                 Ok(())
@@ -14506,6 +14515,16 @@ impl super::TrapDispatcher {
                         let mut found = false;
                         let mut target_is_folder = false;
                         for candidate_dir_id in self.hfs_lookup_directory_ids(vref, dir_id) {
+                            // Check an actual directory before the file lookup: that
+                            // lookup can fall back to a child of the named folder.
+                            if self
+                                .find_vfs_directory_in_directory(candidate_dir_id, &name)
+                                .is_some()
+                            {
+                                found = true;
+                                target_is_folder = true;
+                                break;
+                            }
                             if self
                                 .find_vfs_file_in_directory(candidate_dir_id, &name)
                                 .is_some()
@@ -14514,14 +14533,6 @@ impl super::TrapDispatcher {
                                     .is_some()
                             {
                                 found = true;
-                                break;
-                            }
-                            if self
-                                .find_vfs_directory_in_directory(candidate_dir_id, &name)
-                                .is_some()
-                            {
-                                found = true;
-                                target_is_folder = true;
                                 break;
                             }
                         }
