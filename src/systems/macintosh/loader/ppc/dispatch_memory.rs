@@ -887,6 +887,10 @@ pub(super) fn dispatch_memory_import(
             };
             Some(PpcImportAction::ReturnPreserve)
         }
+        PpcImportDispatcherTarget::SetMemErr => {
+            *last_mem_error = cpu.gpr[3] as u16 as i16;
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::MemError => {
             if ppc_hle_trace_enabled() && *last_mem_error != PPC_NO_ERR {
                 eprintln!("[PPC-TRACE] MemError lr=${:08X} -> {}", cpu.lr, *last_mem_error);

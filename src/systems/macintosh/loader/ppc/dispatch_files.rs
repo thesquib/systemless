@@ -444,6 +444,10 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 default_dir_id,
             ) as u16 as u32))
         }
+        PpcImportDispatcherTarget::SetResErr => {
+            *last_resource_error = cpu.gpr[3] as u16 as i16;
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::ResError => Some(PpcImportAction::Return(ppc_i16_result(
             *last_resource_error,
         ))),
@@ -529,7 +533,7 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
         PpcImportDispatcherTarget::PBFlushVol => Some(PpcImportAction::Return(ppc_i16_result(
             ppc_complete_pb(memory, cpu.gpr[3], PPC_NO_ERR),
         ))),
-        PpcImportDispatcherTarget::PBHGetVInfo => {
+        PpcImportDispatcherTarget::PBGetVInfo | PpcImportDispatcherTarget::PBHGetVInfo => {
             Some(PpcImportAction::Return(ppc_i16_result(ppc_pbh_get_v_info(
                 cpu,
                 memory,
@@ -539,6 +543,7 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 vfs_resource_files,
                 default_dir_id,
                 working_directories,
+                matches!(binding.dispatcher_target, PpcImportDispatcherTarget::PBHGetVInfo),
             ))))
         }
         PpcImportDispatcherTarget::PBGetVolumeInfo => {
@@ -797,6 +802,7 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 vfs_resource_files,
                 vfs_resources,
                 default_dir_id,
+                working_directories,
             ),
         ))),
         PpcImportDispatcherTarget::PBSetCatInfo => Some(PpcImportAction::Return(ppc_i16_result(
@@ -973,6 +979,9 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 aliases,
             ))))
         }
+        PpcImportDispatcherTarget::GetAliasInfo => Some(PpcImportAction::Return(ppc_i16_result(
+            ppc_get_alias_info(cpu, memory, vfs_directories, handles, aliases),
+        ))),
         PpcImportDispatcherTarget::MatchAlias => Some(PpcImportAction::Return(ppc_i16_result(
             ppc_match_alias(cpu, memory, vfs_directories, handles, aliases),
         ))),
@@ -1328,6 +1337,48 @@ pub(super) fn ppc_dispatch_file_compatibility(
             let requested_vref = memory.read_u16_be(pb + 22).unwrap_or(0) as i16;
             let requested_dir_id = memory.read_u32_be(pb + 48).unwrap_or(0);
             let proc_id = memory.read_u32_be(pb + 28).unwrap_or(0);
+            // ioNamePtr names the directory relative to the volume and dirID.
+            // Inside Macintosh: Files (1992), PBOpenWD.
+            let name_bytes = memory
+                .read_u32_be(pb + 18)
+                .filter(|name_ptr| *name_ptr != 0)
+                .and_then(|name_ptr| ppc_read_pstring_bytes(memory, name_ptr))
+                .unwrap_or_default();
+            let requested_dir_id = if name_bytes.is_empty() {
+                requested_dir_id
+            } else {
+                let parent_dir_id = working_directories.get(&requested_vref).map_or_else(
+                    || ppc_resolve_directory_id(requested_vref, requested_dir_id, default_dir_id),
+                    |record| {
+                        if requested_dir_id == 0 {
+                            record.dir_id
+                        } else {
+                            requested_dir_id
+                        }
+                    },
+                );
+                let name = decode_mac_roman(&name_bytes);
+                let normalized = crate::trap::TrapDispatcher::normalize_hfs_lookup_path(&name);
+                let named_path = if !name.starts_with(':') && name.contains(':') {
+                    Some(normalized)
+                } else {
+                    ppc_directory_path_for_id(vfs_directories, parent_dir_id)
+                        .map(|parent| ppc_join_vfs_path(parent, &normalized))
+                };
+                let named_dir_id = named_path
+                    .and_then(|path| ppc_directory_id_for_path(vfs_directories, &path));
+                if ppc_hle_trace_enabled() {
+                    eprintln!("[PPC-TRACE] PBOpenWD name={name:?} parent={parent_dir_id} -> {named_dir_id:?}");
+                }
+                let Some(named_dir_id) = named_dir_id else {
+                    return PpcImportAction::Return(ppc_i16_result(ppc_complete_pb(
+                        memory,
+                        pb,
+                        PPC_DIR_NF_ERR,
+                    )));
+                };
+                named_dir_id
+            };
             let result = match ppc_open_working_directory(
                 requested_vref,
                 requested_dir_id,

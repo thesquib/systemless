@@ -507,6 +507,7 @@ pub(crate) fn dispatch_supported_import(
             current_resource_refnum,
             resource_policy,
             last_resource_error,
+            toolbox_startup,
         },
     ) {
         return Some(action);
@@ -756,7 +757,17 @@ pub(crate) fn dispatch_supported_import(
         return Some(action);
     }
 
-    if let Some(action) =
+    // The lowercase C entry points convert in place around the Pascal routine,
+    // as the InterfaceLib glue does.
+    let c_string_font_input = matches!(
+        binding.dispatcher_target,
+        PpcImportDispatcherTarget::GetFNumC
+            | PpcImportDispatcherTarget::StringWidthC
+    );
+    if c_string_font_input {
+        dispatch_stdc::ppc_c2pstr(cpu, memory);
+    }
+    let font_action =
         dispatch_fonts::dispatch_font_import(dispatch_fonts::PpcFontDispatchContext {
             binding,
             cpu,
@@ -778,8 +789,11 @@ pub(crate) fn dispatch_supported_import(
             handles,
             current_resource_refnum: *current_resource_refnum,
             last_resource_error,
-        })
-    {
+        });
+    if c_string_font_input {
+        dispatch_stdc::ppc_p2cstr(cpu, memory);
+    }
+    if let Some(action) = font_action {
         return Some(action);
     }
 
@@ -1510,6 +1524,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::TempTopMem
         | PpcImportDispatcherTarget::PurgeMem
         | PpcImportDispatcherTarget::PurgeMemSys
+        | PpcImportDispatcherTarget::SetMemErr
         | PpcImportDispatcherTarget::MemError => {
             unreachable!("memory imports return through dispatch_memory_import")
         }
@@ -1833,6 +1848,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::OpenResFileCString
         | PpcImportDispatcherTarget::OpenRFPerm
         | PpcImportDispatcherTarget::HOpenResFile
+        | PpcImportDispatcherTarget::SetResErr
         | PpcImportDispatcherTarget::ResError
         | PpcImportDispatcherTarget::GetVol
         | PpcImportDispatcherTarget::GetWDInfo
@@ -1842,6 +1858,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::HSetVol
         | PpcImportDispatcherTarget::FlushVol
         | PpcImportDispatcherTarget::PBFlushVol
+        | PpcImportDispatcherTarget::PBGetVInfo
         | PpcImportDispatcherTarget::PBHGetVInfo
         | PpcImportDispatcherTarget::PBGetVolumeInfo
         | PpcImportDispatcherTarget::FSGetVolumeInfo
@@ -1869,6 +1886,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::FSMakeFSSpec
         | PpcImportDispatcherTarget::PBGetFCBInfo
         | PpcImportDispatcherTarget::FindFolder
+        | PpcImportDispatcherTarget::GetAliasInfo
         | PpcImportDispatcherTarget::ResolveAliasFile
         | PpcImportDispatcherTarget::ResolveAliasFileWithMountFlags
         | PpcImportDispatcherTarget::GetIconRefFromFile
@@ -2236,7 +2254,10 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::GetSysFont
         | PpcImportDispatcherTarget::GetAppFont
         | PpcImportDispatcherTarget::GetDefFontSize
-        | PpcImportDispatcherTarget::GetFontName => {
+        | PpcImportDispatcherTarget::GetFontName
+        | PpcImportDispatcherTarget::GetFontNameC
+        | PpcImportDispatcherTarget::GetFNumC
+        | PpcImportDispatcherTarget::StringWidthC => {
             unreachable!("Font Manager imports return through dispatch_font_import")
         }
         PpcImportDispatcherTarget::DMGetDisplayIDByGDevice
@@ -2417,7 +2438,9 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::SVersion
         | PpcImportDispatcherTarget::EqualString
         | PpcImportDispatcherTarget::EqualCString
+        | PpcImportDispatcherTarget::RelStringC
         | PpcImportDispatcherTarget::UpperCString
+        | PpcImportDispatcherTarget::ScreenRes
         | PpcImportDispatcherTarget::RelString
         | PpcImportDispatcherTarget::InitEditionPackVersion
         | PpcImportDispatcherTarget::StuffHex

@@ -2824,6 +2824,12 @@ pub(crate) fn ppc_paint_rect(
             mode,
         );
     }
+    // shortcut: notPatCopy only; other pen modes still copy, handle them when a title needs it.
+    let inverted = pattern.map(|row| !row);
+    let not_pat_copy = memory
+        .read_u16_be(current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_MODE_OFFSET))
+        == Some(12);
+    let pattern = if not_pat_copy { &inverted } else { pattern };
     if pattern.iter().all(|row| *row == 0xff) {
         return ppc_paint_rect_bounds(
             memory,

@@ -126,7 +126,16 @@ fn hle_import_runner_handles_font_metrics() {
         loaded.memory.read_u32_be(metrics_ptr + 12),
         Some(to_fixed(metrics.wid_max.saturating_mul(scale)))
     );
-    assert_eq!(loaded.memory.read_u32_be(metrics_ptr + 16), Some(0));
+    let table = loaded
+        .memory
+        .read_u32_be(metrics_ptr + 16)
+        .and_then(|handle| loaded.memory.read_u32_be(handle))
+        .unwrap();
+    let width = ppc_text_width_bytes(text_font, loaded.quickdraw_text_size, 0, b"A");
+    assert_eq!(
+        loaded.memory.read_u32_be(table + 4 * u32::from(b'A')),
+        Some(to_fixed(width)),
+    );
     assert_eq!(loaded.cpu.gpr[3], metrics_ptr);
 }
 

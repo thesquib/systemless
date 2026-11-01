@@ -2647,6 +2647,13 @@ fn native_menu_select_retains_custom_mdef_draw_and_choose_until_release() {
         Some(before.clone())
     );
     let tracking = loaded.toolbox_startup.execution.menu().snapshot().unwrap();
+    assert_eq!(
+        loaded
+            .memory
+            .read_u16_be(crate::memory::globals::addr::TOP_MENU_ITEM)
+            .map(|value| value as i16),
+        Some(tracking.content_top),
+    );
 
     loaded.set_input_snapshot(PpcInputSnapshot {
         mouse_button: false,
@@ -9787,12 +9794,7 @@ fn menu_item_command_ids_bind_and_round_trip_without_changing_shortcuts() {
         b"AppearanceLib".as_slice(),
         b"CarbonLib".as_slice(),
     ] {
-        let pef = synthetic_pef_with_loader(synthetic_loader_with_symbol_class(
-            library,
-            b"SetMenuItemCommandID",
-            0,
-            &[sm_index_reloc(0x30, 0)],
-        ));
+        let pef = synthetic_pef_with_library_import(library, b"SetMenuItemCommandID");
         let mut loaded = load_pef_application(&pef).unwrap();
         assert_eq!(
             loaded.imports[0].dispatcher_target,
@@ -9913,12 +9915,7 @@ fn menu_item_reference_constants_bind_and_round_trip_without_changing_shortcuts(
         b"AppearanceLib".as_slice(),
         b"CarbonLib".as_slice(),
     ] {
-        let pef = synthetic_pef_with_loader(synthetic_loader_with_symbol_class(
-            library,
-            b"SetMenuItemRefCon",
-            0,
-            &[sm_index_reloc(0x30, 0)],
-        ));
+        let pef = synthetic_pef_with_library_import(library, b"SetMenuItemRefCon");
         let mut loaded = load_pef_application(&pef).unwrap();
         assert_eq!(
             loaded.imports[0].dispatcher_target,

@@ -67,6 +67,23 @@ pub(super) fn dispatch_toolbox_import(
             );
             Some(PpcImportAction::Return(ppc_i16_result(result)))
         }
+        PpcImportDispatcherTarget::RelStringC => {
+            let left = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[3], 255);
+            let right = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[4], 255);
+            Some(PpcImportAction::Return(ppc_i16_result(
+                crate::text_utils::evaluate_rel_string(
+                    &left,
+                    &right,
+                    cpu.gpr[5] & 0xff != 0,
+                    cpu.gpr[6] & 0xff != 0,
+                ),
+            )))
+        }
+        PpcImportDispatcherTarget::ScreenRes => {
+            let _ = memory.write_u16_be(cpu.gpr[3], 72);
+            let _ = memory.write_u16_be(cpu.gpr[4], 72);
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::InitEditionPackVersion => {
             // As with the classic _Pack11 InitEditionPack path, initialization
             // succeeds for the process-owned Edition Manager stub.

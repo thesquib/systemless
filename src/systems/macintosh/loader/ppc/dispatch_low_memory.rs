@@ -10,13 +10,22 @@ pub enum PpcLowMemoryAccessor {
     GetFsFcbLen,
     GetGzMoveHnd,
     GetGzRootHnd,
+    GetScrHRes,
+    GetScrVRes,
     GetTheMenu,
+    GetTopMapHndl,
     /// LMSetCursorNew: the CrsrNew byte at $08CE.
     SetCursorNew,
     /// LMSetMouseTemp: the MTemp Point at $0828.
     SetMouseTemp,
     /// LMSetRawMouseLocation: the RawMouse Point at $082C.
     SetRawMouseLocation,
+    SetTopMapHndl,
+    GetFractEnable,
+    SetFractEnable,
+    SetFScaleDisable,
+    SetLastSpExtra,
+    SetMenuDisable,
 }
 
 pub(super) struct PpcLowMemoryDispatchContext<'a> {
@@ -55,11 +64,13 @@ pub(super) fn dispatch_low_memory_import(
                 }
                 PpcLowMemoryAccessor::GetDoubleTime
                 | PpcLowMemoryAccessor::GetGzMoveHnd
-                | PpcLowMemoryAccessor::GetGzRootHnd => {
+                | PpcLowMemoryAccessor::GetGzRootHnd
+                | PpcLowMemoryAccessor::GetTopMapHndl => {
                     let address = match accessor {
                         PpcLowMemoryAccessor::GetDoubleTime => addr::DOUBLE_TIME,
                         PpcLowMemoryAccessor::GetGzMoveHnd => addr::GZ_MOVE_HND,
                         PpcLowMemoryAccessor::GetGzRootHnd => addr::GZ_ROOT_HND,
+                        PpcLowMemoryAccessor::GetTopMapHndl => addr::TOP_MAP_HNDL,
                         _ => unreachable!(),
                     };
                     return Some(
@@ -68,11 +79,16 @@ pub(super) fn dispatch_low_memory_import(
                             .map_or(PpcImportAction::Halt, PpcImportAction::Return),
                     );
                 }
-                PpcLowMemoryAccessor::GetFsFcbLen | PpcLowMemoryAccessor::GetTheMenu => {
-                    let address = if *accessor == PpcLowMemoryAccessor::GetFsFcbLen {
-                        addr::FS_FCB_LEN
-                    } else {
-                        addr::THE_MENU
+                PpcLowMemoryAccessor::GetFsFcbLen
+                | PpcLowMemoryAccessor::GetScrHRes
+                | PpcLowMemoryAccessor::GetScrVRes
+                | PpcLowMemoryAccessor::GetTheMenu => {
+                    let address = match accessor {
+                        PpcLowMemoryAccessor::GetFsFcbLen => addr::FS_FCB_LEN,
+                        PpcLowMemoryAccessor::GetScrHRes => addr::SCR_H_RES,
+                        PpcLowMemoryAccessor::GetScrVRes => addr::SCR_V_RES,
+                        PpcLowMemoryAccessor::GetTheMenu => addr::THE_MENU,
+                        _ => unreachable!(),
                     };
                     return Some(
                         memory
@@ -88,6 +104,25 @@ pub(super) fn dispatch_low_memory_import(
                 PpcLowMemoryAccessor::SetMouseTemp => memory.write_u32_be(addr::M_TEMP, cpu.gpr[3]),
                 PpcLowMemoryAccessor::SetRawMouseLocation => {
                     memory.write_u32_be(addr::MOUSE_LOC, cpu.gpr[3])
+                }
+                PpcLowMemoryAccessor::SetTopMapHndl => {
+                    memory.write_u32_be(addr::TOP_MAP_HNDL, cpu.gpr[3])
+                }
+                PpcLowMemoryAccessor::GetFractEnable => {
+                    let value = memory.read_u8(addr::FRACT_ENABLE).unwrap_or(0);
+                    return Some(PpcImportAction::Return(u32::from(value)));
+                }
+                PpcLowMemoryAccessor::SetFractEnable => {
+                    memory.write_u8(addr::FRACT_ENABLE, cpu.gpr[3] as u8)
+                }
+                PpcLowMemoryAccessor::SetFScaleDisable => {
+                    memory.write_u8(addr::FSCALE_DISABLE, cpu.gpr[3] as u8)
+                }
+                PpcLowMemoryAccessor::SetLastSpExtra => {
+                    memory.write_u32_be(addr::LAST_SP_EXTRA, cpu.gpr[3])
+                }
+                PpcLowMemoryAccessor::SetMenuDisable => {
+                    memory.write_u32_be(addr::MENU_DISABLE, cpu.gpr[3])
                 }
             };
             Some(written.map_or(PpcImportAction::Halt, |_| PpcImportAction::ReturnPreserve))

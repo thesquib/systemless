@@ -175,6 +175,7 @@ pub(super) fn ppc_pb_get_cat_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     vfs_resources: &[PpcVfsResourceRecord],
     default_dir_id: u32,
+    working_directories: &HashMap<i16, ProcessWorkingDirectory>,
 ) -> i16 {
     let pb = cpu.gpr[3];
     if pb == 0 {
@@ -197,6 +198,21 @@ pub(super) fn ppc_pb_get_cat_info(
     let Some(requested_dir_id) = memory.read_u32_be(pb + 48) else {
         return PPC_PARAM_ERR;
     };
+    // A working directory reference stands in for the volume and, with dirID 0,
+    // the directory. Inside Macintosh: Files (1992), 2-181.
+    let (vref, requested_dir_id) = working_directories.get(&vref).map_or(
+        (vref, requested_dir_id),
+        |record| {
+            (
+                record.volume_ref_num,
+                if requested_dir_id == 0 {
+                    record.dir_id
+                } else {
+                    requested_dir_id
+                },
+            )
+        },
+    );
     let effective_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
     // A negative index selects the directory by ID. ioNamePtr is output-only,
     // including when its buffer does not yet contain a valid Pascal string.
@@ -291,10 +307,17 @@ pub(super) fn ppc_pb_get_cat_info(
     } else {
         entry.name.clone()
     };
-    if name_ptr != 0 && !ppc_write_pstring_bytes(memory, name_ptr, &output_name) {
+    // With ioFDirIndex zero ioNamePtr is input only, and callers reuse the buffer
+    // holding a full path. Inside Macintosh: Files (1992), p. 2-191.
+    if fdir_index != 0
+        && name_ptr != 0
+        && !ppc_write_pstring_bytes(memory, name_ptr, &output_name)
+    {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
-    if memory.write_u16_be(pb + 22, resolved_vref as u16).is_none() {
+    // ioVRefNum is input-only here: callers enumerating by index reuse the block
+    // with vRefNum 0 meaning the default directory.
+    if pathname_volume.is_some() && memory.write_u16_be(pb + 22, resolved_vref as u16).is_none() {
         return PPC_PARAM_ERR;
     }
     if ppc_hle_trace_enabled() {
@@ -732,9 +755,11 @@ pub(super) fn ppc_pbh_get_v_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     default_dir_id: u32,
     working_directories: &HashMap<i16, ProcessWorkingDirectory>,
+    hierarchical: bool,
 ) -> i16 {
     let pb = cpu.gpr[3];
-    if pb == 0 || !ppc_memory_can_write_bytes(memory, pb, 122) {
+    let pb_len = if hierarchical { 122 } else { 64 };
+    if pb == 0 || !ppc_memory_can_write_bytes(memory, pb, pb_len) {
         return PPC_PARAM_ERR;
     }
     let Some(name_ptr) = memory.read_u32_be(pb + 18) else {
@@ -866,6 +891,15 @@ pub(super) fn ppc_pbh_get_v_info(
         memory.write_u16_be(pb + 56, volume.allocation_start),
         memory.write_u32_be(pb + 58, volume.next_catalog_id),
         memory.write_u16_be(pb + 62, volume.free_blocks),
+    ];
+    if writes.iter().any(Option::is_none) {
+        return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
+    }
+    // PBGetVInfo callers supply a VolumeParam, which ends at ioVFrBlk.
+    if !hierarchical {
+        return ppc_complete_pb(memory, pb, PPC_NO_ERR);
+    }
+    let writes = [
         memory.write_u16_be(pb + 64, 0x4244),
         memory.write_u16_be(pb + 66, 1),
         memory.write_u16_be(pb + 68, (-33i16) as u16),
@@ -1942,7 +1976,7 @@ pub(super) fn ppc_resolved_fsspec_target_path(
         return None;
     };
     let name = decode_mac_roman(name_bytes);
-    let normalized_name = crate::trap::TrapDispatcher::normalize_hfs_path(&name);
+    let normalized_name = crate::trap::TrapDispatcher::normalize_hfs_lookup_path(&name);
     if normalized_name.is_empty() {
         return None;
     }
@@ -4115,7 +4149,7 @@ pub(super) fn ppc_open_res_file(
         *last_resource_error = PPC_PARAM_ERR;
         return -1;
     };
-    let normalized_name = ppc_normalize_vfs_path(&decode_mac_roman(&name_bytes));
+    let normalized_name = crate::trap::TrapDispatcher::normalize_hfs_lookup_path(&decode_mac_roman(&name_bytes));
     if normalized_name.is_empty() {
         *last_resource_error = PPC_PARAM_ERR;
         return -1;
@@ -6240,6 +6274,45 @@ pub(super) fn ppc_resolve_alias(
     {
         return PPC_PARAM_ERR;
     }
+    PPC_NO_ERR
+}
+
+/// GetAliasInfo: index 0 is the target's name, -1 its volume, -2 and -3 the
+/// AppleShare server and zone, and N > 0 the Nth folder above the target.
+pub(super) fn ppc_get_alias_info(
+    cpu: &PpcCpu,
+    memory: &mut PpcSectionMem,
+    vfs_directories: &[PpcVfsDirectory],
+    handles: &[PpcHandleRecord],
+    aliases: &[PpcAliasRecord],
+) -> i16 {
+    let alias_handle = cpu.gpr[3];
+    let index = cpu.gpr[4] as i16;
+    let out = cpu.gpr[5];
+    let Some(alias) = aliases
+        .iter()
+        .find(|record| record.handle == alias_handle)
+        .cloned()
+        .or_else(|| {
+            ppc_alias_record_from_handle(memory, handles, alias_handle, Some(vfs_directories))
+        })
+    else {
+        return PPC_PARAM_ERR;
+    };
+    let name = match index {
+        0 => alias.target_name,
+        -1 => encode_mac_roman_lossy(crate::trap::TrapDispatcher::boot_volume_name()),
+        n if n > 0 => vfs_directories
+            .iter()
+            .find(|directory| directory.dir_id == alias.target_dir_id)
+            .and_then(|directory| {
+                directory.path.rsplit('/').filter(|part| !part.is_empty()).nth(n as usize - 1)
+            })
+            .map(encode_mac_roman_lossy)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    ppc_write_pstring_bytes(memory, out, &name);
     PPC_NO_ERR
 }
 

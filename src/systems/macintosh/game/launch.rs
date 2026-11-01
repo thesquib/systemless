@@ -760,7 +760,7 @@ impl<'a> WebPackLoader<'a> {
             {
                 let pending = self.pending.take().expect("complete web-pack entry");
                 self.filter_suite
-                    .record(pending.file_type_code, pending.creator_code);
+                    .record(&pending.name, pending.file_type_code, pending.creator_code);
                 maybe_select_executable_with_preference(
                     &mut self.executable_entry,
                     &pending.name,
@@ -1401,27 +1401,44 @@ struct PayloadFile {
 /// filter suite itself is a standalone application.
 #[derive(Default)]
 struct FilterSuiteContents {
-    filter_creators: std::collections::BTreeMap<[u8; 4], usize>,
-    application_creators: std::collections::BTreeSet<[u8; 4]>,
+    filters: Vec<(String, [u8; 4])>,
+    applications: Vec<(String, [u8; 4])>,
 }
 
 impl FilterSuiteContents {
-    fn record(&mut self, file_type: [u8; 4], creator: [u8; 4]) {
+    fn record(&mut self, name: &str, file_type: [u8; 4], creator: [u8; 4]) {
         if file_type == *b"8BFM" {
-            *self.filter_creators.entry(creator).or_default() += 1;
+            self.filters.push((name.to_string(), creator));
         } else if file_type == *b"APPL" {
-            self.application_creators.insert(creator);
+            self.applications.push((name.to_string(), creator));
         }
+    }
+
+    /// A filter in a subfolder of an application's folder is that host's plug-in.
+    fn has_host_folder(&self, filter: &str) -> bool {
+        self.applications.iter().any(|(application, _)| {
+            application.rsplit_once('/').is_some_and(|(folder, _)| {
+                filter
+                    .strip_prefix(folder)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(|rest| rest.contains('/'))
+            })
+        })
     }
 
     fn reject_without_host(&self, runner: &FixtureRunner) -> Result<(), String> {
         if runner.preferred_executable_path().is_some() || executable_name_override().is_some() {
             return Ok(());
         }
-        let plugin_suite_without_host = self
-            .filter_creators
-            .iter()
-            .any(|(creator, count)| *count >= 2 && !self.application_creators.contains(creator));
+        let mut filter_creators = std::collections::BTreeMap::<[u8; 4], usize>::new();
+        for (filter, creator) in &self.filters {
+            if !self.has_host_folder(filter) {
+                *filter_creators.entry(*creator).or_default() += 1;
+            }
+        }
+        let plugin_suite_without_host = filter_creators.iter().any(|(creator, count)| {
+            *count >= 2 && !self.applications.iter().any(|(_, other)| other == creator)
+        });
         if plugin_suite_without_host {
             return Err("Archive contains Photoshop-compatible filters but no standalone application for the suite; open the filters with a compatible image editor".to_string());
         }
@@ -1435,7 +1452,7 @@ fn reject_filter_suite_without_host(
 ) -> Result<(), String> {
     let mut contents = FilterSuiteContents::default();
     for file in &payload.files {
-        contents.record(file.file_type, file.creator);
+        contents.record(&file.name, file.file_type, file.creator);
     }
     contents.reject_without_host(runner)
 }
@@ -2286,6 +2303,37 @@ fn expand_installer_maker_payload(
     Ok(Some(payload))
 }
 
+/// Where an installer's per-language folder lands in the shared application tree.
+// shortcut: US only and inferred from the catalog layout, parse the installer's actions when another title needs it.
+fn vise_locale_overlay_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("US/")?;
+    let rest = rest.strip_prefix("RSRC/").unwrap_or(rest);
+    Some(format!("Universal/App/RSRC/{rest}"))
+}
+
+fn apply_vise_locale_overlay(entries: &mut Vec<crate::game::vise::ViseEntry<'_>>) {
+    if entries
+        .iter()
+        .any(|entry| entry.path.starts_with("Universal/App/RSRC/"))
+    {
+        let overlaid = entries
+            .iter()
+            .filter_map(|entry| vise_locale_overlay_path(&entry.path))
+            .collect::<std::collections::HashSet<_>>();
+        entries.retain(|entry| !overlaid.contains(&entry.path));
+        // US/X and US/RSRC/X land on the same path; two writers would mix their forks.
+        let mut seen = std::collections::HashSet::new();
+        entries.retain(|entry| {
+            vise_locale_overlay_path(&entry.path).is_none_or(|path| seen.insert(path))
+        });
+        for entry in entries.iter_mut() {
+            if let Some(path) = vise_locale_overlay_path(&entry.path) {
+                entry.path = path;
+            }
+        }
+    }
+}
+
 fn expand_vise_payload(
     name: &str,
     data: &[u8],
@@ -2366,7 +2414,9 @@ fn expand_vise_payload(
         installer_roots: vec![name.to_string()],
         skipped_disk_image_errors: Vec::new(),
     };
-    for entry in archive.entries {
+    let mut entries = archive.entries;
+    apply_vise_locale_overlay(&mut entries);
+    for entry in entries {
         let extract_fork = |packed_offset: usize,
                             packed: &[u8],
                             unpacked_offset: usize,
@@ -4270,6 +4320,53 @@ mod tests {
     }
 
     #[test]
+    fn vise_locale_overlay_keeps_one_entry_per_target_path() {
+        let entry = |path: &str, data_unpacked_len| crate::game::vise::ViseEntry {
+            path: path.to_string(),
+            file_type: *b"TEXT",
+            creator: *b"ttxt",
+            external: false,
+            data_packed: &[],
+            rsrc_packed: &[],
+            data_packed_offset: 0,
+            rsrc_packed_offset: 0,
+            unpacked_offset: 0,
+            data_unpacked_offset: 0,
+            rsrc_unpacked_offset: 0,
+            data_unpacked_len,
+            rsrc_unpacked_len: 0,
+        };
+        let mut entries = vec![
+            entry("Universal/App/RSRC/a", 1),
+            entry("US/a", 2),
+            entry("US/RSRC/a", 3),
+            entry("Universal/App/RSRC/b", 4),
+        ];
+        apply_vise_locale_overlay(&mut entries);
+        let kept = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.data_unpacked_len))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [("Universal/App/RSRC/a", 2), ("Universal/App/RSRC/b", 4)]
+        );
+    }
+
+    #[test]
+    fn vise_locale_overlay_maps_language_folder_into_shared_resources() {
+        assert_eq!(
+            vise_locale_overlay_path("US/PM7.0 RSRC").as_deref(),
+            Some("Universal/App/RSRC/PM7.0 RSRC")
+        );
+        assert_eq!(
+            vise_locale_overlay_path("US/RSRC/Plugins/ColorPkr.add").as_deref(),
+            Some("Universal/App/RSRC/Plugins/ColorPkr.add")
+        );
+        assert_eq!(vise_locale_overlay_path("Universal/App/RSRC/a"), None);
+    }
+
+    #[test]
     fn vise_external_file_copies_both_sibling_forks_without_decoding_stale_ranges() {
         let archive = external_vise_test_archive();
         let files = [external_vise_test_file()];
@@ -5306,6 +5403,16 @@ mod tests {
         payload.files.last_mut().unwrap().creator = *b"FILT";
         assert!(reject_filter_suite_without_host(&payload, &runner).is_ok());
         payload.files.last_mut().unwrap().creator = *b"VIEW";
+        payload.files.last_mut().unwrap().name = "Suite/Viewer".into();
+        assert!(reject_filter_suite_without_host(&payload, &runner).is_err());
+        for file in payload.files.iter_mut().take(2) {
+            file.name = file.name.replace("Suite/", "Suite/Plug-ins/");
+        }
+        assert!(reject_filter_suite_without_host(&payload, &runner).is_ok());
+        for file in payload.files.iter_mut().take(2) {
+            file.name = file.name.replace("Suite/Plug-ins/", "Suite/");
+        }
+        payload.files.last_mut().unwrap().name = "Suite/Art Gallery/Viewer".into();
         runner.set_preferred_executable_path(Some("Suite/Art Gallery/Viewer"));
         assert!(reject_filter_suite_without_host(&payload, &runner).is_ok());
     }

@@ -767,6 +767,40 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
     }
 
     #[test]
+    fn get_alias_info_reports_the_target_name_and_folders() {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(b"GetAliasInfo")).unwrap();
+        let out = PPC_DATA_BASE + 0x1000;
+        loaded.memory.add_region(out, vec![0xAA; 64]);
+        let aliases = [PpcAliasRecord {
+            handle: 0x1234_0000,
+            target_vref: -1,
+            target_dir_id: 77,
+            target_name: b"Pub".to_vec(),
+        }];
+        let directories = [PpcVfsDirectory {
+            dir_id: 77,
+            parent_dir_id: 2,
+            path: "Disk/Folder".to_string(),
+            creator: 0,
+            file_type: 0,
+            finder_flags: 0,
+            dirty: false,
+        }];
+        let mut cpu = loaded.cpu.clone();
+        cpu.gpr[3] = 0x1234_0000;
+        cpu.gpr[5] = out;
+        cpu.gpr[4] = 0;
+        assert_eq!(ppc_get_alias_info(&cpu, &mut loaded.memory, &directories, &[], &aliases), PPC_NO_ERR);
+        assert_eq!(ppc_read_pascal_string(&mut loaded.memory, out).as_deref(), Some(&b"Pub"[..]));
+        cpu.gpr[4] = 1;
+        assert_eq!(ppc_get_alias_info(&cpu, &mut loaded.memory, &directories, &[], &aliases), PPC_NO_ERR);
+        assert_eq!(ppc_read_pascal_string(&mut loaded.memory, out).as_deref(), Some(&b"Folder"[..]));
+        cpu.gpr[4] = 5;
+        assert_eq!(ppc_get_alias_info(&cpu, &mut loaded.memory, &directories, &[], &aliases), PPC_NO_ERR);
+        assert_eq!(ppc_read_pascal_string(&mut loaded.memory, out).as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
     fn match_alias_returns_one_fsspec_candidate() {
         let mut loaded = load_pef_application(&synthetic_pef_with_import(b"NewAlias")).unwrap();
         let scratch = PPC_HEAP_BASE + 0x1200;
@@ -3291,6 +3325,48 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
     }
 
     #[test]
+    fn pb_get_cat_info_searches_a_working_directory_and_keeps_its_ref() {
+        let pef = synthetic_pef_with_import(b"PBGetCatInfoSync");
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let wd_ref = -32000i16;
+        loaded.working_directories.with_mut(|directories| {
+            directories.insert(
+                wd_ref,
+                ProcessWorkingDirectory {
+                    ref_num: wd_ref,
+                    volume_ref_num: PPC_BOOT_VOLUME_REF_NUM,
+                    dir_id: PPC_PREFERENCES_DIR_ID,
+                    proc_id: 0,
+                },
+            );
+        });
+        let pb = PPC_DATA_BASE + 0x1000;
+        let name_ptr = pb + 128;
+        loaded.memory.add_region(pb, vec![0; 256]);
+        write_ppc_pstring(&mut loaded.memory, name_ptr, b"Test App Prefs");
+        loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+        loaded.memory.write_u16_be(pb + 22, wd_ref as u16).unwrap();
+        loaded.push_test_vfs_file(PpcVfsFileRecord {
+            path: "System Folder/Preferences/Test App Prefs".to_string(),
+            data: (b"prefs".to_vec()).into(),
+            creator: u32::from_be_bytes(*b"NanO"),
+            file_type: u32::from_be_bytes(*b"pref"),
+            finder_flags: 0,
+            dirty: false,
+        });
+        loaded.cpu.gpr[3] = pb;
+
+        loaded.run_with_hle_imports(64);
+
+        assert_eq!(loaded.memory.read_u16_be(pb + 16), Some(PPC_NO_ERR as u16));
+        assert_eq!(loaded.memory.read_u16_be(pb + 22), Some(wd_ref as u16));
+        assert_eq!(
+            loaded.memory.read_u32_be(pb + 100),
+            Some(PPC_PREFERENCES_DIR_ID)
+        );
+    }
+
+    #[test]
     fn pb_get_cat_info_resolves_a_full_path_on_a_mounted_volume() {
         let pef = synthetic_pef_with_import(b"PBGetCatInfoSync");
         let mut loaded = load_pef_application(&pef).unwrap();
@@ -3350,7 +3426,7 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
         assert_eq!(loaded.memory.read_u32_be(pb + 100), Some(42));
         assert_eq!(
             ppc_read_pstring_bytes(&mut loaded.memory, name_ptr),
-            Some(b"ToolBot Power Supply".to_vec())
+            Some(b"Gridz\xaa CD:ToolBot Power Supply".to_vec())
         );
     }
 
@@ -4919,6 +4995,61 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
         );
         assert_eq!(loaded.vfs_resource_files.len(), 1);
         assert_eq!(loaded.next_file_ref_num, PPC_FIRST_FILE_REF_NUM + 1);
+    }
+
+    #[test]
+    fn open_res_file_full_path_strips_the_boot_volume_among_duplicates() {
+        let pef = synthetic_pef_with_import(b"OpenResFile");
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let name_ptr = PPC_DATA_BASE + 0x1000;
+        loaded.memory.add_region(name_ptr, vec![0; 64]);
+        write_ppc_pstring(&mut loaded.memory, name_ptr, b"MacintoshHD:A:RSRC:ITEM.RSL");
+        for path in ["A/RSRC/item.rsl", "B/RSRC/item.rsl"] {
+            loaded.push_vfs_resource_file(PpcVfsResourceFileRecord {
+                path: path.to_string(),
+                creator: 0,
+                file_type: 0,
+                finder_flags: 0,
+                resource_len: 0,
+                raw_data: None,
+                map_attrs: 0,
+                dirty: false,
+            });
+        }
+        loaded.cpu.gpr[3] = name_ptr;
+
+        loaded.run_with_hle_imports(64);
+
+        assert_eq!(loaded.test_resource_error(), PPC_NO_ERR);
+        assert_eq!(loaded.resource_files[0].path, "A/RSRC/item.rsl");
+    }
+
+    #[test]
+    fn pb_open_wd_resolves_the_directory_named_by_io_name_ptr() {
+        let pef = synthetic_pef_with_import(b"PBOpenWDSync");
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let pb = PPC_DATA_BASE + 0x1000;
+        let name_ptr = pb + 128;
+        loaded.memory.add_region(pb, vec![0; 256]);
+        write_ppc_pstring(&mut loaded.memory, name_ptr, b"System Folder");
+        loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+        loaded.memory.write_u32_be(pb + 48, PPC_ROOT_DIR_ID).unwrap();
+        loaded.cpu.gpr[3] = pb;
+
+        loaded.run_with_hle_imports(64);
+
+        assert_eq!(loaded.memory.read_u16_be(pb + 16), Some(PPC_NO_ERR as u16));
+        assert_ne!(loaded.memory.read_u32_be(pb + 48), Some(PPC_ROOT_DIR_ID));
+
+        write_ppc_pstring(&mut loaded.memory, name_ptr, b"Missing");
+        loaded.memory.write_u32_be(pb + 48, PPC_ROOT_DIR_ID).unwrap();
+        loaded.cpu.pc = loaded.entry_pc;
+        loaded.cpu.lr = loaded.halt_pc;
+        loaded.cpu.gpr[3] = pb;
+
+        loaded.run_with_hle_imports(64);
+
+        assert_eq!(loaded.memory.read_u16_be(pb + 16), Some(PPC_DIR_NF_ERR as u16));
     }
 
     #[test]
@@ -11366,6 +11497,78 @@ fn pb_write_preserves_unwritten_tail_and_extends_only_past_eof() {
         assert_eq!(loaded.memory.read_u32_be(pb + 46), Some(offset + count));
         assert_eq!(loaded.files[0].position, offset + count);
     }
+}
+
+#[test]
+fn pb_get_v_info_writes_only_the_volume_param_record() {
+    let pef = synthetic_pef_with_import(b"PBGetVInfoSync");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let pb = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(pb, vec![0xa5; 0x100]);
+    loaded.memory.write_u32_be(pb + 18, 0).unwrap();
+    loaded.memory.write_u16_be(pb + 22, 0).unwrap();
+    loaded.memory.write_u16_be(pb + 28, 0).unwrap();
+    loaded.cpu.gpr[3] = pb;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], 0);
+    for offset in 64..122 {
+        assert_eq!(loaded.memory.read_u8(pb + offset), Some(0xa5), "{offset}");
+    }
+}
+
+#[test]
+fn c_string_text_entry_points_take_and_return_c_strings() {
+    let pef = synthetic_pef_with_import(b"upperstring");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "upperstring"),
+        PpcImportDispatcherTarget::UpperCString
+    );
+    let text = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(text, vec![0; 16]);
+    loaded.memory.write_bytes(text, b"abc\0").unwrap();
+    loaded.cpu.gpr[3] = text;
+    loaded.cpu.gpr[4] = 0;
+
+    loaded.run_with_hle_imports(64);
+
+    assert_eq!(loaded.memory.read_u8(text), Some(b'A'));
+    assert_eq!(loaded.memory.read_u8(text + 2), Some(b'C'));
+    assert_eq!(loaded.memory.read_u8(text + 3), Some(0));
+}
+
+#[test]
+fn fs_make_fs_spec_resolves_a_boot_volume_full_path() {
+    let pef = synthetic_pef_with_import(b"FSMakeFSSpec");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let name_ptr = PPC_DATA_BASE + 0x1000;
+    let spec_ptr = PPC_DATA_BASE + 0x1100;
+    loaded.memory.add_region(name_ptr, vec![0; 0x200]);
+    write_ppc_pstring(
+        &mut loaded.memory,
+        name_ptr,
+        b"MacintoshHD:System Folder:Preferences:Test App Prefs",
+    );
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "System Folder/Preferences/Test App Prefs".to_string(),
+        data: (b"prefs".to_vec()).into(),
+        creator: 0,
+        file_type: 0,
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded.cpu.gpr[3] = 0;
+    loaded.cpu.gpr[4] = 0;
+    loaded.cpu.gpr[5] = name_ptr;
+    loaded.cpu.gpr[6] = spec_ptr;
+
+    loaded.run_with_hle_imports(64);
+
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(loaded.memory.read_u32_be(spec_ptr + 2), Some(PPC_PREFERENCES_DIR_ID));
 }
 
 #[test]
