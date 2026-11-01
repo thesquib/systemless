@@ -893,6 +893,60 @@ fn hle_import_runner_test_control_returns_the_hit_part() {
 }
 
 #[test]
+fn track_control_with_nil_action_returns_only_after_the_button_is_released() {
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(b"TrackControl")).unwrap();
+    let mut last_mem_error = loaded.last_mem_error();
+    let scratch = ppc_heap_alloc(
+        &mut loaded.memory,
+        test_heap_cursor!(loaded),
+        test_heap_limit!(loaded),
+        32,
+        true,
+    );
+    ppc_write_rect(&mut loaded.memory, scratch, 5, 6, 25, 86).unwrap();
+    write_ppc_pstring(&mut loaded.memory, scratch + 8, b"OK");
+    let control_handle = with_test_controls!(
+        loaded,
+        |controls| ppc_new_control_values(
+            None,
+            &mut loaded.memory,
+            test_heap_cursor!(loaded),
+            test_heap_limit!(loaded),
+            &mut last_mem_error,
+            test_handles!(loaded),
+            controls,
+            PPC_MAIN_GWORLD,
+            scratch,
+            scratch + 8,
+            true,
+            0,
+            0,
+            1,
+            0,
+            0,
+        )
+    );
+    assert_ne!(control_handle, 0);
+    loaded.cpu.gpr[3] = control_handle;
+    loaded.cpu.gpr[4] = (10 << 16) | 10;
+    loaded.cpu.gpr[5] = 0;
+    loaded.set_input_snapshot(PpcInputSnapshot {
+        mouse_button: true,
+        mouse_v: 10,
+        mouse_h: 10,
+        ..PpcInputSnapshot::default()
+    });
+    let held = loaded.run_with_hle_imports(64);
+    assert!(!matches!(held.result, PpcRunResult::Halted { .. }));
+    assert_eq!(loaded.cpu.gpr[3], control_handle);
+
+    loaded.set_input_snapshot(PpcInputSnapshot::default());
+    let released = loaded.run_with_hle_imports(64);
+    assert!(matches!(released.result, PpcRunResult::Halted { .. }));
+    assert_eq!(loaded.cpu.gpr[3], 10);
+}
+
+#[test]
 fn popup_track_control_requires_a_visible_enabled_hit_and_cdef_action() {
     for (label, visible, hilite, point, requested, stored, opens) in [
         ("outside", true, 0, (0i16, 0i16), u32::MAX, u32::MAX, false),
