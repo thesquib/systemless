@@ -1677,6 +1677,8 @@ fn dialog_popup_controls_use_ditl_bounds_and_menu_resource_items() {
         Some((38, 226, 58, 326))
     );
     assert_eq!(loaded.controls.records()[0].popup_menu_id, 300);
+    let menu_list = ppc_current_menu_list(&mut loaded.memory);
+    assert_ne!(ppc_get_menu_handle(&mut loaded.memory, menu_list, 300), 0);
     assert_eq!(
         loaded
             .memory
@@ -4512,6 +4514,14 @@ fn ditl_manipulation_and_query_commands_dispatch_with_canonical_evaluation() {
         PpcImportDispatcherTarget::DialogCompatibility(PpcDialogCompatibilityOperation::CountDitl),
     );
     assert_eq!(loaded.cpu.gpr[3], 3);
+    // 3b. The appended button has a live control, as if NewDialog had built it
+    let appended_offset = ditl_bytes.len() as u32;
+    let items_ptr = loaded.memory.read_u32_be(items_handle).unwrap();
+    let appended_control = loaded.memory.read_u32_be(items_ptr + appended_offset).unwrap();
+    assert_ne!(appended_control, 0);
+    assert!(with_test_controls!(loaded, |controls| controls
+        .iter()
+        .any(|record: &PpcControlRecord| record.handle == appended_control)));
 
     // 4. ShortenDITL: Remove 1 item from the end
     loaded.cpu.gpr[3] = dialog_ptr;
@@ -4520,6 +4530,10 @@ fn ditl_manipulation_and_query_commands_dispatch_with_canonical_evaluation() {
         &mut loaded,
         PpcImportDispatcherTarget::DialogCompatibility(PpcDialogCompatibilityOperation::ShortenDitl),
     );
+
+    assert!(!with_test_controls!(loaded, |controls| controls
+        .iter()
+        .any(|record: &PpcControlRecord| record.handle == appended_control)));
 
     // 4a. CountDITL reports 2 items
     loaded.cpu.gpr[3] = dialog_ptr;
