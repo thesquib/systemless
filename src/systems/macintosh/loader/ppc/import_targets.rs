@@ -252,6 +252,7 @@ pub enum PpcImportDispatcherTarget {
     FrameRoundRect,
     PaintRoundRect,
     EraseRoundRect,
+    InvertRoundRect,
     FillRoundRect,
     InvalRect,
     InvalRgn,
@@ -848,6 +849,7 @@ pub enum PpcImportDispatcherTarget {
     EventAvail,
     OSEventAvail,
     PostEvent,
+    PPostEvent,
     Button,
     StillDown,
     WaitMouseUp,
@@ -918,6 +920,14 @@ pub enum PpcImportDispatcherTarget {
     SetOSTrapAddress,
     NSetTrapAddress,
     EqualString,
+    /// equalstring: EqualString with C-string arguments.
+    EqualCString,
+    /// upperstring: UpperString on a C string, converted in place.
+    UpperCString,
+    /// drawstring: DrawString with a C-string argument.
+    DrawCString,
+    /// openresfile: OpenResFile with a C-string file name.
+    OpenResFileCString,
     RelString,
     InitEditionPackVersion,
     StuffHex,
@@ -3618,6 +3628,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "FrameRoundRect") => PpcImportDispatcherTarget::FrameRoundRect,
         ("InterfaceLib", "PaintRoundRect") => PpcImportDispatcherTarget::PaintRoundRect,
         ("InterfaceLib", "EraseRoundRect") => PpcImportDispatcherTarget::EraseRoundRect,
+        ("InterfaceLib", "InvertRoundRect") => PpcImportDispatcherTarget::InvertRoundRect,
         ("InterfaceLib", "FillRoundRect") => PpcImportDispatcherTarget::FillRoundRect,
         ("InterfaceLib" | "AppearanceLib" | "CarbonLib", "InvalRect" | "invalrect") => {
             PpcImportDispatcherTarget::InvalRect
@@ -5082,6 +5093,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib" | "CarbonLib", "EventAvail") => PpcImportDispatcherTarget::EventAvail,
         ("InterfaceLib", "OSEventAvail") => PpcImportDispatcherTarget::OSEventAvail,
         ("InterfaceLib", "PostEvent") => PpcImportDispatcherTarget::PostEvent,
+        ("InterfaceLib", "PPostEvent") => PpcImportDispatcherTarget::PPostEvent,
         ("InterfaceLib", "Button") => PpcImportDispatcherTarget::Button,
         ("InterfaceLib", "StillDown") => PpcImportDispatcherTarget::StillDown,
         ("InterfaceLib", "WaitMouseUp") => PpcImportDispatcherTarget::WaitMouseUp,
@@ -5160,6 +5172,10 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "AEManagerInfo") => PpcImportDispatcherTarget::AEManagerInfo,
         ("InterfaceLib", "SVersion") => PpcImportDispatcherTarget::SVersion,
         ("InterfaceLib" | "CarbonLib", "EqualString") => PpcImportDispatcherTarget::EqualString,
+        ("InterfaceLib", "equalstring") => PpcImportDispatcherTarget::EqualCString,
+        ("InterfaceLib", "upperstring") => PpcImportDispatcherTarget::UpperCString,
+        ("InterfaceLib", "drawstring") => PpcImportDispatcherTarget::DrawCString,
+        ("InterfaceLib", "openresfile") => PpcImportDispatcherTarget::OpenResFileCString,
         ("InterfaceLib" | "CarbonLib", "RelString") => PpcImportDispatcherTarget::RelString,
         ("InterfaceLib", "InitEditionPackVersion") => {
             PpcImportDispatcherTarget::InitEditionPackVersion

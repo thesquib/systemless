@@ -1,5 +1,125 @@
 # Changelog
 
+## [0.106.0](https://github.com/benletchford/systemless/compare/v0.105.1...v0.106.0) (2026-11-01)
+
+
+### Features
+
+* **catalogue:** add Age of Empires and Alpha Centauri demos ([#5473](https://github.com/benletchford/systemless/issues/5473)) ([341438b](https://github.com/benletchford/systemless/commit/341438b1f3bee2ac35785f256826537af78adf08))
+* **catalogue:** approve Missions of the Reliant browser launch ([#5469](https://github.com/benletchford/systemless/issues/5469)) ([88cca74](https://github.com/benletchford/systemless/commit/88cca74610735edadfbb7e65131cd97129aa5556))
+* **catalogue:** restore Glider and Crystal Quest promotional demos ([#5470](https://github.com/benletchford/systemless/issues/5470)) ([f5ff7e7](https://github.com/benletchford/systemless/commit/f5ff7e7b334512b22675a546811735ed5d7fa289))
+
+
+### Performance Improvements
+
+* **quickdraw:** skip per-pixel tests for rectangular CopyBits regions ([#5465](https://github.com/benletchford/systemless/issues/5465)) ([547c622](https://github.com/benletchford/systemless/commit/547c622413dcfb62fcf56330b206e9a82b21bc24))
+* **runner:** fast-forward saved-tick-plus-constant TickCount waits ([#5463](https://github.com/benletchford/systemless/issues/5463)) ([321a7a6](https://github.com/benletchford/systemless/commit/321a7a6a875f4e500aa266d2b4c5e741d15f24b6))
+* **runner:** fast-forward SUBQ-reserved signed TickCount delays ([#5468](https://github.com/benletchford/systemless/issues/5468)) ([dc0b47f](https://github.com/benletchford/systemless/commit/dc0b47fb263edfe1a07267dffc96b1c6248d9dd7))
+
+## [0.105.1](https://github.com/benletchford/systemless/compare/v0.105.0...v0.105.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **ppc:** honor guest mouse position updates ([#5391](https://github.com/benletchford/systemless/issues/5391)) ([142e5d4](https://github.com/benletchford/systemless/commit/142e5d4e1a2b719f900c2e7efc9d647919ef9615))
+
+
+### Performance Improvements
+
+* **trap:** skip come-from classification in default gateway lookups ([#5460](https://github.com/benletchford/systemless/issues/5460)) ([e5aa082](https://github.com/benletchford/systemless/commit/e5aa0826280a5bad9243ead15bae09bb4a9a5bd8))
+
+## [0.105.0](https://github.com/benletchford/systemless/compare/v0.104.0...v0.105.0) (2026-10-31)
+
+
+### Features
+
+* **catalogue:** add Continuum intake ([#5454](https://github.com/benletchford/systemless/issues/5454)) ([6fee697](https://github.com/benletchford/systemless/commit/6fee697d42a75c8b406c5c7748384149226fb6c1))
+
+
+### Bug Fixes
+
+* **ppc:** report File Manager resource forks by their file in PBGetFCBInfo ([#5457](https://github.com/benletchford/systemless/issues/5457)) ([cac764d](https://github.com/benletchford/systemless/commit/cac764da9046e15035890416c7a247ec5e2a9bf4))
+
+
+### Performance Improvements
+
+* **catalogue:** raise Tomb Raider Gold demo CPU budget ([#5458](https://github.com/benletchford/systemless/issues/5458)) ([a31cd29](https://github.com/benletchford/systemless/commit/a31cd299a6d2ad844bbc46466ba1c3286d287c9a))
+
+## [0.104.0](https://github.com/benletchford/systemless/compare/v0.103.0...v0.104.0) (2026-10-31)
+
+
+### Features
+
+* **catalogue:** add 500 Cards ([#5450](https://github.com/benletchford/systemless/issues/5450)) ([f64ac89](https://github.com/benletchford/systemless/commit/f64ac8960c8a789795faae73ee2037c88ece1c90))
+* **catalogue:** add Assassin intake ([#5426](https://github.com/benletchford/systemless/issues/5426)) ([05ea376](https://github.com/benletchford/systemless/commit/05ea3765aed2dc8fd66166cab5a5cf3cda698a42))
+* **catalogue:** add Awesome BlackJack ([#5452](https://github.com/benletchford/systemless/issues/5452)) ([6550be7](https://github.com/benletchford/systemless/commit/6550be7910a554f82f65a8ad94e0c2e8d887e766))
+* **catalogue:** add Candy Crisis intake ([#5429](https://github.com/benletchford/systemless/issues/5429)) ([78ec4f2](https://github.com/benletchford/systemless/commit/78ec4f280881547b874320fd23e65ece82fd209c))
+* **catalogue:** add Colossal Cave, Shade and Hunter, in Darkness ([#5442](https://github.com/benletchford/systemless/issues/5442)) ([0fd116b](https://github.com/benletchford/systemless/commit/0fd116b11944ea79d2eabae882ba3f63f1d772ca))
+* **catalogue:** add Dirt Bike intake ([#5415](https://github.com/benletchford/systemless/issues/5415)) ([52e7773](https://github.com/benletchford/systemless/commit/52e7773be233dc55a610dda9efb815c6eed093f0))
+* **catalogue:** add Expert Blackjack ([#5448](https://github.com/benletchford/systemless/issues/5448)) ([b6047d7](https://github.com/benletchford/systemless/commit/b6047d79869db456565963c0d8348cdac4911d2a))
+* **catalogue:** add four MaxZip interactive fiction games ([#5438](https://github.com/benletchford/systemless/issues/5438)) ([21bc3f3](https://github.com/benletchford/systemless/commit/21bc3f3d74b8ea6d605a13d34145ecbab42dce31))
+* **catalogue:** add Frog Xing intake ([#5420](https://github.com/benletchford/systemless/issues/5420)) ([9e16c2c](https://github.com/benletchford/systemless/commit/9e16c2cf0a30c632c2506fb783ba46cfc5ea4842))
+* **catalogue:** add Looney Lander ([#5428](https://github.com/benletchford/systemless/issues/5428)) ([4485334](https://github.com/benletchford/systemless/commit/44853346b4cf95e5d4e64607a21d2024256ef700))
+* **catalogue:** add MegaPong ([#5433](https://github.com/benletchford/systemless/issues/5433)) ([cc1a0a2](https://github.com/benletchford/systemless/commit/cc1a0a22a98098528c5b4ade30f21b139ae2f249))
+* **catalogue:** add Missions of the Reliant intake ([#5413](https://github.com/benletchford/systemless/issues/5413)) ([dfc0294](https://github.com/benletchford/systemless/commit/dfc0294bb28424fb6727431c682dba1825bd8b64))
+* **catalogue:** add Snake Byte ([#5424](https://github.com/benletchford/systemless/issues/5424)) ([52de779](https://github.com/benletchford/systemless/commit/52de779413a2007b822c0140c93c29831f7b60fe))
+* **catalogue:** add Spiked ([#5422](https://github.com/benletchford/systemless/issues/5422)) ([cc64923](https://github.com/benletchford/systemless/commit/cc649233316a68f7e0992b03f714af091e9080e7))
+* **catalogue:** add Tarantula ([#5446](https://github.com/benletchford/systemless/issues/5446)) ([67b0ef0](https://github.com/benletchford/systemless/commit/67b0ef08656b3d8e2dd7245504d6a7e00dd128aa))
+* **catalogue:** add Wumpus intake ([#5444](https://github.com/benletchford/systemless/issues/5444)) ([ce44cad](https://github.com/benletchford/systemless/commit/ce44cad5bab51f751bd02249cf888dd1f60628e5))
+* **catalogue:** approve Assassin and Frog Xing browser launch ([#5430](https://github.com/benletchford/systemless/issues/5430)) ([d24b735](https://github.com/benletchford/systemless/commit/d24b7354cd1a32a1ec8942a6370cc87a004d814c))
+* **catalogue:** approve Candy Crisis browser launch ([#5431](https://github.com/benletchford/systemless/issues/5431)) ([44af7d4](https://github.com/benletchford/systemless/commit/44af7d48e758f30ff838cbc1bfca4a16209e180f))
+* **catalogue:** approve Tomb Raider Gold and Dirt Bike browser launch ([#5418](https://github.com/benletchford/systemless/issues/5418)) ([4363640](https://github.com/benletchford/systemless/commit/43636404b3d1fb30766cd3d299cca5ec57a8abaf))
+* **catalogue:** restore hosted Tomb Raider Gold demo ([#5411](https://github.com/benletchford/systemless/issues/5411)) ([d6c940b](https://github.com/benletchford/systemless/commit/d6c940bcf12458aae07ebb156b66f191b943fb84))
+
+
+### Bug Fixes
+
+* keep kiosk stage margins black through palette fades ([#5417](https://github.com/benletchford/systemless/issues/5417)) ([c6f5f1e](https://github.com/benletchford/systemless/commit/c6f5f1e4850b03c6b18f328b96de8d22ebad3e72))
+* **loader:** accept MacBinary data-only files without trailing padding ([0fdb396](https://github.com/benletchford/systemless/commit/0fdb396149d5896bf5f7076fc1166d6b7acb224d))
+* **ppc:** implement InvertRoundRect ([78cc275](https://github.com/benletchford/systemless/commit/78cc2755498fb011e62ddb62b899337b18471630))
+
+## [0.103.0](https://github.com/benletchford/systemless/compare/v0.102.0...v0.103.0) (2026-10-31)
+
+
+### Features
+
+* **catalogue:** add Abbalone 3D source intake ([43214a1](https://github.com/benletchford/systemless/commit/43214a1cf30de02033056d72340cdd4eb02cb7e8))
+* **catalogue:** add and approve siege shareware ([#5367](https://github.com/benletchford/systemless/issues/5367)) ([669744e](https://github.com/benletchford/systemless/commit/669744eda28c21d97963157ac6444a53794942dc))
+* **catalogue:** add original Otello 2.0 intake ([53d748b](https://github.com/benletchford/systemless/commit/53d748b97d344f591415e564af01341e71212daa))
+* **catalogue:** add original Otello 2.0 intake ([42a8d5d](https://github.com/benletchford/systemless/commit/42a8d5d013fd9d89fa71f03d175c08f696708a4b))
+* **catalogue:** add Powerball shareware intake ([#5382](https://github.com/benletchford/systemless/issues/5382)) ([4ec317a](https://github.com/benletchford/systemless/commit/4ec317a30ef0cbc1ae3f0fc1e6e024573967e3a2))
+* **catalogue:** approve Otello browser launch ([8f82318](https://github.com/benletchford/systemless/commit/8f8231817ed663842693fe4a1d22300c388f5f03))
+* **catalogue:** approve Otello browser launch ([635d4a5](https://github.com/benletchford/systemless/commit/635d4a5a64cedc299432fe1789ba20e33e3ed6f9))
+
+
+### Bug Fixes
+
+* batch bounded sound status queries in browser ([713569d](https://github.com/benletchford/systemless/commit/713569dc7c8d885fab3c65de91b9ca42c308fcee))
+* **catalogue:** approve realmz browser launch ([#5366](https://github.com/benletchford/systemless/issues/5366)) ([4d9e76e](https://github.com/benletchford/systemless/commit/4d9e76eea3ec5760d083c13d70a3e6c67be3b3f6))
+* **catalogue:** hold crystal quest pending rights evidence ([d0791ad](https://github.com/benletchford/systemless/commit/d0791ada6e7f02eade5c1c93eb849070a9e0317f))
+* **catalogue:** hold glider pending rights evidence ([416e734](https://github.com/benletchford/systemless/commit/416e7346aba9d004f7b6ed5557ce250f7d22d3ce))
+* **catalogue:** hold realmz launch pending browser approval ([#5344](https://github.com/benletchford/systemless/issues/5344)) ([17d6a2b](https://github.com/benletchford/systemless/commit/17d6a2b241d874c89a54faf6d9376fcc61b977c2))
+* discard activation events for removed windows ([634bab1](https://github.com/benletchford/systemless/commit/634bab15a790f5b17389d5450d9088b7fe4bad91))
+* dispatch classic Apple events by class and ID ([b446f49](https://github.com/benletchford/systemless/commit/b446f497cf9f09af7b1ff3ac8bbfb3eebe032437))
+* dispatch indexed picture bitmap callbacks ([124685a](https://github.com/benletchford/systemless/commit/124685ab09961abfc8002ebe66318c471c2f93ad))
+* expose the current resource file reference ([a1e9f91](https://github.com/benletchford/systemless/commit/a1e9f9114042f31e66799a673989d1fa37e05bd1))
+* identify populated folders when resolving aliases ([5b477c0](https://github.com/benletchford/systemless/commit/5b477c0931522d717f0c18d5e796b8140daf25cc))
+* **ppc:** account for event polling time ([#5384](https://github.com/benletchford/systemless/issues/5384)) ([2353cca](https://github.com/benletchford/systemless/commit/2353ccaabe4ac3a2bc969f2ed2df981e8031bb22))
+* **ppc:** expose a usable application resource reference ([49597a5](https://github.com/benletchford/systemless/commit/49597a5b2d8e8d7608ecce3a80e8cb5e06e2c0e0))
+* **ppc:** honor inverted QuickDraw text modes ([#5381](https://github.com/benletchford/systemless/issues/5381)) ([a8e8baa](https://github.com/benletchford/systemless/commit/a8e8baaa14f545b9a455aaffdf1e263c002ce3ab))
+* **ppc:** preserve the port when creating hidden windows ([6138079](https://github.com/benletchford/systemless/commit/613807958c50843a74513279b4f70f33a08571d3))
+* **ppc:** preserve the port when creating hidden windows ([e6bca9d](https://github.com/benletchford/systemless/commit/e6bca9dfe747687d9c12a7efd7aeef6333f13783))
+* **ppc:** preserve the port when selecting windows ([e2cbad7](https://github.com/benletchford/systemless/commit/e2cbad734c845a8b5ecb1826a4632f03f4a1ab22))
+* **ppc:** preserve the port when selecting windows ([153f794](https://github.com/benletchford/systemless/commit/153f7940914df9e7d07035d1da58e9d435c5db8e))
+* preserve idle pacing while key repeat is pending ([#5342](https://github.com/benletchford/systemless/issues/5342)) ([7cfcd9b](https://github.com/benletchford/systemless/commit/7cfcd9bd06c4587b3c65c329048c09053f816181))
+* preserve idle proofs across browser slices ([5288300](https://github.com/benletchford/systemless/commit/52883003d4ea84209cc2cc4f73b251c6ea046c3e))
+
+
+### Performance Improvements
+
+* batch safe event and rectangle queries ([#5363](https://github.com/benletchford/systemless/issues/5363)) ([856f5f7](https://github.com/benletchford/systemless/commit/856f5f79d721ce383c4cd2e93db2165da90d117d))
+* preserve pacing through proven device polling cycles ([#5359](https://github.com/benletchford/systemless/issues/5359)) ([840d509](https://github.com/benletchford/systemless/commit/840d509f20039fd55065e393e9d9e4231679c90e))
+
 ## [0.102.0](https://github.com/benletchford/systemless/compare/v0.101.0...v0.102.0) (2026-10-30)
 
 

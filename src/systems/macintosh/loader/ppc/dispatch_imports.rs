@@ -498,6 +498,9 @@ pub(crate) fn dispatch_supported_import(
             heap_limit,
             last_mem_error,
             handles,
+            files,
+            writable_refnums,
+            vfs_files,
             resource_files,
             vfs_resource_files,
             vfs_resources,
@@ -1827,6 +1830,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::CurResFile
         | PpcImportDispatcherTarget::UseResFile
         | PpcImportDispatcherTarget::OpenResFile
+        | PpcImportDispatcherTarget::OpenResFileCString
         | PpcImportDispatcherTarget::OpenRFPerm
         | PpcImportDispatcherTarget::HOpenResFile
         | PpcImportDispatcherTarget::ResError
@@ -2037,6 +2041,7 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::DrawChar
         | PpcImportDispatcherTarget::DrawText
         | PpcImportDispatcherTarget::DrawString
+        | PpcImportDispatcherTarget::DrawCString
         | PpcImportDispatcherTarget::TextFont
         | PpcImportDispatcherTarget::TextFace
         | PpcImportDispatcherTarget::TextMode
@@ -2070,6 +2075,7 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::FrameRoundRect
         | PpcImportDispatcherTarget::PaintRoundRect
         | PpcImportDispatcherTarget::EraseRoundRect
+        | PpcImportDispatcherTarget::InvertRoundRect
         | PpcImportDispatcherTarget::FillRoundRect => {
             unreachable!("QuickDraw imports return through dispatch_quickdraw_import")
         }
@@ -2410,6 +2416,8 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::SysEnvirons
         | PpcImportDispatcherTarget::SVersion
         | PpcImportDispatcherTarget::EqualString
+        | PpcImportDispatcherTarget::EqualCString
+        | PpcImportDispatcherTarget::UpperCString
         | PpcImportDispatcherTarget::RelString
         | PpcImportDispatcherTarget::InitEditionPackVersion
         | PpcImportDispatcherTarget::StuffHex
@@ -3311,6 +3319,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::EventAvail
         | PpcImportDispatcherTarget::OSEventAvail
         | PpcImportDispatcherTarget::PostEvent
+        | PpcImportDispatcherTarget::PPostEvent
         | PpcImportDispatcherTarget::Button
         | PpcImportDispatcherTarget::StillDown
         | PpcImportDispatcherTarget::WaitMouseUp

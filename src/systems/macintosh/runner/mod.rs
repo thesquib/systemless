@@ -1357,6 +1357,18 @@ fn idle_cycle_trap_is_journal_complete(
         // (`IdleCycleHostSnapshot` records channel activity for resumes). Any
         // accepted command changes channel state and cancels.
         (true, 0x0003) => sound_command_rejected,
+        // Pre-dispatch proves the already-identical menu mutation path.
+        (true, 0x013A) | (true, 0x0147) => true,
+        // Pre-dispatch records and checks the narrowly resident GetResource case.
+        (true, 0x01A0) => true,
+        // Pre-dispatch admission restricts BlockMove to flat, unobserved RAM;
+        // all copied bytes then participate in the write journal.
+        (false, 0x002E) => true,
+        // SetCursor reads its complete image from guest memory and installs it
+        // in the process cursor state. The idle host snapshot includes that
+        // complete state; the journal and resume checks reject changes to the
+        // input bytes, and patched dispatch remains a boundary.
+        (true, 0x0051) => true,
         // Pure transforms of a Point on the stack (quickdraw.rs).
         (true, 0x0070) | (true, 0x0071) => true, // LocalToGlobal, GlobalToLocal
         // These utilities read only guest memory or stack operands and write
@@ -4056,6 +4068,7 @@ impl FixtureRunner {
         self.bus.write_word(addr::FS_FCB_LEN, HFS_FCB_SIZE);
         self.bus
             .write_word(addr::CUR_APREF_NUM, APPLICATION_RESOURCE_REFNUM);
+        self.dispatcher.sync_guest_curmap(&mut self.bus);
 
         self.dispatcher
             .open_files
@@ -5507,8 +5520,9 @@ impl FixtureRunner {
         let w0 = self.bus.read_word(pc_after_trap);
 
         // Template D consumes TickCount directly from its stack result slot:
-        //   CLR.L -(A7); _TickCount; CMP.L (A7)+,Dn; Bcc.S <back-to-CLR>
-        // Lemmings uses the BEQ form for its frame delay loop.
+        //   CLR.L -(A7) or SUBQ #4,A7; _TickCount; CMP.L (A7)+,Dn; Bcc.S back
+        // Lemmings uses the BEQ form for its frame delay loop; Missions of
+        // the Reliant's delay routine uses SUBQ and BGT.
         if (w0 & 0xF1FF) == 0xB09F {
             let dn = ((w0 >> 9) & 7) as usize;
             return self.try_spin_template_d(pc_after_trap, dn, tick_cap);
@@ -5544,6 +5558,14 @@ impl FixtureRunner {
             return self.try_spin_template_g(pc_after_trap, dn, w1, tick_cap);
         }
 
+        // Template H: compare with a saved tick plus a small constant.
+        //   MOVE.L (A7)+,Dn; MOVE.L (d16,An),Dm; ADDQ.L #q,Dm
+        //   CMP.L Dm,Dn; BLT.S/BLE.S <back-to-CLR.L -(A7) or SUBQ #4,A7>
+        // Continuum uses this as its frame limiter.
+        if (w1 & 0xF1F8) == 0x2028 && ((w1 >> 9) & 7) as usize != dn {
+            return self.try_spin_template_h(pc_after_trap, dn, w1, tick_cap);
+        }
+
         // Template A: SUBQ.L #imm, Dn; CMP.L Dn, Dm; BHI.S <back-to-SUBQ-#4,A7>
         if (w1 & 0xF1F8) == 0x5180 && (w1 & 0x0007) as usize == dn {
             return self.try_spin_template_a(pc_after_trap, dn, w1, tick_cap, count);
@@ -5560,6 +5582,78 @@ impl FixtureRunner {
         }
 
         false
+    }
+
+    /// Template H: saved-tick plus constant frame limiter.
+    ///   CLR.L -(A7) or SUBQ #4,A7; _TickCount; MOVE.L (A7)+,Dn
+    ///   MOVE.L (d16,An),Dm; ADDQ.L #q,Dm; CMP.L Dm,Dn; BLT.S/BLE.S back
+    ///
+    /// The loop exits once the signed sample reaches `saved + q` (BLT) or
+    /// passes it (BLE). As with template F, only the stacked TickCount result
+    /// is replaced; the post-trap instructions run exactly once on the CPU.
+    fn try_spin_template_h(
+        &mut self,
+        pc_after_trap: u32,
+        dn: usize,
+        w_load: u16,
+        tick_cap: Option<u32>,
+    ) -> bool {
+        let dm = ((w_load >> 9) & 7) as usize;
+        let an = (w_load & 7) as usize;
+        let disp = self.bus.read_word(pc_after_trap.wrapping_add(4)) as i16 as i32;
+        let w_add = self.bus.read_word(pc_after_trap.wrapping_add(6));
+        if (w_add & 0xF1F8) != 0x5080 || (w_add & 7) as usize != dm {
+            return false;
+        }
+        let addend = match (w_add >> 9) & 7 {
+            0 => 8,
+            q => q as i32,
+        };
+        let w_cmp = self.bus.read_word(pc_after_trap.wrapping_add(8));
+        if (w_cmp & 0xF1F8) != 0xB080
+            || ((w_cmp >> 9) & 7) as usize != dn
+            || (w_cmp & 7) as usize != dm
+        {
+            return false;
+        }
+        let branch_pc = pc_after_trap.wrapping_add(10);
+        let w_branch = self.bus.read_word(branch_pc);
+        if !matches!(w_branch & 0xFF00, 0x6D00 | 0x6F00) || (w_branch & 0x00FF) == 0 {
+            return false;
+        }
+        let displacement = (w_branch & 0xFF) as i8 as i32;
+        let target = (branch_pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32;
+        let canonical_target = pc_after_trap.wrapping_sub(4);
+        if target != canonical_target
+            || !matches!(self.bus.read_word(canonical_target), 0x42A7 | 0x594F | 0x598F)
+            || self.bus.read_word(canonical_target.wrapping_add(2)) != 0xA975
+        {
+            return false;
+        }
+
+        let sp = self.m68k.cpu.core.a(7);
+        let captured_tick = self.bus.read_long(sp) as i32;
+        let base_addr = (self.m68k.cpu.core.a(an) as i32).wrapping_add(disp) as u32;
+        let deadline = (self.bus.read_long(base_addr) as i32).wrapping_add(addend);
+        let exit_tick = if w_branch & 0xFF00 == 0x6F00 {
+            deadline.wrapping_add(1)
+        } else {
+            deadline
+        };
+        if exit_tick.wrapping_sub(captured_tick) <= 0 {
+            return false;
+        }
+        match self.advance_until_tick(exit_tick as u32, tick_cap) {
+            AdvanceResult::CapHit => {
+                self.bus.write_long(sp, self.guest_tick());
+                true
+            }
+            AdvanceResult::Advanced => {
+                self.bus.write_long(sp, self.guest_tick());
+                false
+            }
+            AdvanceResult::Interrupted | AdvanceResult::TooFar => false,
+        }
     }
 
     /// Template F: saved-register tick-change or unsigned-deadline wait.
@@ -5873,6 +5967,10 @@ impl FixtureRunner {
             tick,
             cpu,
             host: IdleCycleHostSnapshot::capture(&self.dispatcher),
+            slice_host: None,
+            resources: Vec::new(),
+            memory_guards: Vec::new(),
+            menus: Vec::new(),
             arrivals: 0,
             budget: self.tick_budget,
         });
@@ -5994,7 +6092,25 @@ impl FixtureRunner {
         Some(true)
     }
 
+    #[cfg(test)]
     fn park_proven_idle_cycle(&mut self, trap_pc: u32, wake_tick: u32) {
+        self.park_proven_idle_cycle_with_dependencies(
+            trap_pc,
+            wake_tick,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    fn park_proven_idle_cycle_with_dependencies(
+        &mut self,
+        trap_pc: u32,
+        wake_tick: u32,
+        resources: Vec<IdleResidentResource>,
+        memory_guards: Vec<IdleMemoryGuard>,
+        menus: Vec<crate::trap::menu::IdleMenuProof>,
+    ) {
         if wait_stats_enabled() {
             WS_PARKED.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -6009,6 +6125,9 @@ impl FixtureRunner {
             tick,
             cpu: CpuArchitecturalSnapshot::capture(&self.m68k.cpu.core),
             host: IdleCycleHostSnapshot::capture(&self.dispatcher),
+            resources,
+            memory_guards,
+            menus,
         });
         // No guest code runs while parked. This second journal therefore
         // catches every bus-visible mutation made by the frontend or an HLE
@@ -6033,7 +6152,10 @@ impl FixtureRunner {
                 // second check verifies its low-memory guest projection did
                 // not diverge during the idle probe.
                 && self.bus.read_long(0x016A) == sleep.tick;
-        let host_unchanged = sleep.host == IdleCycleHostSnapshot::capture(&self.dispatcher);
+        let host_unchanged = sleep.host == IdleCycleHostSnapshot::capture(&self.dispatcher)
+            && self.idle_resources_unchanged(&sleep.resources)
+            && self.idle_memory_guards_safe(&sleep.memory_guards)
+            && self.idle_menus_unchanged(&sleep.menus);
         let can_observe_events = self.active_interrupt_callback.is_none()
             && !self.dispatcher.input_state.has_key_repeat()
             && self.dispatcher.pending_launch_app.is_none()
@@ -6074,7 +6196,7 @@ impl FixtureRunner {
                 if wait_stats_enabled() {
                     WS_RESUMED.fetch_add(1, AtomicOrdering::Relaxed);
                 }
-                self.park_proven_idle_cycle(sleep.trap_pc, sleep.wake_tick);
+                self.park_proven_idle_cycle_with_dependencies(sleep.trap_pc, sleep.wake_tick, sleep.resources, sleep.memory_guards, sleep.menus);
                 true
             }
             AdvanceResult::Advanced => {
@@ -6088,13 +6210,215 @@ impl FixtureRunner {
         }
     }
 
-    /// The new query admissions require their default HLE handlers. A
-    /// guest patch can have effects outside the journal. IsDialogEvent also
-    /// traverses the menu adapter, which can retire a pending manager call.
+    /// The search must encounter an already loaded resource before any file
+    /// that would trigger a reload. Every host-side update on that path must
+    /// already be at its fixed point, including Memory Manager metadata.
+    fn idle_resident_resource(&self, kind: [u8; 4], id: i16) -> Option<IdleResidentResource> {
+        let kind = TrapDispatcher::normalize_ostype(kind);
+        let dispatcher = &self.dispatcher;
+        let resources = dispatcher.resources.as_ref()?;
+        for file in dispatcher.resource_search_order() {
+            let loaded = resources.files.get(&file)?.loaded.get(&(kind, id)).copied();
+            if let Some(ptr) = loaded.filter(|ptr| *ptr != 0) {
+                let key = (file, kind, id);
+                let handle = *dispatcher.resource_handles_by_key.get(&key)?;
+                if handle == 0
+                    || self.idle_memory_guard(handle, 4).is_none()
+                    || dispatcher.loaded_handles.get(&handle) != Some(&(ptr, kind, id))
+                    || dispatcher.resource_handle_files.get(&handle) != Some(&file)
+                    || !dispatcher.resident_resources.contains(&key)
+                    || self.bus.read_long(handle) != ptr
+                    || dispatcher.handle_for_ptr(ptr) != Some(handle)
+                {
+                    return None;
+                }
+                let handle_state = dispatcher
+                    .process_memory_manager()
+                    .resource_handle_state_is_stable(handle)?;
+                return Some(IdleResidentResource {
+                    resource_type: kind,
+                    resource_id: id,
+                    file,
+                    ptr,
+                    handle,
+                    handle_state,
+                });
+            }
+            if loaded.is_some()
+                || dispatcher
+                    .resource_backing_data
+                    .contains_key(&(file, kind, id))
+            {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn idle_resources_unchanged(&self, resources: &[IdleResidentResource]) -> bool {
+        resources.iter().all(|resource| {
+            self.idle_resident_resource(resource.resource_type, resource.resource_id)
+                .as_ref()
+                == Some(resource)
+        })
+    }
+
+    /// Conservative, read-only equivalent of asking whether a slice may
+    /// encounter an event. Peeking through the Event Manager can itself post
+    /// an auto-key or launch event and prune update markers.
+    fn idle_slice_has_pending_events(&self) -> bool {
+        let dispatcher = &self.dispatcher;
+        dispatcher.event_queue.menu_bar_is_invalid()
+            || !dispatcher.event_queue.is_empty()
+            || dispatcher.has_pending_native_menu_event()
+            || dispatcher.input_state.has_key_repeat()
+            || dispatcher.pending_launch_app.is_some()
+            || dispatcher
+                .apple_event_launch_state
+                .has_unclaimed_open_application_event()
+            || dispatcher
+                .flushed_update_events
+                .iter()
+                .any(|event| event.what == 6 && dispatcher.window_list.contains(&event.message))
+    }
+
+    fn idle_memory_guard(&self, address: u32, count: u32) -> Option<IdleMemoryGuard> {
+        address.checked_add(count)?;
+        self.bus
+            .idle_memory_range_is_journal_safe(address, address, count)
+            .then_some(IdleMemoryGuard {
+                src: address,
+                dst: address,
+                count,
+            })
+    }
+
+    fn record_idle_memory_guards(&mut self, guards: &[IdleMemoryGuard]) -> bool {
+        let Some(probe) = self.idle_cycle_probe.as_mut() else {
+            return false;
+        };
+        let new_guards = guards
+            .iter()
+            .filter(|guard| !probe.memory_guards.contains(guard))
+            .count();
+        if probe.memory_guards.len() + new_guards > 16 {
+            return false;
+        }
+        for guard in guards {
+            if !probe.memory_guards.contains(guard) {
+                probe.memory_guards.push(*guard);
+            }
+        }
+        true
+    }
+
+    fn idle_cursor_call_guards(&self) -> Option<[IdleMemoryGuard; 2]> {
+        let sp = self.m68k.cpu.read_reg(Register::A7);
+        let stack = self.idle_memory_guard(sp, 4)?;
+        let cursor = self.bus.read_long(sp);
+        Some([stack, self.idle_memory_guard(cursor, 68)?])
+    }
+
+    fn idle_memory_guards_safe(&self, copies: &[IdleMemoryGuard]) -> bool {
+        copies.iter().all(|copy| {
+            self.bus
+                .idle_memory_range_is_journal_safe(copy.src, copy.dst, copy.count)
+        })
+    }
+
+    fn idle_menus_unchanged(&self, menus: &[crate::trap::menu::IdleMenuProof]) -> bool {
+        menus.iter().all(|menu| {
+            self.dispatcher
+                .idle_menu_proof(&self.bus, menu.handle, menu.mutation.clone())
+                .as_ref()
+                == Some(menu)
+        })
+    }
+
+    fn idle_menu_call_proof(
+        &self,
+        opcode: u16,
+    ) -> Option<(crate::trap::menu::IdleMenuProof, Vec<IdleMemoryGuard>)> {
+        use crate::trap::menu::IdleMenuMutation;
+        let sp = self.m68k.cpu.read_reg(Register::A7);
+        let is_set_text = canonical_trap_number(opcode) == (true, 0x0147);
+        let stack_size = if is_set_text { 10 } else { 6 };
+        if sp.checked_add(stack_size).is_none()
+            || !self
+                .bus
+                .idle_memory_range_is_journal_safe(sp, sp, stack_size)
+        {
+            return None;
+        }
+        let mut guards = vec![IdleMemoryGuard {
+            src: sp,
+            dst: sp,
+            count: stack_size,
+        }];
+        let (handle, mutation) = if is_set_text {
+            let text_ptr = self.bus.read_long(sp);
+            let item = self.bus.read_word(sp.wrapping_add(4)) as i16;
+            let handle = self.bus.read_long(sp.wrapping_add(6));
+            if text_ptr == 0
+                || handle == 0
+                || item < 1
+                || text_ptr.checked_add(1).is_none()
+                || !self
+                    .bus
+                    .idle_memory_range_is_journal_safe(text_ptr, text_ptr, 1)
+            {
+                return None;
+            }
+            let len = u32::from(self.bus.read_byte(text_ptr)) + 1;
+            if text_ptr.checked_add(len).is_none()
+                || !self
+                    .bus
+                    .idle_memory_range_is_journal_safe(text_ptr, text_ptr, len)
+            {
+                return None;
+            }
+            guards.push(IdleMemoryGuard {
+                src: text_ptr,
+                dst: text_ptr,
+                count: len,
+            });
+            (
+                handle,
+                IdleMenuMutation::SetText(
+                    item,
+                    self.bus.read_bytes(text_ptr + 1, len as usize - 1),
+                ),
+            )
+        } else {
+            (
+                self.bus.read_long(sp.wrapping_add(2)),
+                IdleMenuMutation::Disable(self.bus.read_word(sp) as i16),
+            )
+        };
+        Some((
+            self.dispatcher
+                .idle_menu_proof(&self.bus, handle, mutation)?,
+            guards,
+        ))
+    }
+
+    /// Default HLE handlers are required: guest patches can have effects
+    /// outside the journal. IsDialogEvent can also retire a manager call.
     fn idle_query_has_unsafe_dispatch(&self, opcode: u16) -> bool {
         let trap = canonical_trap_number(opcode);
-        (matches!(trap, (true, 0x0000 | 0x0058 | 0x017F))
-            && self.dispatcher.has_native_trap_patch(&self.bus, opcode))
+        (matches!(
+            trap,
+            (
+                true,
+                0x0000 | 0x0051 | 0x0058 | 0x013A | 0x0147 | 0x017F | 0x01A0
+            ) | (false, 0x002E)
+        ) && self.dispatcher.has_native_trap_patch(&self.bus, opcode))
+            || (trap == (false, 0x002E)
+                && !self.bus.idle_memory_range_is_journal_safe(
+                    self.m68k.cpu.read_reg(Register::A0),
+                    self.m68k.cpu.read_reg(Register::A1),
+                    self.m68k.cpu.read_reg(Register::D0),
+                ))
             || (trap == (true, 0x017F) && !self.dispatcher.guest_calls.is_empty())
     }
 
@@ -6116,6 +6440,7 @@ impl FixtureRunner {
                 self.dispatcher.pending_wait_sleep_ticks == 0
                     && self.dispatcher.pending_wait_next_event_return.is_none()
                     && self.dispatcher.system_task_wne_returns.is_empty()
+                    && !self.dispatcher.event_poll_requires_yield
             }
             _ => false,
         };
@@ -6192,6 +6517,14 @@ impl FixtureRunner {
                 self.mark_idle_cycle_site_busy(probe.trap_pc, probe.tick);
                 return false;
             }
+            if !self.idle_resources_unchanged(&probe.resources)
+                || !self.idle_memory_guards_safe(&probe.memory_guards)
+                || !self.idle_menus_unchanged(&probe.menus)
+            {
+                self.bus.cancel_write_probe();
+                self.idle_cycle_last_seen = None;
+                return false;
+            }
             let same_site_tick = probe.trap_pc == trap_pc && probe.tick == tick;
             if same_site_tick {
                 // The probe closed on its origin without dying to a
@@ -6214,12 +6547,12 @@ impl FixtureRunner {
                 if memory_unchanged {
                     self.idle_cycle_last_seen = Some((trap_pc, tick));
                     if tick_cap.is_some_and(|cap| tick >= cap) {
-                        self.park_proven_idle_cycle(trap_pc, wake_tick);
+                        self.park_proven_idle_cycle_with_dependencies(trap_pc, wake_tick, probe.resources, probe.memory_guards, probe.menus);
                         return true;
                     }
                     match self.advance_until_tick(wake_tick, tick_cap) {
                         AdvanceResult::CapHit => {
-                            self.park_proven_idle_cycle(trap_pc, wake_tick);
+                            self.park_proven_idle_cycle_with_dependencies(trap_pc, wake_tick, probe.resources, probe.memory_guards, probe.menus);
                             return true;
                         }
                         AdvanceResult::Advanced => {
@@ -6536,7 +6869,7 @@ impl FixtureRunner {
     ) -> bool {
         let w_branch = self.bus.read_word(pc_after_trap.wrapping_add(2));
         let branch_condition = w_branch & 0xFF00;
-        if branch_condition != 0x6400 && branch_condition != 0x6700 {
+        if !matches!(branch_condition, 0x6400 | 0x6700 | 0x6C00 | 0x6E00) {
             return false;
         }
         let displacement = (w_branch & 0xFF) as i8 as i32;
@@ -6545,7 +6878,10 @@ impl FixtureRunner {
         }
         let branch_pc = pc_after_trap.wrapping_add(2);
         let target = (branch_pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32;
-        if target != pc_after_trap.wrapping_sub(4) || self.bus.read_word(target) != 0x42A7 {
+        // The result slot may be reserved by CLR.L -(A7) or SUBQ #4,A7.
+        if target != pc_after_trap.wrapping_sub(4)
+            || !matches!(self.bus.read_word(target), 0x42A7 | 0x594F | 0x598F)
+        {
             return false;
         }
 
@@ -6555,7 +6891,23 @@ impl FixtureRunner {
             // BEQ would already fall through, so there is no wait to skip.
             return false;
         }
-        let target_tick = dn_value.wrapping_add(1);
+        let target_tick = match branch_condition {
+            // CMP.L (A7)+,Dn; BGT repeats while the signed deadline Dn is
+            // still after the sample, so the first exiting tick is Dn. BGE
+            // also repeats at Dn itself. Leave expired deadlines to the CPU.
+            0x6E00 | 0x6C00 => {
+                let exit = if branch_condition == 0x6E00 {
+                    dn_value
+                } else {
+                    dn_value.wrapping_add(1)
+                };
+                if (exit.wrapping_sub(captured_tick) as i32) <= 0 {
+                    return false;
+                }
+                exit
+            }
+            _ => dn_value.wrapping_add(1),
+        };
         match self.advance_until_tick(target_tick, tick_cap) {
             AdvanceResult::CapHit => {
                 // The trap's result was captured before the synthetic VBLs.
@@ -6997,18 +7349,24 @@ impl FixtureRunner {
             );
         }
 
-        // Deferred CPU slices belong to one outer presentation frame. Keep
-        // the bounded write journal across those small slices, but reject any
-        // changed host/task state before guest execution resumes. Ordinary
-        // frames and sound-only execution end the observation.
+        // A guest may temporarily change host mirrors (for example SetPort)
+        // inside a cycle. At a deferred boundary compare against the state at
+        // the previous slice exit, not the anchor: only frontend-side changes
+        // happened in between. The anchor snapshot is still required to match
+        // when the whole cycle closes. A pending event must run normally even
+        // when its input state has returned to the same values.
         self.cancel_pass_recording();
-        if finish_frame != FrameFinalization::Deferred
-            || sound_work_only
-            || self.idle_cycle_probe.as_ref().is_some_and(|probe| {
-                probe.host != IdleCycleHostSnapshot::capture(&self.dispatcher)
-            })
-        {
+        let host_changed = self.idle_cycle_probe.as_ref().is_some_and(|probe| {
+            probe.slice_host.as_ref() != Some(&IdleCycleHostSnapshot::capture(&self.dispatcher))
+        });
+        let pending_event = self.idle_cycle_probe.is_some()
+            && !host_changed
+            && self.idle_slice_has_pending_events();
+        let probe_interrupted = host_changed || pending_event;
+        if finish_frame != FrameFinalization::Deferred || sound_work_only || probe_interrupted {
             self.cancel_idle_cycle_observation();
+        } else if let Some(probe) = self.idle_cycle_probe.as_mut() {
+            probe.slice_host = None;
         }
 
         // Freeze ticks while menu/control tracking is active. ModalDialog
@@ -7710,7 +8068,101 @@ impl FixtureRunner {
                             &self.bus,
                             self.bus.read_word(self.m68k.cpu.core.a(7)) as i16,
                         );
-                    let unsafe_idle_query = self.idle_query_has_unsafe_dispatch(opcode);
+                    let unsafe_dispatch = self.idle_query_has_unsafe_dispatch(opcode);
+                    let resource_safe = if canonical_trap_number(opcode) == (true, 0x01A0)
+                        && !unsafe_dispatch
+                        && self.idle_cycle_probe.is_some()
+                    {
+                        let sp = self.m68k.cpu.read_reg(Register::A7);
+                        if let (Some(stack), Some(res_error)) = (
+                            self.idle_memory_guard(sp, 10),
+                            self.idle_memory_guard(0x0A60, 2),
+                        ) {
+                            let id = self.bus.read_word(sp) as i16;
+                            let kind = self.bus.read_long(sp + 2).to_be_bytes();
+                            if let Some(resource) = self.idle_resident_resource(kind, id) {
+                                if !self.record_idle_memory_guards(&[stack, res_error]) {
+                                    false
+                                } else {
+                                    let probe = self.idle_cycle_probe.as_mut().unwrap();
+                                    if probe.resources.contains(&resource) {
+                                        true
+                                    } else if probe.resources.len() < 16 {
+                                        probe.resources.push(resource);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    };
+                    let cursor_safe = if canonical_trap_number(opcode) == (true, 0x0051)
+                        && !unsafe_dispatch
+                        && self.idle_cycle_probe.is_some()
+                    {
+                        self.idle_cursor_call_guards()
+                            .is_some_and(|guards| self.record_idle_memory_guards(&guards))
+                    } else {
+                        true
+                    };
+                    let menu_safe =
+                        if matches!(canonical_trap_number(opcode), (true, 0x013A | 0x0147))
+                            && !unsafe_dispatch
+                            && self.idle_cycle_probe.is_some()
+                        {
+                            if let Some((menu, guards)) = self.idle_menu_call_proof(opcode) {
+                                let probe = self.idle_cycle_probe.as_mut().unwrap();
+                                let new_guards = guards
+                                    .iter()
+                                    .filter(|guard| !probe.memory_guards.contains(guard))
+                                    .count();
+                                let new_menu = !probe.menus.contains(&menu);
+                                if probe.memory_guards.len() + new_guards > 16
+                                    || (new_menu && probe.menus.len() >= 16)
+                                {
+                                    false
+                                } else {
+                                    for guard in guards {
+                                        if !probe.memory_guards.contains(&guard) {
+                                            probe.memory_guards.push(guard);
+                                        }
+                                    }
+                                    if new_menu {
+                                        probe.menus.push(menu);
+                                    }
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            true
+                        };
+                    let mut unsafe_idle_query =
+                        !resource_safe || !cursor_safe || !menu_safe || unsafe_dispatch;
+                    if !unsafe_idle_query && canonical_trap_number(opcode) == (false, 0x002E) {
+                        if let Some(probe) = self.idle_cycle_probe.as_mut() {
+                            let copy = IdleMemoryGuard {
+                                src: self.m68k.cpu.read_reg(Register::A0),
+                                dst: self.m68k.cpu.read_reg(Register::A1),
+                                count: self.m68k.cpu.read_reg(Register::D0),
+                            };
+                            if !probe.memory_guards.contains(&copy) {
+                                if probe.memory_guards.len() < 16 {
+                                    probe.memory_guards.push(copy);
+                                } else {
+                                    unsafe_idle_query = true;
+                                }
+                            }
+                        }
+                    }
                     if unsafe_idle_query {
                         // A manager return can retire during dispatch, so the
                         // virtual recorder must reject it before that happens.
@@ -8050,6 +8502,9 @@ impl FixtureRunner {
         self.cancel_pass_recording();
         if finish_frame != FrameFinalization::Deferred || sound_work_only {
             self.cancel_idle_cycle_observation();
+        } else if self.idle_cycle_probe.is_some() {
+            let host = IdleCycleHostSnapshot::capture(&self.dispatcher);
+            self.idle_cycle_probe.as_mut().unwrap().slice_host = Some(host);
         }
         self.keep_virtual_idle_cycle_across_slice();
         if finish_frame != FrameFinalization::Deferred {
