@@ -771,6 +771,9 @@ pub(crate) struct StandardFilePutTrackingState {
     pub bounds: (i16, i16, i16, i16),
     pub saved_pixels: SavedPixels,
     pub active_button: Option<((i16, i16, i16, i16), bool)>,
+    /// A press in the name field held down: where it went
+    /// down (a byte offset in the name), the anchor a drag selects from.
+    pub name_anchor: Option<usize>,
 }
 
 /// Candidate file shown by a retained Standard File get dialog.
@@ -1088,6 +1091,7 @@ pub(crate) struct ResourceCheckLoadState {
     pub result_sp: Option<u32>,
     pub reference: u32,
     pub temporary_map: Option<(u32, u32)>,
+    pub res_load_before: Option<u8>,
     pub d_regs: [u32; 8],
     pub a_regs: [u32; 8],
 }
@@ -1629,6 +1633,8 @@ pub struct TrapDispatcher {
     /// Guest SndChannel storage used by writes to the ROM Sound Driver
     /// reference number (-4). Allocated lazily on the first StartSound write.
     pub(crate) legacy_sound_driver_channel: Option<u32>,
+    /// Stable, driver-owned ICN# and Pascal device name for virtual disks.
+    pub(crate) disk_driver_icon: Option<u32>,
     /// Process-owned refnums whose access paths grant write permission.
     /// Files 1992, pp. 2-7--2-8 and 2-121 defines permission as access-path
     /// state and `wrPermErr` (-61) for writes through a read-only path.
@@ -3904,6 +3910,7 @@ impl TrapDispatcher {
             open_files,
             synthetic_drivers: HashMap::default(),
             legacy_sound_driver_channel: None,
+            disk_driver_icon: None,
             write_refnums,
             file_positions,
             recent_file_read: None,
@@ -4617,7 +4624,11 @@ impl TrapDispatcher {
     /// Give loaded application CODE the same master pointers and allocation
     /// metadata used by the Resource Manager. Executing code may recover and
     /// detach its own handle before installing a segment decompressor.
-    pub(crate) fn bind_application_code_handles(&mut self, bus: &mut MacMemoryBus) {
+    pub(crate) fn bind_application_code_handles(
+        &mut self,
+        bus: &mut MacMemoryBus,
+        resident_segments: &[i16],
+    ) {
         let mut segments: Vec<_> = self
             .segment_map
             .iter()
@@ -4625,6 +4636,9 @@ impl TrapDispatcher {
             .collect();
         segments.sort_unstable_by_key(|&(id, _)| id);
         for (id, ptr) in segments {
+            if !resident_segments.is_empty() && !resident_segments.contains(&id) {
+                continue;
+            }
             let key = (0, *b"CODE", id);
             let Some(size) = self
                 .resource_backing_data
@@ -6772,6 +6786,15 @@ impl TrapDispatcher {
                 return u16::MAX;
             }
         };
+        // Resource Manager returns the File Manager's access-path reference.
+        // Keep raw fork reads, marks and closure on the same path as PBOpenRF.
+        // Inside Macintosh: More Macintosh Toolbox (1993), p. 1-58.
+        let backing_key = format!("__rsrc__{vfs_key}");
+        // Raw-fork writes are mirrored back to vfs_rsrc immediately. Refresh
+        // stale backing after a file has been deleted or recreated.
+        self.vfs.insert(backing_key.clone(), rsrc_data.clone());
+        self.open_files.insert(refnum, backing_key);
+        self.file_positions.insert(refnum, 0);
         if let Some(fork) = ResourceFork::parse(&rsrc_data) {
             self.merge_resources_from_fork(&fork, bus, refnum);
         } else {
@@ -6934,6 +6957,8 @@ impl TrapDispatcher {
             }
         });
 
+        self.open_files.remove(&refnum);
+        self.file_positions.remove(&refnum);
         self.write_refnums.remove(&refnum);
         Self::clear_file_fcb(bus, refnum);
         self.sync_guest_curmap(bus);
@@ -8958,11 +8983,33 @@ impl TrapDispatcher {
                 0x1A0 | 0x1A1 | 0x19D | 0x01F | 0x020 | 0x00E | 0x00C => {
                     Some((bus.read_long(result_sp), Some(result_sp)))
                 }
-                0x1A2 => Some((bus.read_long(sp_before), None)),
+                0x1A2
+                    if bus.read_long(sp_before) != 0
+                        && bus.read_long(bus.read_long(sp_before)) == 0 =>
+                {
+                    Some((bus.read_long(sp_before), None))
+                }
                 _ => None,
             };
             if let Some((handle, result_sp)) = resource_result {
-                self.maybe_inject_resource_checkload(bus, cpu, handle, result_sp);
+                let force_load = trap_num == 0x1A2;
+                if !self.maybe_inject_resource_checkload(bus, cpu, handle, result_sp, force_load)
+                    && handle != 0
+                    && bus.read_long(handle) == 0
+                    && (force_load || Self::resource_loading_enabled(bus))
+                {
+                    let sp = cpu.read_reg(Register::A7);
+                    bus.write_long(sp.wrapping_sub(4), handle);
+                    cpu.write_reg(Register::A7, sp.wrapping_sub(4));
+                    let previous_trap = self.current_trap_word;
+                    self.current_trap_word = 0xA0FC;
+                    let fallback = self.dispatch_resource(true, 0x1A2, cpu, bus);
+                    self.current_trap_word = previous_trap;
+                    cpu.write_reg(Register::A7, sp);
+                    if let Some(Err(err)) = fallback {
+                        return Err(err);
+                    }
+                }
             }
         }
 

@@ -3062,6 +3062,13 @@ pub(super) fn ppc_blit_theme_bitmap_masked(
     let vis_storage = memory
         .read_u32_be(port.wrapping_add(PPC_CGRAF_PORT_VIS_RGN_OFFSET))
         .and_then(|vis_rgn| ppc_region_storage(memory, vis_rgn));
+    let band_bottom = i32::from(top)
+        .saturating_add(i32::try_from(bitmap.height()).unwrap_or(i32::MAX))
+        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    let mut vis_rows =
+        regions::PpcRegionRowCache::for_band(vis_storage.as_deref(), top, band_bottom);
+    let mut clip_rows =
+        regions::PpcRegionRowCache::for_band(clip_storage.as_deref(), top, band_bottom);
     let mut pixels = HashMap::new();
     let rgba = bitmap.rgba();
     let mut wrote = false;
@@ -3079,12 +3086,13 @@ pub(super) fn ppc_blit_theme_bitmap_masked(
             let port_h = i32::from(left) + x as i32;
             let port_v = i32::from(top) + y as i32;
             let point = surface.local_point((port_h, port_v));
-            if ppc_local_point_in_port_regions(
-                surface,
-                point,
-                vis_storage.as_deref(),
-                clip_storage.as_deref(),
-            ) {
+            let port_h = point.0 + i32::from(surface.left);
+            let port_v = point.1 + i32::from(surface.top);
+            if i16::try_from(port_h)
+                .ok()
+                .zip(i16::try_from(port_v).ok())
+                .is_some_and(|(h, v)| vis_rows.contains(v, h) && clip_rows.contains(v, h))
+            {
                 if surface.front_buffer.depth == 32 {
                     let frame = surface.front_buffer;
                     let (Ok(px), Ok(py)) = (u32::try_from(point.0), u32::try_from(point.1)) else {
@@ -3877,4 +3885,59 @@ pub(super) fn ppc_draw_control_inner(
 
     }
     framed
+}
+
+#[cfg(test)]
+mod theme_clip_row_tests {
+    use super::*;
+
+    #[test]
+    fn cached_rows_match_point_queries_for_rectangular_and_complex_regions() {
+        let rect = vec![0, 10, 0, 1, 0, 2, 0, 5, 0, 9];
+        let complex = regions::ppc_region_storage_from_rows(
+            1,
+            &[vec![2, 4, 6, 9], vec![2, 4, 6, 9], vec![3, 8], vec![]],
+        )
+        .unwrap();
+        for storage in [&rect, &complex] {
+            let mut cache = regions::PpcRegionRowCache::new(Some(storage));
+            for v in -1..8 {
+                for h in -1..12 {
+                    assert_eq!(
+                        cache.contains(v, h),
+                        regions::ppc_point_in_region_storage(storage, v, h),
+                        "point ({h}, {v})"
+                    );
+                }
+            }
+        }
+        assert!(regions::PpcRegionRowCache::new(None).contains(-20, 30));
+        assert!(!regions::PpcRegionRowCache::new(Some(&[0, 1])).contains(0, 0));
+    }
+
+    #[test]
+    fn predecoded_band_matches_lazy_queries_inside_and_outside_band() {
+        let complex = regions::ppc_region_storage_from_rows(
+            -2,
+            &[vec![-4, -1, 2, 6], vec![-4, -1, 2, 6], vec![-3, 4], vec![], vec![0, 2]],
+        )
+        .unwrap();
+        let rect = vec![0, 10, 0xff, 0xfe, 0xff, 0xfc, 0, 3, 0, 6];
+        let malformed = vec![0, 12, 0xff, 0xfe, 0xff, 0xfc, 0, 3, 0, 6, 0, 0];
+        for storage in [&complex, &rect, &malformed] {
+            for (top, bottom) in [(-1, 2), (-5, 6), (0, 0), (i16::MIN, i16::MAX)] {
+                let mut cache = regions::PpcRegionRowCache::for_band(Some(storage), top, bottom);
+                for v in -5..8 {
+                    for h in -7..9 {
+                        assert_eq!(
+                            cache.contains(v, h),
+                            regions::ppc_point_in_region_storage(storage, v, h),
+                            "point ({h}, {v}), band ({top}, {bottom})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(regions::PpcRegionRowCache::for_band(None, -1, 1).contains(0, 0));
+    }
 }
