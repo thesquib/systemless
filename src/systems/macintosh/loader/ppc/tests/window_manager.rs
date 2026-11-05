@@ -730,6 +730,32 @@ fn close_window_removes_process_membership_without_native_gworld_metadata() {
 
 
 #[test]
+fn new_cwindow_leaves_bytes_after_caller_storage_record_alone() {
+    let pef = synthetic_pef_with_import(b"NewCWindow");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let scratch = PPC_DATA_BASE + 0x1000;
+    let storage_ptr = scratch + 0x100;
+    loaded.memory.add_region(scratch, vec![0; 0x300]);
+    ppc_write_rect(&mut loaded.memory, scratch, 20, 10, 260, 330).unwrap();
+    let tail = storage_ptr + PPC_CWINDOW_RECORD_SIZE;
+    loaded.memory.write_u16_be(tail, 0x0065).unwrap();
+    loaded.cpu.gpr[3] = storage_ptr;
+    loaded.cpu.gpr[4] = scratch;
+    loaded.cpu.gpr[5] = scratch + 8;
+    loaded.cpu.gpr[6] = 0;
+    loaded.cpu.gpr[7] = 0;
+    loaded.cpu.gpr[8] = u32::MAX;
+    loaded.cpu.gpr[9] = 0;
+    loaded.cpu.gpr[10] = 0;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(loaded.cpu.gpr[3], storage_ptr);
+    assert_eq!(loaded.memory.read_u16_be(tail), Some(0x0065));
+}
+
+#[test]
 fn hle_import_runner_handles_new_cwindow_allocation() {
     let pef = synthetic_pef_with_import(b"NewCWindow");
     let mut loaded = load_pef_application(&pef).unwrap();
@@ -2976,15 +3002,11 @@ fn hle_import_runner_get_new_cwindow_associates_matching_palette() {
     let probe = loaded.run_with_hle_imports(64);
 
     assert_eq!(probe.unsupported_import_index, None);
-    let palette_handle = loaded
-        .memory
-        .read_u32_be(storage_ptr + PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET)
+    let palette_handle = loaded.toolbox_startup.port_palettes.get(&storage_ptr).map(|entry| entry.0)
         .unwrap();
     assert_ne!(palette_handle, 0);
     assert_eq!(
-        loaded
-            .memory
-            .read_u16_be(storage_ptr + PPC_CGRAF_PORT_PALETTE_UPDATES_OFFSET),
+        loaded.toolbox_startup.port_palettes.get(&storage_ptr).map(|entry| entry.1),
         Some(1)
     );
     let palette = loaded.memory.read_u32_be(palette_handle).unwrap();
