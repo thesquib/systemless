@@ -657,7 +657,7 @@ impl CfmLoadOperation {
                     let error_name = [0];
                     let mut writes: Vec<(u32, &[u8])> =
                         vec![(operation.outputs.connection, &connection)];
-                    // Callers may pass NULL for mainAddr, as Adobe's Sangam does when loading readers.
+                    // mainAddr is optional; PageMaker 7's Sangam passes NULL for its readers.
                     if operation.outputs.main_address != 0 {
                         writes.push((operation.outputs.main_address, &main_address));
                     }
