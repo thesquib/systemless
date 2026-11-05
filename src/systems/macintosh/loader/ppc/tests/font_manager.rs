@@ -486,3 +486,16 @@ fn ppc_src_copy_space_clears_cell_with_clip_and_scale() {
         }
     }
 }
+
+#[test]
+fn font_metrics_ignores_a_nil_record() {
+    let pef = synthetic_pef_with_import(b"FontMetrics");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let before = loaded.memory.read_u32_be(16);
+    loaded.cpu.gpr[3] = 0;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(loaded.memory.read_u32_be(16), before);
+}
