@@ -940,6 +940,73 @@ pub(super) fn ppc_write_region_storage(
     PPC_NO_ERR
 }
 
+/// Combine two rectangular (or empty) regions at their vertical change points.
+/// This is equivalent to expanding each scanline, but its work is bounded by
+/// the number of rectangle edges rather than the height of the coordinate space.
+pub(super) fn ppc_rectangular_region_boolean(
+    a: &[u8], b: &[u8], operation: PpcRegionBooleanOp,
+) -> Option<Vec<u8>> {
+    if a.len() != 10 || b.len() != 10 {
+        return None;
+    }
+    let a = ppc_region_storage_bbox(a);
+    let b = ppc_region_storage_bbox(b);
+    let mut edges = Vec::new();
+    for (top, _, bottom, _) in [a, b].into_iter().flatten() {
+        edges.extend([top, bottom]);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    let mut segments = Vec::new();
+    let row_at = |rect: Option<(i16, i16, i16, i16)>, y| match rect {
+        Some((top, left, bottom, right)) if top <= y && y < bottom => vec![left, right],
+        _ => Vec::new(),
+    };
+    for pair in edges.windows(2) {
+        let row = ppc_region_combine_rows(&row_at(a, pair[0]), &row_at(b, pair[0]), operation);
+        segments.push((pair[0], pair[1], row));
+    }
+    let Some((top, _, first)) = segments.iter().find(|(_, _, row)| !row.is_empty()) else {
+        return Some(vec![0, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
+    };
+    let bottom = segments.iter().rev().find(|(_, _, row)| !row.is_empty())?.1;
+    let left = segments.iter().filter_map(|(_, _, row)| row.first().copied()).min()?;
+    let right = segments.iter().filter_map(|(_, _, row)| row.last().copied()).max()?;
+    let rectangular = first.as_slice() == [left, right]
+        && segments.iter().filter(|(start, end, _)| *end > *top && *start < bottom)
+            .all(|(_, _, row)| row == first);
+    let mut words = Vec::new();
+    if !rectangular {
+        let mut previous = Vec::new();
+        for (start, _, row) in segments.iter().filter(|(start, end, _)| *end > *top && *start < bottom) {
+            let delta = ppc_region_merge_endpoints(&previous, row);
+            if !delta.is_empty() {
+                words.push(*start);
+                words.extend(delta);
+                words.push(i16::MAX);
+            }
+            previous = row.clone();
+        }
+        let delta = ppc_region_merge_endpoints(&previous, &[]);
+        if !delta.is_empty() {
+            words.push(bottom);
+            words.extend(delta);
+            words.push(i16::MAX);
+        }
+        words.push(i16::MAX);
+    }
+    let size = u16::try_from(10usize.checked_add(words.len().checked_mul(2)?)?).ok()?;
+    let mut output = Vec::with_capacity(usize::from(size));
+    output.extend_from_slice(&size.to_be_bytes());
+    for value in [*top, left, bottom, right] {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
+    for word in words {
+        output.extend_from_slice(&word.to_be_bytes());
+    }
+    Some(output)
+}
+
 pub(super) fn ppc_region_boolean_op(
     allocator: Option<&mut PpcProcessAllocatorView<'_>>,
     memory: &mut PpcSectionMem,
@@ -977,7 +1044,9 @@ pub(super) fn ppc_region_boolean_op(
             (None, None) => None,
         },
     };
-    let output = if let Some((top, bottom)) = band {
+    let output = if let Some(output) = ppc_rectangular_region_boolean(&storage_a, &storage_b, operation) {
+        output
+    } else if let Some((top, bottom)) = band {
         let Some(rows_a) = ppc_region_rows_for_band(&storage_a, top, bottom) else {
             return PPC_PARAM_ERR;
         };
@@ -1207,6 +1276,67 @@ pub(super) fn ppc_point_in_region(memory: &mut PpcSectionMem, rgn_handle: u32, v
         return false;
     };
     ppc_point_in_region_storage(&storage, v, h)
+}
+
+// Reuse decoded intervals across point queries in a QuickDraw region.
+pub(super) struct PpcRegionRowCache<'a> {
+    storage: Option<&'a [u8]>,
+    rows: HashMap<i16, Vec<i16>>,
+}
+
+impl<'a> PpcRegionRowCache<'a> {
+    pub(super) fn new(storage: Option<&'a [u8]>) -> Self {
+        Self {
+            storage,
+            rows: HashMap::new(),
+        }
+    }
+
+    pub(super) fn for_band(storage: Option<&'a [u8]>, top: i16, bottom: i16) -> Self {
+        let mut cache = Self::new(storage);
+        let Some(storage) = storage.filter(|storage| storage.len() > 10) else {
+            return cache;
+        };
+        if i32::from(bottom) - i32::from(top) > 4096 || bottom <= top {
+            return cache;
+        }
+        if let Some(rows) = ppc_region_rows_for_band(storage, top, bottom) {
+            for (offset, row) in rows.into_iter().enumerate() {
+                cache.rows.insert((i32::from(top) + offset as i32) as i16, row);
+            }
+        }
+        cache
+    }
+
+    pub(super) fn contains(&mut self, v: i16, h: i16) -> bool {
+        let Some(storage) = self.storage else {
+            return true;
+        };
+        let Some((top, left, bottom, right)) = ppc_region_storage_bbox(storage) else {
+            return false;
+        };
+        if v < top || v >= bottom || h < left || h >= right {
+            return false;
+        }
+        if storage.len() == 10 {
+            return true;
+        }
+        self.rows
+            .entry(v)
+            .or_insert_with(|| {
+                ppc_region_rows_for_band(storage, v, v.saturating_add(1))
+                    .and_then(|mut rows| {
+                        if rows.is_empty() {
+                            None
+                        } else {
+                            Some(rows.remove(0))
+                        }
+                    })
+                    .unwrap_or_default()
+            })
+            .chunks_exact(2)
+            .any(|interval| h >= interval[0] && h < interval[1])
+    }
 }
 
 pub(super) fn ppc_point_in_region_storage(storage: &[u8], v: i16, h: i16) -> bool {

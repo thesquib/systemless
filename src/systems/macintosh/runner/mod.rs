@@ -3785,7 +3785,18 @@ impl FixtureRunner {
 
         let segments: HashMap<i16, u32> = app.segment_bases.iter().map(|(&k, &v)| (k, v)).collect();
         self.dispatcher.register_segments(segments);
-        self.dispatcher.bind_application_code_handles(&mut self.bus);
+        let mut resident_segments: Vec<i16> = app
+            .jump_table
+            .iter()
+            .filter(|entry| entry.loaded)
+            .map(|entry| entry.segment)
+            .collect();
+        if let Some(entry) = app.jump_table.first() {
+            resident_segments.push(0);
+            resident_segments.push(entry.segment);
+        }
+        self.dispatcher
+            .bind_application_code_handles(&mut self.bus, &resident_segments);
 
         Some(app)
     }
@@ -4068,6 +4079,15 @@ impl FixtureRunner {
         self.bus.write_word(addr::FS_FCB_LEN, HFS_FCB_SIZE);
         self.bus
             .write_word(addr::CUR_APREF_NUM, APPLICATION_RESOURCE_REFNUM);
+        // The application map is created before its resource fork receives an
+        // FCB. Publish that FCB reference to native Resource Manager clients.
+        let map_handle = self.bus.read_long(0x0A50);
+        if map_handle != 0 {
+            let map = self.bus.read_long(map_handle);
+            if map != 0 && self.bus.read_word(map + 20) == 0 {
+                self.bus.write_word(map + 20, APPLICATION_RESOURCE_REFNUM);
+            }
+        }
         self.dispatcher.sync_guest_curmap(&mut self.bus);
 
         self.dispatcher
@@ -4124,6 +4144,8 @@ impl FixtureRunner {
             (native, migrated_services)
         });
         assert!(self.native.reset_for_launch(native_launch.is_some()));
+        self.dispatcher
+            .reset_resource_checkload_for_launch(&mut self.bus);
         self.debug_advance_generation();
         self.process_context.reset_cfm_for_launch();
         if let Some((ppc_app, migrated_services)) = native_launch {
@@ -4156,6 +4178,10 @@ impl FixtureRunner {
         self.m68k.cpu.core.set_sr_noint_nosp(launch_sr);
 
         // Initialize low-memory globals
+        self.bus.write_word(
+            addr::SYS_VERSION,
+            crate::machine_profile::REFERENCE_MACHINE_PROFILE.system_version_bcd,
+        );
         self.bus.write_long(addr::MEM_TOP, ram_size);
         // CurStackBase ($0908): "Address of base of stack; start of
         // application global variables." Per Inside Macintosh: Memory
@@ -4958,6 +4984,10 @@ impl FixtureRunner {
 
         self.bus.detach_guest_address_space();
         self.adopt_ppc_process_memory_image(&mut ppc_app);
+        self.bus.write_word(
+            addr::SYS_VERSION,
+            crate::machine_profile::POWERPC_SYSTEM_VERSION_BCD,
+        );
         // These are process launch defaults, not PEF-loader state. Reapply
         // them after adopting a sparse construction image so a synthetic
         // adapter that maps zero-filled low memory cannot erase the process
@@ -6263,13 +6293,13 @@ impl FixtureRunner {
         })
     }
 
-    /// Conservative, read-only equivalent of asking whether a slice may
-    /// encounter an event. Peeking through the Event Manager can itself post
-    /// an auto-key or launch event and prune update markers.
-    fn idle_slice_has_pending_events(&self) -> bool {
+    /// Queue mutations are covered by `IdleCycleHostSnapshot`. All other
+    /// possible event sources remain conservative across a deferred slice.
+    /// Peeking through the Event Manager here could itself post an auto-key
+    /// or launch event and prune update markers.
+    fn idle_slice_has_nonqueue_pending_events(&self) -> bool {
         let dispatcher = &self.dispatcher;
         dispatcher.event_queue.menu_bar_is_invalid()
-            || !dispatcher.event_queue.is_empty()
             || dispatcher.has_pending_native_menu_event()
             || dispatcher.input_state.has_key_repeat()
             || dispatcher.pending_launch_app.is_some()
@@ -7361,7 +7391,7 @@ impl FixtureRunner {
         });
         let pending_event = self.idle_cycle_probe.is_some()
             && !host_changed
-            && self.idle_slice_has_pending_events();
+            && self.idle_slice_has_nonqueue_pending_events();
         let probe_interrupted = host_changed || pending_event;
         if finish_frame != FrameFinalization::Deferred || sound_work_only || probe_interrupted {
             self.cancel_idle_cycle_observation();

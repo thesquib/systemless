@@ -643,6 +643,10 @@ fn load_pef_application_with_optional_disk_fragment(
             .ok_or(PpcLoadError::AddressOverflow)?;
     }
     memory.add_region(PPC_HALT_PC, vec![0u8; PPC_LOW_MEMORY_SIZE]);
+    let _ = memory.write_u16_be(
+        crate::memory::globals::addr::SYS_VERSION,
+        POWERPC_SYSTEM_VERSION_BCD,
+    );
     let _ = memory.write_u8(
         crate::memory::globals::addr::KBD_TYPE,
         crate::machine_profile::KEYBOARD_PHYSICAL_TYPE,
@@ -1074,6 +1078,13 @@ fn load_pef_application_with_optional_disk_fragment(
     memory.add_region(stack_base, stack);
     let mut cpu = PpcCpu::new();
     cpu.alignment_policy = PpcAlignmentPolicy::EmulateData;
+    // The PowerPC JIT is on by default; set `PPC_JIT=0` to use the interpreter.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    if std::env::var("PPC_JIT").as_deref() != Ok("0") {
+        if let Err(error) = cpu.enable_jit(ppc::PpcJitConfig::default()) {
+            eprintln!("ppc jit unavailable: {error}");
+        }
+    }
     cpu.pc = startup.map_or(entry_pc, |startup| startup.0);
     cpu.gpr[1] = stack_pointer;
     cpu.gpr[2] = startup.map_or(rtoc, |startup| startup.1);

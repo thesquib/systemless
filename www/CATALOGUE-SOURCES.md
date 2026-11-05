@@ -2826,3 +2826,204 @@ Approve the existing entry's two browser CPU routes. The contribution still requ
 validation and a replay of its final committed head before normal merge. **Human release
 and exact released production-route verification remain pending.** Source stock remains
 **221 records**; this approval adds no source game and no qualified-live increment.
+
+## After Dark Games and Tony Hawk 2 — 2026-11-02 intake
+
+On master `d5f042bce`, the `ci-test` native play runner exercised two intact
+promotional demos. These are bounded native observations, not browser, rights or
+release approvals. The local scenarios and captures are under `/tmp` and are
+not independent emulator comparisons.
+
+- **After Dark Games Demo:** [original BinHex](https://download.classicmacdemos.com/After%20Dark%20Games%20Demo.hqx),
+  10,327,704 bytes, SHA-256 `0fea33ca33c78263fe042917dd9cbbd6d97dfee0b2a8ba1bc4fc390de484f2c1`.
+  The PPC game now opens after the VISE importer fix tracked by #3928. In Roof
+  Rats, creating a player and clicking two adjacent matching rooms changed the
+  room counter from 150 to 148. A matched idle control differed by 6,580 pixels
+  after the move; an exact replay matched all three checkpoints at ticks 340,
+  402 and 464, with no exhausted frames. Other sampler games and audio remain
+  untested. The installed readme describes the limited demo, but does not grant
+  redistribution. The installer contains compressed text resources not yet
+  decoded in this audit, and the install tree includes runtime libraries. An
+  inspection-only reconstruction of the original installer with a modified 68K
+  profile advertising PowerPC reached its splash; Continue created a text dialog
+  with a Decline control, then the guest exited before its contents could be
+  captured. This does not establish what the dialog says. Review the complete
+  package and its terms before hosting. Three 20-second local Chromium 156
+  worker/WebGL preview samples using the exact archive and 60 MHz pacing measured
+  60.26, 59.70 and 60.31 guest ticks/s, with one substituted archive request and
+  no console errors each. The first screenshot visibly shows the board at 148
+  rooms. The other two screenshots appeared black in the image inspection tool,
+  but independent AppKit pixel reads found their board regions identical to the
+  first, and converting one to JPEG showed the same board and 148-room count.
+  A GPU-allowed, overlay-off run visibly showed the same board and measured
+  60.76 guest ticks/s. The preview substituted locally served original bytes;
+  the managed hosted archive and released route remain untested, so this is not
+  browser launch approval.
+- **Tony Hawk's Pro Skater 2 Demo:** [original StuffIt archive](https://classicmacdemos.com/download/tony-hawks-pro-skater-2/),
+  23,248,987 bytes, SHA-256 `3576065f578a4ec66315d56e3a5deeb37b8a14c578c63efc289aee55be93ea24`.
+  Selecting `Tony Hawk Demo (OS9)` on PPC now reaches the Hangar single-session
+  level. Holding Space for 20 ticks produces an airborne skater; the matched idle
+  run was pixel-identical at tick 440 and differed by 298,263 pixels at tick 490.
+  An exact replay matched both checkpoints with no exhausted frames. Score,
+  audio, other controls and full-session behaviour remain unverified. The readme
+  does not grant complete-package redistribution. The archive contains OS 9 and
+  OS X executables and game data; complete-package rights review remains open.
+  The headless runs took longer than their simulated duration under concurrent
+  load; they are not a performance measurement. A local Chromium 156
+  worker/WebGL preview with the exact archive and 60 MHz pacing reached skater
+  selection; one 20-second sample measured 17.76 guest ticks/s and 41.92 host
+  fps, below the probe's 50/55 thresholds. Its screenshot remained on skater
+  selection, so that sample did not measure the Hangar. A second sample using
+  longer waits reached the Hangar and measured 31.84 guest ticks/s and 43.69
+  host fps, with a 59.9 ms runtime frame; it also failed the pacing thresholds.
+  A separate fixed-25-MHz preview reached the Hangar but measured 28.17 guest
+  ticks/s and 43.73 host fps, with a 58.9 ms runtime frame, also failing the
+  thresholds. These samples do not establish equal guest progress or compare
+  game speed at the two settings. Browser input, sustained gameplay and pacing
+  qualification remain open.
+
+Neither candidate is hosted, launch-approved or counted live. The browser
+preview worktree is `/tmp/systemless-catalogue-browser-20261102`; its temporary
+entries are test fixtures and must not be published as catalogue metadata.
+
+## Worms demo — 2026-11-02 intake
+
+The original [Worms demo](https://classicmacdemos.com/worms) was downloaded
+from the linked archive (2,123,427 bytes, SHA-256
+`afc5a0c21989e0b7fe0c23b7b73116ede921436d2aed4db04b60e8bcb53ccd6b`);
+the source lists it on 12 period cover discs. The application contains 68K
+CODE resources and a PowerPC PEF. Its extracted tree contains game data and no
+separate readme or licence file; the application resource map has CODE, DATA,
+SIZE and cfrg resources, with no TEXT or STR resources. Complete-package terms
+are not established by this inventory alone.
+
+On master `d5f042bce`, 68K and PPC native runs each reached the playable-demo
+main menu at 1,200 frontend ticks. Both reports have zero exhausted frames and
+no assertions; this is startup evidence only. On 68K, an initial click, a
+longer held click and Return did not start a match; on PPC, Space did not start
+one. A further 68K replay moving the mouse to `(v=257,h=250)`, waiting 30 ticks
+and clicking at that position opened the team-selection screen on both 68K and
+PPC. Subsequent 68K attempts to select a team did not begin a match. The guest
+cursor appeared at different positions from requested coordinates, including after button events;
+the exact control path and any runtime defect need investigation before
+claiming gameplay. No browser test, hosting, launch approval or released-route
+check has been performed.
+
+
+**Battle and combat follow-up, 3 November:** the unchanged original demo on
+both 68K and PPC selects two teams, starts a landscape and enters a battle when
+the headless setup accounts for the guest's mouse recentering. On each slice,
+a held Right input and same-duration idle control start from pixel-identical
+battle frames; the post-input view scrolls in the input run. Four observed
+pixel assertions pass in each movement/control replay, with zero exhausted
+frames. A separate matched Space hold/release produces a visible explosion and
+reduces the active worm's displayed health from 100 to 50; six observed pixel
+checks pass in each fire/no-fire replay on both slices, with zero exhausted
+frames. These bounded native results are not a complete match, browser or
+independent-emulator qualification. The exact package's distribution terms
+remain unestablished, and the mouse-warp behavior and safe frontend handling
+remain under investigation in [#5558](https://github.com/benletchford/systemless/issues/5558).
+No entry or managed asset is approved by this evidence.
+
+## Fatty Bear's Birthday Surprise — direct public replay
+
+On 2 November 2026, fresh Chromium 156 worker/WebGL sessions opened the
+[public player](https://systemless.org/fatty-bears-birthday-surprise-demo/)
+without a preview bridge or local archive substitution. A fresh managed archive
+download matched 1,199,592 bytes and SHA-256
+`c524b0e05f2f96b9fa31432d5306b525bc897702f6b6fc1a146d735029e007d0`;
+the catalogue screenshot matched 21,855 bytes and SHA-256
+`90d437f17d7b045c85c57bed7d4d0d22a554846ddb9e6802015270b1ca6d1551`.
+The unchanged application's data fork is empty; its resource map contains eight
+CODE resources and no cfrg. The bundled data files remain in the original
+archive.
+
+The opening grayscale front-yard animation occurs without input and is not
+counted as gameplay. After it and the title sequence, the original colour yard
+and inventory appear. At guest tick 5,100, a click on the skateboard made Fatty
+walk toward it; a same-duration no-click control left him at the house. Inspected
+captures differed by 102 pixels before the input and 4,071 pixels afterward in
+the game-content region. A repeated clicked run showed the same movement, with
+94 differing pixels in that region at the later capture. Captures are browser
+observations, not an independent Macintosh emulator oracle. Twenty-second samples
+measured 59.78 and 59.93 guest ticks/s for the clicked runs and 60.37 for the
+control, with no console errors. Other puzzles, later scenes, saves and audio
+fidelity were not assessed. With the existing original-package acceptance,
+native evidence, promoted assets and launch approval, this verifies one
+existing distinct title live; it adds no source entry or release.
+
+## NS-SHAFT — direct public replay 2 November 2026
+
+The enabled [public player](https://systemless.org/ns-shaft/) was tested directly
+with no preview bridge or substituted assets. The hosted original archive
+independently matches SHA-256 `ced6dfcab13f4fd7a4a7f949467bcc4de0f7abd519dae379bf351761a8efcba1`
+and 382,228 bytes; its hosted screenshot matches SHA-256
+`86e82d659bf504f96fcf00c99e5522e164f4ff89d4e0fbe2bca7fc5dba2ed710`
+and 84,418 bytes. Existing intake #4475 records the original grant, matching
+forks and 68K-only executable.
+
+In a fresh Chrome 156 worker/WebGL session at 25 MHz, Return dismissed the
+original shareware notice and a second Return started the game. An 800 ms Right
+hold produced a character on a lower platform at B0002F; a fresh matched
+no-arrow control instead reached the high-score prompt, with the character at
+the spikes. A separate 20-second sample after Right input included the end-of-run
+prompt and reported 60.026 guest ticks/sec, 61.061 host frames/sec and no
+console errors. This is bounded gameplay, not a full run or an audio or score
+persistence test. Some title-dialog remnants remain tracked by #4477. The
+latest published release observed was v0.107.0, but the deployed player asset
+was not independently mapped to that tag.
+
+## NS-TOWER — direct public pacing recheck 2 November 2026
+
+The enabled [public player](https://systemless.org/ns-tower/) was tested directly
+without frontend or archive substitution. The hosted author-original archive
+matches SHA-256 `50e9a1fd942cebf9d3a549fee19b590b0248e009d1c3cfcd613ae4ef600d3d51`
+and 829,529 bytes. The public page references the clean replacement screenshot,
+whose hosted bytes match SHA-256
+`99c877db2efdf9885cd9530fafa351ad33b31af3f2fda02ecb6eb1c56f6ce058` and
+86,330 bytes. Intake #4480 records unchanged-package permission, independent fork
+comparison and the 68K-only executable. Its earlier direct public captures show
+Space charging the meter and the character rising on release.
+
+Two fresh Chrome 156 worker/WebGL runs at 25 MHz dismiss the shareware notice,
+start the tower and release a 700 ms Space charge. The clean sidebar and active
+playfield were inspected. Two 20-second samples report 60.223 and 60.282 guest
+ticks/sec, 60.223 and 60.282 host frames/sec respectively, and no console
+errors. This replaces the earlier contention-affected 35.48 ticks/sec observation
+as the quiet public pacing check; it does not establish floor-counter advancement,
+long runs, saved-score persistence or audio fidelity. The latest published release
+observed was v0.107.0; the deployed player asset was not mapped to a tag.
+
+## Nanosaur original demo — native movement recheck 3 November 2026
+
+The publisher's original [Mac OS 9 1.3.4 image](https://www.pangeasoft.net/nano/Nanosaur.dmg)
+remains unchanged: SHA-256
+`0cda02a8caceae0c2d9165f9fdb019d01be7312cd87afbf7f57cb07d69f80b5f`,
+14,376,561 bytes. Its embedded licence restricts redistribution and network
+transmission, so the image remains unhosted pending applicable permission. The
+publisher-endorsed modern port's licence is not applied to this classic image.
+
+Two fresh native-hosted PowerPC guest runs of the exact original image on integrated
+master `9044ca571`, with the Apple M3 Metal QD3D renderer, select the unregistered
+Demo and progress through the original title and 3D selection to the game world.
+The captures immediately before input match pixel for pixel at frontend/guest
+tick 5,218. Holding Up for 120 frontend ticks moves the dinosaur away from the
+circular starting marker; a matched no-key run remains at the marker. At tick
+5,338 the inspected screenshots differ by 160,462 pixels and show the same
+countdown. Both structured runs complete without guest instruction-budget
+exhaustion. This is bounded input evidence from Systemless, not an independent
+classic-Mac oracle or a browser pacing measurement. Full gameplay, audio,
+architecture completeness, permission, asset promotion, browser launch and public
+delivery remain unverified. [Intake and reproduction](https://github.com/benletchford/systemless/issues/5535).
+
+A further matched 3 November PowerPC replay uses the same unchanged DMG and the
+local `ci-test` executable SHA-256
+`bf259eddd3ad1c8aa3b299b0ad3d918e9feaf3242a28041017f8a41b3994ce07`, with
+Metal rendering. The fire and idle captures match before input at frontend/guest
+tick 5,218. Holding Space for 60 ticks produces visible weapon feedback and
+reduces the displayed ammunition from 50 to 46; the idle run remains at 50.
+Three observed HUD pixel checks pass in each repeated run at tick 5,278 with
+zero exhausted frames; the outcome captures differ by 3,371 pixels. This is
+bounded native weapon input, not a confirmed hit, completed game or browser
+performance result. The original licence restriction remains; no hosting or
+live qualification is claimed. [Replay details](https://github.com/benletchford/systemless/issues/5535).
