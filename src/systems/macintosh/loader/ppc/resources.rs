@@ -158,8 +158,17 @@ pub(crate) fn ppc_get_resource(
     ) {
         Some(index) => index,
         None => {
+            let fond_name = crate::quickdraw::fonts::FONT_NAMES
+                .iter()
+                .find(|(id, _)| *id == res_id)
+                .map(|(_, name)| crate::mac_roman::encode_mac_roman_lossy(name));
+            let mut name = Vec::new();
             let system_resource = if !current_only && res_type == u32::from_be_bytes(*b"STR ") {
                 crate::trap::TrapDispatcher::system_str_default_body(res_id).map(|body| body.to_vec())
+            } else if !current_only && res_type == u32::from_be_bytes(*b"FOND") && fond_name.is_some() {
+                // Built-in fonts have no resource file, but the real System's fonts have FONDs.
+                name = fond_name.unwrap_or_default();
+                Some(super::dispatch_resources::ppc_synthetic_fond_bytes(res_id))
             } else if !current_only && res_type == u32::from_be_bytes(*b"itl0") && res_id == 0 {
                 // The Roman system script supplies numeric-format resource 0.
                 // Intl0Rec layout: Inside Macintosh: Text (1993), B-22–B-24.
@@ -174,14 +183,10 @@ pub(crate) fn ppc_get_resource(
             if let Some(data) = system_resource {
                 vfs_resources.push(PpcVfsResourceRecord {
                     ref_num: 0,
-                    path: if res_type == u32::from_be_bytes(*b"STR ") {
-                        "__system__/STR ".to_string()
-                    } else {
-                        "__system__/itl0".to_string()
-                    },
+                    path: format!("__system__/{}", ppc_res_type_text(res_type)),
                     res_type,
                     res_id,
-                    name: Vec::new(),
+                    name,
                     data: data.into(),
                     raw_data: None,
                     raw_attrs: None,
