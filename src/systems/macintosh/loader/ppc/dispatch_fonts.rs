@@ -232,6 +232,9 @@ pub(super) fn dispatch_font_import(context: PpcFontDispatchContext<'_>) -> Optio
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::FontMetrics => {
+            if cpu.gpr[3] == 0 || !ppc_memory_can_write_bytes(memory, cpu.gpr[3], 20) {
+                return Some(PpcImportAction::ReturnPreserve);
+            }
             let text_font = ppc_current_text_font(memory, current_gworld);
             ppc_font_metrics(memory, cpu.gpr[3], text_font, *quickdraw_text_size);
             let style = ppc_current_text_style(memory, current_gworld);

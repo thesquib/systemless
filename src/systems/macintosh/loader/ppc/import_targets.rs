@@ -803,6 +803,7 @@ pub enum PpcImportDispatcherTarget {
     CloseDeskAcc,
     AEInstallEventHandler,
     AERemoveEventHandler,
+    AEGetEventHandler,
     AEInstallSpecialHandler,
     AEProcessAppleEvent,
     LNew,
@@ -2883,8 +2884,6 @@ pub(crate) fn dispatcher_target_for_import(
             | "AEInstallCoercionHandler"
             | "IconIDToRgn",
         ) => PpcImportDispatcherTarget::ReturnNoErr,
-        // errAEHandlerNotFound: callers install their own handler when none is reported.
-        ("InterfaceLib", "AEGetEventHandler") => PpcImportDispatcherTarget::ReturnError(-1717),
         ("InterfaceLib", "ReserveMemSys") => PpcImportDispatcherTarget::NoOpPreserve,
         // A single process holds every byte range, so locks always succeed.
         ("InterfaceLib", "PBLockRangeSync" | "PBUnlockRangeSync") => {
@@ -2945,6 +2944,7 @@ pub(crate) fn dispatcher_target_for_import(
             PpcImportDispatcherTarget::AEInstallEventHandler
         }
         ("InterfaceLib", "AERemoveEventHandler") => PpcImportDispatcherTarget::AERemoveEventHandler,
+        ("InterfaceLib", "AEGetEventHandler") => PpcImportDispatcherTarget::AEGetEventHandler,
         ("DrawSprocketLib", "DSpStartup") => PpcImportDispatcherTarget::DSpStartup,
         ("DrawSprocketLib", "DSpSetDebugMode") => PpcImportDispatcherTarget::DSpSetDebugMode,
         ("DrawSprocketLib", "DSpGetVersion") => PpcImportDispatcherTarget::DSpGetVersion,
