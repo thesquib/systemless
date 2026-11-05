@@ -2274,6 +2274,11 @@ impl super::TrapDispatcher {
             left + sright,
         );
         self.draw_standard_file_get_list(bus, tracking);
+        // A button held down with the pointer inside stays highlighted
+        // through a repaint (TrackControl's inButton, IM I-323).
+        if let Some((rect, true)) = tracking.active_button {
+            self.draw_standard_file_button(bus, tracking.bounds, rect, true, true);
+        }
         self.standard_file_drawn = bus.screen_mark();
     }
 
@@ -2824,6 +2829,13 @@ impl super::TrapDispatcher {
         location_label: &str,
         writable: bool,
     ) -> Vec<DialogItem> {
+        let (start, end) = Self::standard_file_selection_range(tracking);
+        let mac_roman = |offset: usize| {
+            encode_mac_roman_lossy(&tracking.name[..offset])
+                .len()
+                .min(i16::MAX as usize) as i16
+        };
+        let (mac_roman_start, mac_roman_end) = (mac_roman(start), mac_roman(end));
         vec![
             DialogItem {
                 item_type: if writable { 4 } else { 0x84 },
@@ -2875,8 +2887,10 @@ impl super::TrapDispatcher {
                 item_type: 16,
                 rect: STANDARD_FILE_NAME_RECT,
                 text: tracking.name.clone(),
-                sel_start: tracking.sel_start,
-                sel_end: tracking.sel_end,
+                // The field draws Mac Roman text: its selection in Mac Roman
+                // offsets (the name's own are UTF-8).
+                sel_start: mac_roman_start,
+                sel_end: mac_roman_end,
                 ..DialogItem::default()
             },
             DialogItem {
@@ -2930,7 +2944,73 @@ impl super::TrapDispatcher {
             &location_label,
         );
         self.draw_standard_file_put_list(bus, tracking);
+        // A button held down with the pointer inside stays highlighted
+        // through a repaint (TrackControl's inButton, IM I-323).
+        if let Some((rect, true)) = tracking.active_button {
+            self.draw_standard_file_button(bus, tracking.bounds, rect, false, true);
+        }
+        self.draw_standard_file_name_caret(bus, tracking);
         self.standard_file_drawn = bus.screen_mark();
+    }
+
+    /// The byte offset in the name of the character
+    /// boundary nearest a global `h` in the name field (the glyphs start a
+    /// pixel inside its rect, as TextEdit draws them).
+    fn standard_file_name_offset_at(tracking: &StandardFilePutTrackingState, h: i16) -> usize {
+        let origin = tracking.bounds.1 + STANDARD_FILE_NAME_RECT.1 + 1;
+        let boundaries = tracking
+            .name
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(tracking.name.len()));
+        boundaries
+            .min_by_key(|&at| {
+                let x = origin + Self::fb_measure_string(&tracking.name[..at], 0, 12);
+                (i32::from(x) - i32::from(h)).abs()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The insertion point, a line before the character it
+    /// stands at, when nothing is selected (it blinks on a Mac; drawn steady
+    /// here).
+    fn draw_standard_file_name_caret(
+        &self,
+        bus: &mut MacMemoryBus,
+        tracking: &StandardFilePutTrackingState,
+    ) {
+        let (start, end) = Self::standard_file_selection_range(tracking);
+        if start != end {
+            return;
+        }
+        let (top, left, bottom, right) = STANDARD_FILE_NAME_RECT;
+        let (top, left, bottom, right) = (
+            tracking.bounds.0 + top,
+            tracking.bounds.1 + left,
+            tracking.bounds.0 + bottom,
+            tracking.bounds.1 + right,
+        );
+        let x = left + Self::fb_measure_string(&tracking.name[..start], 0, 12);
+        // Past the field (a name wider than it), no insertion point is drawn
+        // rather than one outside the dialog.
+        if x >= right {
+            return;
+        }
+        let (screen_base, row_bytes, screen_width, screen_height, pixel_size) =
+            self.get_screen_params();
+        Self::fb_fill_rect(
+            bus,
+            screen_base,
+            row_bytes,
+            pixel_size,
+            screen_width,
+            screen_height,
+            top,
+            x,
+            bottom,
+            x + 1,
+            true,
+        );
     }
 
     /// Whether the Standard File dialog drawn last still stands untouched:
@@ -3202,6 +3282,7 @@ impl super::TrapDispatcher {
             bounds,
             saved_pixels,
             active_button: None,
+            name_anchor: None,
         };
         self.draw_standard_file_put_dialog(bus, &tracking);
         self.standard_file_put_tracking = Some(tracking);
@@ -3215,6 +3296,31 @@ impl super::TrapDispatcher {
     ) {
         let mut action = None;
         let mut consumed_event = false;
+        // A press in the name field held down selects from
+        // where it went down to the pointer, until the button comes up.
+        if let Some(anchor) = tracking.name_anchor {
+            let release = self
+                .event_queue
+                .iter()
+                .position(|event| event.what == 2)
+                .and_then(|index| self.event_queue.remove(index));
+            let (_, h) = release
+                .as_ref()
+                .map(|event| (event.where_v, event.where_h))
+                .unwrap_or_else(|| self.input_state.mouse_position());
+            let at = Self::standard_file_name_offset_at(&tracking, h);
+            let (sel_start, sel_end) = (anchor.min(at) as i16, anchor.max(at) as i16);
+            if (sel_start, sel_end) != (tracking.sel_start, tracking.sel_end) {
+                tracking.sel_start = sel_start;
+                tracking.sel_end = sel_end;
+                self.draw_standard_file_put_dialog(bus, &tracking);
+            }
+            if release.is_none() {
+                self.standard_file_put_tracking = Some(tracking);
+                return;
+            }
+            tracking.name_anchor = None;
+        }
         if tracking.active_button.is_some() {
             if let Some((v, h)) = self.service_standard_file_button(bus, tracking.bounds, &mut tracking.active_button, false) {
                 action = self.standard_file_put_mouse_action(&mut tracking, v, h);
@@ -3229,6 +3335,20 @@ impl super::TrapDispatcher {
             match event.what {
                 1 => {
                     let local = (event.where_v - tracking.bounds.0, event.where_h - tracking.bounds.1);
+                    // A click in the name field puts the
+                    // insertion point at the nearest character boundary; held
+                    // down, a drag selects (TEClick, IM I-384).
+                    if Self::standard_file_point_in_rect(
+                        local.0,
+                        local.1,
+                        crate::dialog_manager::edit_text_frame_rect(STANDARD_FILE_NAME_RECT),
+                    ) {
+                        let at = Self::standard_file_name_offset_at(&tracking, event.where_h);
+                        tracking.sel_start = at as i16;
+                        tracking.sel_end = at as i16;
+                        tracking.name_anchor = Some(at);
+                        break;
+                    }
                     if let Some(rect) = [STANDARD_FILE_SAVE_RECT, STANDARD_FILE_CANCEL_RECT, STANDARD_FILE_PUT_DESKTOP_RECT]
                         .into_iter().find(|&rect| Self::standard_file_point_in_rect(local.0, local.1, rect)) {
                         if rect == STANDARD_FILE_SAVE_RECT {
@@ -6607,7 +6727,6 @@ impl super::TrapDispatcher {
                                 let app_path = self
                                     .vfs_key_for_fsspec(vref, dir_id, &filename)
                                     .unwrap_or(filename);
-                                self.set_launched_app_path(&app_path);
                                 let target_exists = self.find_vfs_file(&app_path).is_some()
                                     || self.find_vfs_rsrc_file(&app_path).is_some();
                                 if target_exists {
@@ -6639,7 +6758,6 @@ impl super::TrapDispatcher {
                                 }
                                 _ => app_name,
                             };
-                            self.set_launched_app_path(&app_path);
                             let target_exists = self.find_vfs_file(&app_path).is_some()
                                 || self.find_vfs_rsrc_file(&app_path).is_some();
                             if target_exists {
@@ -7268,7 +7386,10 @@ impl super::TrapDispatcher {
                     cpu.write_reg(Register::D0, (-35i32) as u32);
                     return Some(Ok(()));
                 }
-                let scoped_vfs_key = if is_hfs_variant {
+                let scoped_vfs_key = if is_hfs_variant && dir_id > 1 {
+                    let directory = self.resolve_directory_id(vref, dir_id);
+                    self.find_vfs_rsrc_file_in_directory(directory, &filename)
+                } else if is_hfs_variant {
                     self.hfs_lookup_directory_ids(vref, dir_id)
                         .into_iter()
                         .find_map(|dir_id| self.find_vfs_rsrc_file_in_directory(dir_id, &filename))
@@ -7283,7 +7404,7 @@ impl super::TrapDispatcher {
                     && self
                         .vfs_volume_for_ref_num(self.resolve_volume_ref_num(vref))
                         .is_some();
-                let vfs_key = if mounted_volume_selected {
+                let vfs_key = if mounted_volume_selected || (is_hfs_variant && dir_id != 0) {
                     scoped_vfs_key
                 } else {
                     scoped_vfs_key.or_else(|| self.find_vfs_rsrc_file(&filename))
@@ -10184,9 +10305,8 @@ impl super::TrapDispatcher {
             //   sp+12  result INTEGER (2 — refnum or -1)
             // Pop 12 bytes; result lands at the new SP.
             //
-            // Mounted disk-image volumes use their File Manager volume and
-            // directory identity; ordinary archive-backed paths retain the
-            // legacy broad name lookup. Behaviour otherwise mirrors
+            // Explicit directory IDs select the requested directory, also
+            // for archive-backed volumes. Behaviour otherwise mirrors
             // OpenRFPerm: dedup re-opens against `loaded_files`,
             // return the existing refnum, and leave current file unchanged
             // on already-open paths per MTb 1993 1-63. ResErr is noErr on
@@ -10215,12 +10335,15 @@ impl super::TrapDispatcher {
                     cpu.write_reg(Register::A7, sp + 12);
                     return Some(Ok(()));
                 }
-                let mounted_volume_selected =
-                    self.working_directory_info(v_ref).is_some_and(|working| {
+                let scoped_lookup = dir_id > 1
+                    || self.working_directory_info(v_ref).is_some_and(|working| {
                         self.vfs_volume_for_ref_num(working.volume_ref_num)
                             .is_some()
                     });
-                let vfs_key = if mounted_volume_selected {
+                let vfs_key = if dir_id > 1 {
+                    let directory = self.resolve_directory_id(v_ref, dir_id);
+                    self.find_vfs_rsrc_file_in_directory(directory, &name)
+                } else if scoped_lookup {
                     self.find_vfs_rsrc_file_for_hfs_lookup(v_ref, dir_id, &name)
                 } else {
                     self.find_vfs_rsrc_file(&name)
@@ -10295,12 +10418,15 @@ impl super::TrapDispatcher {
                 } else if name.is_empty() {
                     bus.write_word(0x0A60, (-37i16) as u16); // bdNamErr
                 } else {
-                    let mounted_volume_selected =
-                        self.working_directory_info(v_ref).is_some_and(|working| {
+                    let scoped_lookup = dir_id > 1
+                        || self.working_directory_info(v_ref).is_some_and(|working| {
                             self.vfs_volume_for_ref_num(working.volume_ref_num)
                                 .is_some()
                         });
-                    let existing_resource = if mounted_volume_selected {
+                    let existing_resource = if dir_id > 1 {
+                        let directory = self.resolve_directory_id(v_ref, dir_id);
+                        self.find_vfs_rsrc_file_in_directory(directory, &name)
+                    } else if scoped_lookup {
                         self.find_vfs_rsrc_file_for_hfs_lookup(v_ref, dir_id, &name)
                     } else {
                         self.find_vfs_rsrc_file(&name)
@@ -10308,7 +10434,7 @@ impl super::TrapDispatcher {
                     if existing_resource.is_some() {
                         bus.write_word(0x0A60, (-48i16) as u16); // dupFNErr
                     } else {
-                        let vfs_key = if mounted_volume_selected {
+                        let vfs_key = if scoped_lookup {
                             let Some(vfs_key) = self.vfs_key_for_fsspec(v_ref, dir_id, &name)
                             else {
                                 bus.write_word(0x0A60, (-120i16) as u16); // dirNFErr

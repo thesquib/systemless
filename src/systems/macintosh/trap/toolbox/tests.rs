@@ -4219,10 +4219,7 @@ fn launch_legacy_cmdline_queues_existing_target_and_preserves_page_option() {
     assert_eq!(cpu.read_reg(Register::D0), 0x1234_5678);
     assert_eq!(cpu.read_reg(Register::A7), sp_before);
     assert_eq!(bus.read_word(0x0936), 0xFFFF);
-    assert_eq!(
-        disp.launched_app_path(),
-        Some("LaunchTargets/Legacy Helper")
-    );
+    assert_eq!(disp.launched_app_path(), None);
     assert_eq!(
         disp.take_pending_launch_application(false, false)
             .as_deref(),
@@ -4256,7 +4253,7 @@ fn launch_legacy_cmdline_missing_target_halts_without_clobbering_d0() {
     assert_eq!(cpu.read_reg(Register::D0), 0x89AB_CDEF);
     assert_eq!(cpu.read_reg(Register::A7), sp_before);
     assert_eq!(bus.read_word(0x0936), 1);
-    assert_eq!(disp.launched_app_path(), Some("LaunchTargets/NoSuchApp"));
+    assert_eq!(disp.launched_app_path(), None);
     assert!(
         disp.take_pending_launch_application(false, true).is_none(),
         "a missing legacy target must not be queued"
@@ -4264,7 +4261,7 @@ fn launch_legacy_cmdline_missing_target_halts_without_clobbering_d0() {
 }
 
 #[test]
-fn launchapplication_launchcontinue_clear_records_target_app_path_and_halts() {
+fn launchapplication_launchcontinue_clear_preserves_caller_identity_and_halts() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp_before = cpu.read_reg(Register::A7);
     let launch_pb = bus.alloc(64);
@@ -4304,13 +4301,13 @@ fn launchapplication_launchcontinue_clear_records_target_app_path_and_halts() {
     assert_eq!(bus.read_long(launch_pb + 28), 0);
     assert_eq!(bus.read_long(launch_pb + 32), 0);
     assert_eq!(bus.read_long(launch_pb + 36), 0);
-    assert_eq!(disp.launched_app_path(), Some("LaunchTargets/NoSuchApp"));
-    assert_eq!(*disp.default_dir_id, target_dir_id);
-    assert_ne!(disp.app_wd_refnum, 0);
+    assert_eq!(disp.launched_app_path(), None);
+    assert_ne!(*disp.default_dir_id, target_dir_id);
+    assert_eq!(*disp.app_wd_refnum, -1);
 }
 
 #[test]
-fn launchapplication_launchcontinue_set_records_target_app_path_and_returns() {
+fn launchapplication_launchcontinue_set_preserves_caller_identity_and_returns() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp_before = cpu.read_reg(Register::A7);
     let launch_pb = bus.alloc(64);
@@ -4350,9 +4347,9 @@ fn launchapplication_launchcontinue_set_records_target_app_path_and_returns() {
     assert_eq!(bus.read_long(launch_pb + 28), 0);
     assert_eq!(bus.read_long(launch_pb + 32), 0);
     assert_eq!(bus.read_long(launch_pb + 36), 0);
-    assert_eq!(disp.launched_app_path(), Some("LaunchTargets/NoSuchApp"));
-    assert_eq!(*disp.default_dir_id, target_dir_id);
-    assert_ne!(disp.app_wd_refnum, 0);
+    assert_eq!(disp.launched_app_path(), None);
+    assert_ne!(*disp.default_dir_id, target_dir_id);
+    assert_eq!(*disp.app_wd_refnum, -1);
 }
 
 #[test]
@@ -4393,10 +4390,7 @@ fn launchapplication_existing_foreground_target_queues_runner_launch() {
     assert_eq!(cpu.read_reg(Register::A0), launch_pb);
     assert_eq!(cpu.read_reg(Register::D0), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp_before);
-    assert_eq!(
-        disp.launched_app_path(),
-        Some("LaunchTargets/Register Helper")
-    );
+    assert_eq!(disp.launched_app_path(), None);
     assert!(
         disp.take_pending_launch_application(false, false).is_none(),
         "launchContinue target should not start until an Event Manager yield"
@@ -4445,10 +4439,7 @@ fn launchapplication_existing_target_without_launchcontinue_queues_immediate_run
     assert_eq!(cpu.read_reg(Register::A0), launch_pb);
     assert_eq!(cpu.read_reg(Register::D0), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp_before);
-    assert_eq!(
-        disp.launched_app_path(),
-        Some("LaunchTargets/Register Helper")
-    );
+    assert_eq!(disp.launched_app_path(), None);
     assert_eq!(
         disp.take_pending_launch_application(false, false)
             .as_deref(),
@@ -4495,10 +4486,7 @@ fn launchapplication_launchdontswitch_defers_existing_target_until_caller_exit()
     assert_eq!(cpu.read_reg(Register::A0), launch_pb);
     assert_eq!(cpu.read_reg(Register::D0), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp_before);
-    assert_eq!(
-        disp.launched_app_path(),
-        Some("LaunchTargets/Register Helper")
-    );
+    assert_eq!(disp.launched_app_path(), None);
     assert!(
         disp.take_pending_launch_application(true, false).is_none(),
         "launchDontSwitch target must remain in the background while its caller runs"
@@ -7394,6 +7382,85 @@ fn test_pb_open_rf_current_permission_allows_fswrite() {
 }
 
 // HCreateResFile ($A81B) — missing file creation plus PBOpenRF visibility.
+#[test]
+fn hfs_resource_files_with_same_name_are_isolated_by_directory() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let temporary = disp.ensure_vfs_directory("Temporary Items");
+    let extensions = disp.ensure_vfs_directory("System Folder/Extensions");
+    let name_ptr = 0x310000u32;
+    bus.write_pstring(name_ptr, b"Shared Engine");
+    for directory in [temporary, extensions] {
+        bus.write_long(TEST_SP, name_ptr);
+        bus.write_long(TEST_SP + 4, directory);
+        bus.write_word(TEST_SP + 8, 0);
+        cpu.write_reg(Register::A7, TEST_SP);
+        disp.dispatch_toolbox(true, 0x01B, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(0x0A60), 0);
+    }
+    assert!(disp.vfs_rsrc.contains_key("Temporary Items/Shared Engine"));
+    assert!(disp
+        .vfs_rsrc
+        .contains_key("System Folder/Extensions/Shared Engine"));
+    bus.write_long(TEST_SP, name_ptr);
+    bus.write_long(TEST_SP + 4, temporary);
+    bus.write_word(TEST_SP + 8, 0);
+    cpu.write_reg(Register::A7, TEST_SP);
+    disp.dispatch_toolbox(true, 0x01B, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus.read_word(0x0A60) as i16, -48);
+    for (directory, path) in [
+        (temporary, "Temporary Items/Shared Engine"),
+        (extensions, "System Folder/Extensions/Shared Engine"),
+    ] {
+        bus.write_word(TEST_SP, 1);
+        bus.write_long(TEST_SP + 2, name_ptr);
+        bus.write_long(TEST_SP + 6, directory);
+        bus.write_word(TEST_SP + 10, 0);
+        cpu.write_reg(Register::A7, TEST_SP);
+        disp.dispatch_toolbox(true, 0x01A, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            disp.resource_file_name(bus.read_word(TEST_SP + 12)),
+            Some(path)
+        );
+    }
+    let pb = 0x300000u32;
+    bus.write_long(pb + 18, name_ptr);
+    bus.write_word(pb + 22, 0);
+    bus.write_long(pb + 48, temporary);
+    cpu.write_reg(Register::A0, pb);
+    disp.current_trap_word = 0xA209;
+    disp.dispatch_resource(false, 0x09, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus.read_word(pb + 16), 0);
+    assert!(!disp.vfs_rsrc.contains_key("Temporary Items/Shared Engine"));
+    assert!(disp
+        .vfs_rsrc
+        .contains_key("System Folder/Extensions/Shared Engine"));
+    bus.write_word(TEST_SP, 1);
+    bus.write_long(TEST_SP + 2, name_ptr);
+    bus.write_long(TEST_SP + 6, temporary);
+    bus.write_word(TEST_SP + 10, 0);
+    cpu.write_reg(Register::A7, TEST_SP);
+    disp.dispatch_toolbox(true, 0x01A, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus.read_word(TEST_SP + 12) as i16, -1);
+    assert_eq!(bus.read_word(0x0A60) as i16, -43);
+    bus.write_byte(pb + 27, 1);
+    cpu.write_reg(Register::A0, pb);
+    disp.current_trap_word = 0xA20A;
+    disp.dispatch_toolbox(false, 0x0A, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus.read_word(pb + 16) as i16, -43);
+}
+
 #[test]
 fn test_hcreate_res_file_creates_missing_file_and_resource_fork() {
     let (mut disp, mut cpu, mut bus) = setup();
@@ -12901,6 +12968,392 @@ fn standard_put_cancel_tracks_release_and_drag_out() {
     disp.event_queue.push_back(event(2, v, h));
     disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus).unwrap().unwrap();
     assert!(!disp.is_standard_file_put_tracking());
+}
+
+// IM I-323 (TrackControl, inButton): a Standard File button held down is
+// highlighted while the pointer is inside it and unhighlighted outside. The
+// highlight drawn at the press must survive the pass's repaint of a dialog
+// whose pixels changed, and dragging out must unhighlight it.
+#[test]
+fn standard_put_held_button_stays_highlighted_through_the_repaint() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let base = bus.alloc(64 * 342);
+    disp.set_screen_mode_for_test(base, 64, 512, 342, 1);
+    disp.yield_for_ui = true;
+    bus.write_word(TEST_SP, 0x0005);
+    bus.write_long(TEST_SP + 2, 0x3201c0);
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    let bounds = disp.standard_file_put_tracking.as_ref().unwrap().bounds;
+    let v = bounds.0 + super::STANDARD_FILE_CANCEL_RECT.0 + 4;
+    let h = bounds.1 + super::STANDARD_FILE_CANCEL_RECT.1 + 6;
+    let event = |what, v, h| QueuedEvent {
+        what,
+        message: 0,
+        when: 0,
+        where_v: v,
+        where_h: h,
+        modifiers: 0,
+    };
+    // A pixel of the button's face, left of its title: black when highlighted.
+    let lit = |bus: &MacMemoryBus| {
+        bus.read_byte(base + v as u32 * 64 + h as u32 / 8) & (0x80 >> (h % 8)) != 0
+    };
+    assert!(!lit(&bus));
+
+    disp.input_state.set_mouse_position_for_test((v, h));
+    disp.event_queue.push_back(event(1, v, h));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(lit(&bus), "highlighted at the press");
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(lit(&bus), "still highlighted while held inside");
+
+    disp.input_state
+        .set_mouse_position_for_test((bounds.0 + 5, bounds.1 + 5));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(!lit(&bus), "unhighlighted once dragged out");
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(!lit(&bus));
+
+    disp.input_state.set_mouse_position_for_test((v, h));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(lit(&bus), "highlighted again back inside");
+    disp.event_queue
+        .push_back(event(2, bounds.0 + 5, bounds.1 + 5));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(
+        disp.is_standard_file_put_tracking(),
+        "released outside: nothing done"
+    );
+    assert!(!lit(&bus));
+}
+
+// At 2 and 4 bits a pixel isn't a bit: the held button's highlight inverts
+// the button's own pixels, and none in the dialog's rows left of it (where
+// treating the screen as 1 bit put it, at half or a quarter of its columns).
+#[test]
+fn standard_put_held_button_highlight_respects_packed_depths() {
+    for depth in [2u16, 4] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let row_bytes = 512 * u32::from(depth) / 8;
+        let base = bus.alloc(row_bytes * 342);
+        disp.set_screen_mode_for_test(base, row_bytes, 512, 342, depth);
+        disp.yield_for_ui = true;
+        bus.write_word(TEST_SP, 0x0005);
+        bus.write_long(TEST_SP + 2, 0x3201c0);
+        disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        let bounds = disp.standard_file_put_tracking.as_ref().unwrap().bounds;
+        let rect = super::STANDARD_FILE_CANCEL_RECT;
+        let (top, left, bottom) = (bounds.0 + rect.0, bounds.1 + rect.1, bounds.0 + rect.2);
+        let pixel = |bus: &MacMemoryBus, x: i16, y: i16| {
+            let bit = x as u32 * u32::from(depth);
+            let byte = bus.read_byte(base + y as u32 * row_bytes + bit / 8);
+            (byte >> (8 - u32::from(depth) - bit % 8)) & ((1u8 << depth) - 1)
+        };
+        let rows = |bus: &MacMemoryBus| {
+            (top..bottom)
+                .map(|y| {
+                    (bounds.1..left)
+                        .map(|x| pixel(bus, x, y))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = rows(&bus);
+        let (v, h) = (top + 4, left + 6);
+        let face = pixel(&bus, h, v);
+        disp.input_state.set_mouse_position_for_test((v, h));
+        disp.event_queue.push_back(QueuedEvent {
+            what: 1,
+            message: 0,
+            when: 0,
+            where_v: v,
+            where_h: h,
+            modifiers: 0,
+        });
+        disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows(&bus),
+            before,
+            "{depth} bits: the dialog left of the button unchanged"
+        );
+        assert_eq!(
+            pixel(&bus, h, v),
+            face ^ ((1u8 << depth) - 1),
+            "{depth} bits: the button's face inverted"
+        );
+    }
+}
+
+// A click in the Save dialog's name field puts the
+// insertion point at the nearest character boundary (typing then inserts
+// there, the name kept), and a drag selects from the press to the pointer
+// until the button comes up (TEClick, IM I-384).
+#[test]
+fn standard_put_click_places_the_insertion_point_and_drag_selects() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let base = bus.alloc(64 * 342);
+    disp.set_screen_mode_for_test(base, 64, 512, 342, 1);
+    disp.yield_for_ui = true;
+    let name_ptr = 0x320E00u32;
+    bus.write_pstring(name_ptr, b"Dullsville");
+    bus.write_word(TEST_SP, 0x0005); // StandardPutFile selector
+    bus.write_long(TEST_SP + 2, 0x3201c0);
+    bus.write_long(TEST_SP + 6, name_ptr);
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    let (top, left, _, _) = disp.standard_file_put_tracking.as_ref().unwrap().bounds;
+    // The name's glyphs start a pixel inside its rect.
+    let origin = left + super::STANDARD_FILE_NAME_RECT.1 + 1;
+    let x_at = |text: &str| origin + TrapDispatcher::fb_measure_string(text, 0, 12);
+    let v = top + super::STANDARD_FILE_NAME_RECT.0 + 6;
+    let event = |what: u16, h: i16| QueuedEvent {
+        what,
+        message: 0,
+        when: 0,
+        where_v: v,
+        where_h: h,
+        modifiers: 0,
+    };
+    let selection = |disp: &TrapDispatcher| {
+        let tracking = disp.standard_file_put_tracking.as_ref().unwrap();
+        (tracking.sel_start, tracking.sel_end)
+    };
+
+    // A click between "Dulls" and "ville": the insertion point there, the name kept.
+    disp.input_state
+        .set_mouse_position_for_test((v, x_at("Dulls") + 1));
+    disp.event_queue.push_back(event(1, x_at("Dulls") + 1));
+    disp.event_queue.push_back(event(2, x_at("Dulls") + 1));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selection(&disp), (5, 5));
+    assert!(disp
+        .standard_file_put_tracking
+        .as_ref()
+        .unwrap()
+        .name_anchor
+        .is_none());
+    disp.event_queue.push_back(QueuedEvent {
+        what: 3,
+        message: u32::from(b'X'),
+        when: 0,
+        where_v: 0,
+        where_h: 0,
+        modifiers: 0,
+    });
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        disp.standard_file_put_tracking.as_ref().unwrap().name,
+        "DullsXville"
+    );
+
+    // Pressed after "Du" and dragged to after "DullsX": those four characters selected while held, and after.
+    disp.input_state
+        .set_mouse_position_for_test((v, x_at("Du")));
+    disp.event_queue.push_back(event(1, x_at("Du")));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selection(&disp), (2, 2));
+    disp.input_state
+        .set_mouse_position_for_test((v, x_at("DullsX")));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selection(&disp), (2, 6));
+    disp.event_queue.push_back(event(2, x_at("DullsX")));
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selection(&disp), (2, 6));
+    assert!(disp
+        .standard_file_put_tracking
+        .as_ref()
+        .unwrap()
+        .name_anchor
+        .is_none());
+    assert!(
+        disp.event_queue.iter().all(|event| event.what != 2),
+        "the drag's mouse-up is taken"
+    );
+    assert!(disp.is_standard_file_put_tracking());
+}
+
+// The insertion point of a name wider than the field isn't drawn past the
+// field's right edge, outside the dialog.
+#[test]
+fn standard_put_insertion_point_stays_inside_the_name_field() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let base = bus.alloc(64 * 342);
+    disp.set_screen_mode_for_test(base, 64, 512, 342, 1);
+    disp.yield_for_ui = true;
+    bus.write_word(TEST_SP, 0x0005); // StandardPutFile selector
+    bus.write_long(TEST_SP + 2, 0x3201c0);
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    let mut tracking = disp.standard_file_put_tracking.take().unwrap();
+    let (top, left, _, right) = tracking.bounds;
+    let field_left = left + super::STANDARD_FILE_NAME_RECT.1;
+    // A name whose end lies right of the dialog, still on screen.
+    let name = (1..64)
+        .map(|n| "W".repeat(n))
+        .find(|name| field_left + TrapDispatcher::fb_measure_string(name, 0, 12) > right + 4)
+        .expect("a name reaching past the dialog");
+    let end = field_left + TrapDispatcher::fb_measure_string(&name, 0, 12);
+    assert!(end < 510, "the end of the name is on screen");
+    let ink = |bus: &MacMemoryBus, x: i16, y: i16| {
+        bus.read_byte(base + y as u32 * 64 + x as u32 / 8) & (0x80 >> (x % 8)) != 0
+    };
+    let v = top + super::STANDARD_FILE_NAME_RECT.0 + 6;
+    let row = |bus: &MacMemoryBus| (right + 2..512).map(|x| ink(bus, x, v)).collect::<Vec<_>>();
+    // The insertion point at the start, then at the end: the same pixels right
+    // of the dialog (the name's own glyphs aside, no line there).
+    let len = name.len() as i16;
+    tracking.name = name;
+    tracking.sel_start = 0;
+    tracking.sel_end = 0;
+    disp.draw_standard_file_put_dialog(&mut bus, &tracking);
+    let at_start = row(&bus);
+    tracking.sel_start = len;
+    tracking.sel_end = len;
+    disp.draw_standard_file_put_dialog(&mut bus, &tracking);
+    assert_eq!(
+        row(&bus),
+        at_start,
+        "no insertion point drawn right of the dialog"
+    );
+}
+
+// The Save dialog's selection is kept as offsets in the name's UTF-8 text,
+// while the field draws Mac Roman text: the item handed to the drawing must
+// carry Mac Roman offsets, or a name with an accent highlights the next
+// character ("A" of "CaféABC" is bytes 5..6 in UTF-8, 4..5 in Mac Roman).
+#[test]
+fn standard_put_name_selection_is_drawn_in_mac_roman_offsets() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let base = bus.alloc(64 * 342);
+    disp.set_screen_mode_for_test(base, 64, 512, 342, 1);
+    disp.yield_for_ui = true;
+    bus.write_word(TEST_SP, 0x0005);
+    bus.write_long(TEST_SP + 2, 0x3201c0);
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    let mut tracking = disp.standard_file_put_tracking.take().unwrap();
+    tracking.name = "CaféABC".to_string();
+    tracking.sel_start = 5;
+    tracking.sel_end = 6;
+    let items = TrapDispatcher::standard_file_put_dialog_items(&tracking, "Disk", true);
+    let name_item = items
+        .iter()
+        .find(|item| item.rect == super::STANDARD_FILE_NAME_RECT)
+        .expect("the name field");
+    assert_eq!((name_item.sel_start, name_item.sel_end), (4, 5));
+}
+
+// A selection running past the name field's right edge (a name wider than
+// the field) is painted no further than the field.
+#[test]
+fn standard_put_name_selection_is_clipped_to_the_field() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let base = bus.alloc(64 * 342);
+    disp.set_screen_mode_for_test(base, 64, 512, 342, 1);
+    disp.yield_for_ui = true;
+    bus.write_word(TEST_SP, 0x0005);
+    bus.write_long(TEST_SP + 2, 0x3201c0);
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    let mut tracking = disp.standard_file_put_tracking.take().unwrap();
+    let (top, left, _, right) = tracking.bounds;
+    let field_left = left + super::STANDARD_FILE_NAME_RECT.1;
+    let field_right = left + super::STANDARD_FILE_NAME_RECT.3;
+    // A name whose part up to the selection's end lies right of the dialog.
+    let name = "W".repeat(63);
+    let end = (1..63)
+        .find(|&n| field_left + TrapDispatcher::fb_measure_string(&name[..n], 0, 12) > right + 4)
+        .expect("a prefix reaching past the dialog");
+    tracking.name = name;
+    let ink = |bus: &MacMemoryBus, x: i16, y: i16| {
+        bus.read_byte(base + y as u32 * 64 + x as u32 / 8) & (0x80 >> (x % 8)) != 0
+    };
+    let v = top + super::STANDARD_FILE_NAME_RECT.0 + 4;
+    let row = |bus: &MacMemoryBus| {
+        (field_right + 4..512)
+            .map(|x| ink(bus, x, v))
+            .collect::<Vec<_>>()
+    };
+    tracking.sel_start = 2;
+    tracking.sel_end = 2;
+    disp.draw_standard_file_put_dialog(&mut bus, &tracking);
+    let unselected = row(&bus);
+    tracking.sel_end = end as i16;
+    disp.draw_standard_file_put_dialog(&mut bus, &tracking);
+    assert_eq!(row(&bus), unselected, "nothing painted right of the field");
+}
+
+// The selection is measured as the field draws its text (plain system font
+// at 12), not in the application's current text size and face.
+#[test]
+fn standard_put_name_selection_ignores_the_current_text_state() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let base = bus.alloc(64 * 342);
+    disp.set_screen_mode_for_test(base, 64, 512, 342, 1);
+    disp.yield_for_ui = true;
+    bus.write_word(TEST_SP, 0x0005);
+    bus.write_long(TEST_SP + 2, 0x3201c0);
+    disp.dispatch_toolbox(true, 0x1EA, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    let mut tracking = disp.standard_file_put_tracking.take().unwrap();
+    tracking.name = "Dullsville".to_string();
+    tracking.sel_start = 2;
+    tracking.sel_end = 6;
+    let v = tracking.bounds.0 + super::STANDARD_FILE_NAME_RECT.0 + 1;
+    let field = |bus: &MacMemoryBus| {
+        (0..512)
+            .map(|x| bus.read_byte(base + v as u32 * 64 + x as u32 / 8) & (0x80 >> (x % 8)) != 0)
+            .collect::<Vec<_>>()
+    };
+    disp.draw_standard_file_put_dialog(&mut bus, &tracking);
+    let plain = field(&bus);
+    disp.tx_size = 24;
+    disp.tx_face = 1; // bold
+    disp.draw_standard_file_put_dialog(&mut bus, &tracking);
+    assert_eq!(
+        field(&bus),
+        plain,
+        "the highlight where the plain text puts it"
+    );
 }
 
 #[test]
@@ -21240,4 +21693,77 @@ fn apple_event_attribute_backing_survives_classic_descriptor_value_copies() {
     assert_eq!(bus.read_long(actual_type), u32::from_be_bytes(*b"shor"));
     assert_eq!(bus.read_long(actual_size), 2);
     assert_eq!(bus.read_word(output), 17);
+}
+
+#[test]
+fn launchapplication_keeps_caller_identity_until_a_process_switch() {
+    for extended in [false, true] {
+        for target_exists in [false, true] {
+            let (mut disp, mut cpu, mut bus) = setup();
+            disp.vfs.insert("Caller/Caller App".into(), Vec::new());
+            disp.set_launched_app_path("Caller/Caller App");
+            let original_dir = *disp.default_dir_id;
+            let original_wd = *disp.app_wd_refnum;
+            let target_dir = disp.ensure_vfs_directory("Target");
+            if target_exists {
+                disp.vfs.insert("Target/Helper".into(), Vec::new());
+            }
+            let pb = bus.alloc(64);
+            let spec = bus.alloc(32);
+            let name = bus.alloc(32);
+            for offset in 0..64 {
+                bus.write_byte(pb + offset, 0);
+            }
+            for offset in 0..32 {
+                bus.write_byte(spec + offset, 0);
+            }
+            cpu.write_reg(Register::A0, pb);
+            if extended {
+                bus.write_word(pb + 6, 0x4C43);
+                bus.write_long(pb + 8, 32);
+                bus.write_word(pb + 14, 0x4000);
+                bus.write_long(pb + 16, spec);
+                bus.write_word(spec, 0);
+                bus.write_long(spec + 2, target_dir);
+                write_pascal_string(&mut bus, spec + 6, "Helper");
+            } else {
+                // Legacy names are relative to the caller's working directory.
+                // Use a separate target name in that directory.
+                if target_exists {
+                    disp.vfs.insert("Caller/Helper".into(), Vec::new());
+                }
+                write_pascal_string(&mut bus, name, "Helper");
+                bus.write_long(pb, name);
+            }
+            let result = disp.dispatch_toolbox(true, 0x1F2, &mut cpu, &mut bus);
+            assert!(result.is_some(), "launch must be dispatched");
+            if extended {
+                assert!(result.unwrap().is_ok());
+                assert_eq!(
+                    cpu.read_reg(Register::D0) as i32,
+                    if target_exists { 0 } else { -43 }
+                );
+            }
+            assert_eq!(
+                disp.launched_app_path(),
+                Some("Caller/Caller App"),
+                "extended={extended} target_exists={target_exists}"
+            );
+            assert_eq!(*disp.default_dir_id, original_dir);
+            assert_eq!(*disp.app_wd_refnum, original_wd);
+            let queued = disp.take_pending_launch_application(true, true);
+            if target_exists {
+                assert_eq!(
+                    queued.as_deref(),
+                    Some(if extended {
+                        "Target/Helper"
+                    } else {
+                        "Caller/Helper"
+                    })
+                );
+            } else {
+                assert!(queued.is_none());
+            }
+        }
+    }
 }

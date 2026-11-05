@@ -1947,6 +1947,58 @@ fn release_resource_invalidates_handle_and_getresource_allocates_fresh_handle() 
 }
 
 #[test]
+fn resource_manager_open_refnum_reads_raw_fork_and_closes_access_path() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let bytes = make_single_resource_fork_bytes(*b"TEST", 7, b"payload");
+    disp.vfs_rsrc.insert("Engine".to_string(), bytes.clone());
+    let refnum = disp.open_resource_file_from_vfs_key(&mut bus, "Engine", false);
+    assert_ne!(refnum, u16::MAX);
+    let pb = 0x300000u32;
+    let output = 0x310000u32;
+    cpu.write_reg(Register::A0, pb);
+    bus.write_word(pb + 24, refnum);
+    bus.write_long(pb + 32, output);
+    bus.write_long(pb + 36, 12);
+    bus.write_word(pb + 44, 1); // fsFromStart
+    bus.write_long(pb + 46, 0);
+    call(&mut disp, false, 0x02, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_word(pb + 16), 0);
+    assert_eq!(bus.read_long(pb + 40), 12);
+    assert_eq!(bus.read_bytes(output, 12), bytes[..12]);
+    assert_eq!(disp.file_positions.get(&refnum).copied(), Some(12));
+    assert!(disp.close_resource_file_refnum(&mut bus, refnum));
+    assert!(!disp.open_files.contains_key(&refnum));
+    assert!(!disp.file_positions.contains_key(&refnum));
+    cpu.write_reg(Register::A0, pb);
+    call(&mut disp, false, 0x02, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_word(pb + 16) as i16, -51);
+}
+
+#[test]
+fn resource_manager_reopen_reads_recreated_fork_not_old_backing() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let old = make_single_resource_fork_bytes(*b"TEST", 7, b"old bytes");
+    let new = make_single_resource_fork_bytes(*b"TEST", 7, b"new bytes");
+    disp.vfs_rsrc.insert("Engine".into(), old);
+    let first = disp.open_resource_file_from_vfs_key(&mut bus, "Engine", false);
+    assert!(disp.close_resource_file_refnum(&mut bus, first));
+    assert!(disp.remove_vfs_path("Engine"));
+    disp.vfs_rsrc.insert("Engine".into(), new.clone());
+    let second = disp.open_resource_file_from_vfs_key(&mut bus, "Engine", false);
+    let pb = 0x300000u32;
+    let output = 0x310000u32;
+    cpu.write_reg(Register::A0, pb);
+    bus.write_word(pb + 24, second);
+    bus.write_long(pb + 32, output);
+    bus.write_long(pb + 36, new.len() as u32);
+    bus.write_word(pb + 44, 1);
+    bus.write_long(pb + 46, 0);
+    call(&mut disp, false, 0x02, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_word(pb + 16), 0);
+    assert_eq!(bus.read_bytes(output, new.len()), new);
+}
+
+#[test]
 fn release_resource_unloads_vfs_backed_resource_and_getresource_reloads() {
     let (mut disp, mut cpu, mut bus) = setup();
     let bytes = [0xAB; 8];
@@ -3620,6 +3672,11 @@ fn writeresource_persists_added_resource_to_writable_vfs_resource_fork() {
         0
     );
 
+    assert_eq!(
+        disp.vfs.get("__rsrc__Prefs"),
+        disp.vfs_rsrc.get("Prefs"),
+        "raw File Manager reads must see Resource Manager writeback"
+    );
     let fork = crate::managers::resource::ResourceFork::parse(
         disp.vfs_rsrc.get("Prefs").expect("Prefs resource fork"),
     )
@@ -4422,6 +4479,61 @@ fn loadseg_materializes_code_from_runtime_resource_chain() {
 }
 
 #[test]
+fn loadseg_does_not_adopt_heap_backed_code_as_reserved_image() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let code = [0, 0, 0, 1, 0x4E, 0x75];
+    let ptr = setup_resources(&mut disp, &mut bus, b"CODE", 19, &code);
+    assert_eq!(bus.get_alloc_size(ptr), Some(code.len() as u32));
+    disp.register_segments(HashMap::from([(19, ptr)]));
+    let island = 0x240000;
+    bus.write_word(island, 0);
+    bus.write_word(island + 2, 0x3F3C);
+    bus.write_word(island + 4, 19);
+    bus.write_word(island + 6, 0xA9F0);
+    bus.write_word(TEST_SP, 19);
+    cpu.write_reg(Register::A5, island);
+    cpu.write_reg(Register::PC, island + 8);
+    call(&mut disp, true, 0x1F0, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_word(island + 2), 0x4EF9);
+    assert_eq!(bus.read_long(island + 4), ptr + 4);
+    assert_eq!(bus.get_alloc_size(ptr), Some(code.len() as u32));
+}
+
+#[test]
+fn reserved_image_guard_rejects_overlapping_live_allocation() {
+    let (_, _, mut bus) = setup();
+    bus.reserve_heap_range(0x230000, 0x230100);
+    assert!(bus.can_adopt_reserved_image_allocation(0x230000, 16));
+    bus.adopt_reserved_allocation(0x230000, 16);
+    assert!(!bus.can_adopt_reserved_image_allocation(0x230004, 8));
+    assert!(bus.can_adopt_reserved_image_allocation(0x230010, 8));
+}
+
+#[test]
+fn loadseg_does_not_adopt_untracked_non_image_code() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let code = [0, 0, 0, 1, 0x4E, 0x75];
+    setup_resources(&mut disp, &mut bus, b"CODE", 19, &code);
+    let ptr = 0x230000;
+    bus.write_bytes(ptr, &code);
+    assert_eq!(bus.get_alloc_size(ptr), None);
+    assert!(!bus.can_adopt_reserved_image_allocation(ptr, code.len() as u32));
+    disp.register_segments(HashMap::from([(19, ptr)]));
+    let island = 0x240000;
+    bus.write_word(island, 0);
+    bus.write_word(island + 2, 0x3F3C);
+    bus.write_word(island + 4, 19);
+    bus.write_word(island + 6, 0xA9F0);
+    bus.write_word(TEST_SP, 19);
+    cpu.write_reg(Register::A5, island);
+    cpu.write_reg(Register::PC, island + 8);
+    call(&mut disp, true, 0x1F0, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_word(island + 2), 0x4EF9);
+    assert_eq!(bus.read_long(island + 4), ptr + 4);
+    assert_eq!(bus.get_alloc_size(ptr), None);
+}
+
+#[test]
 fn loadseg_getresource_continuation_uses_returned_code_resource() {
     let (mut disp, mut cpu, mut bus) = setup();
 
@@ -4549,6 +4661,58 @@ fn loadseg_getresource_continuation_follows_relocated_and_expanded_handle() {
     assert_eq!(bus.read_word(jt_base + 8), 1);
     assert_eq!(bus.read_word(jt_base + 10), 0x4EF9);
     assert_eq!(bus.read_long(jt_base + 12), expanded + 20);
+    cpu.write_reg(Register::A0, expanded);
+    call_trap_word(&mut disp, 0xA128, &mut cpu, &mut bus).unwrap();
+    assert_eq!(
+        cpu.read_reg(Register::A0),
+        handle,
+        "the returned CODE block must recover its handle"
+    );
+    assert_eq!(
+        disp.handle_for_ptr(ptr),
+        None,
+        "the old block must not retain a stale reverse index"
+    );
+    assert_eq!(
+        disp.find_or_load_resource_any(&mut bus, *b"CODE", 1),
+        Some((0, expanded))
+    );
+}
+
+#[test]
+fn loadseg_returned_handle_does_not_replace_another_blocks_owner() {
+    for owner_is_new in [false, true] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let old_ptr = setup_resources(&mut disp, &mut bus, b"CODE", 1, &[0, 0, 0, 1, 0x4E, 0x75]);
+        let handle = disp.get_or_create_resource_handle(&mut bus, *b"CODE", 1, old_ptr);
+        let new_ptr = bus.alloc(8);
+        bus.write_bytes(new_ptr, &[0, 0, 0, 1, 0x4E, 0x75]);
+        let other = bus.alloc(4);
+        let owned_ptr = if owner_is_new { new_ptr } else { old_ptr };
+        bus.write_long(other, owned_ptr);
+        disp.track_handle_ptr(owned_ptr, other);
+        bus.write_long(handle, new_ptr);
+        let jt = 0x240000;
+        bus.write_word(jt, 0);
+        bus.write_word(jt + 2, 0x3F3C);
+        bus.write_word(jt + 4, 1);
+        bus.write_word(jt + 6, 0xA9F0);
+        disp.loadseg_getresource_state = Some(super::super::dispatch::LoadSegGetResourceState {
+            seg_num: 1,
+            entry_addr: jt,
+            result_sp: TEST_SP - 4,
+            d_regs: [0; 8],
+            a_regs: [0, 0, 0, 0, 0, jt, 0, TEST_SP],
+        });
+        bus.write_long(TEST_SP - 4, handle);
+        disp.resume_loadseg_after_getresource(&mut bus, &mut cpu)
+            .unwrap();
+        assert_eq!(
+            disp.handle_for_ptr(owned_ptr),
+            Some(other),
+            "another live handle must keep its reverse index"
+        );
+    }
 }
 
 #[test]
@@ -7522,6 +7686,7 @@ fn pb_get_vinfo_trap_variants_respect_basic_and_hfs_parameter_block_boundaries()
         bus.write_long(pb + 18, name_buf);
         bus.write_long(pb + 64, 0xDEAD_BEEF);
         bus.write_long(pb + 68, 0xCAFE_BABE);
+        bus.write_long(pb + 90, 0x1234_5678);
 
         call_trap_word(&mut disp, trap_word, &mut cpu, &mut bus).unwrap();
 
@@ -7534,7 +7699,30 @@ fn pb_get_vinfo_trap_variants_respect_basic_and_hfs_parameter_block_boundaries()
         } else {
             assert_eq!(bus.read_long(pb + 64), 0xDEAD_BEEF);
             assert_eq!(bus.read_long(pb + 68), 0xCAFE_BABE);
+            assert_eq!(bus.read_long(pb + 90), 0x1234_5678);
         }
+    }
+}
+
+#[test]
+fn pb_hget_vinfo_reports_boot_system_folder_in_finder_info() {
+    for trap_word in [0xA207, 0xA607] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let system_dir = disp.ensure_vfs_directory("System Folder");
+        let pb = 0x300000u32;
+        cpu.write_reg(Register::A0, pb);
+        bus.write_word(pb + 22, (-1i16) as u16);
+        bus.write_word(pb + 28, 0);
+        bus.write_long(pb + 90, 0xDEAD_BEEF);
+
+        call_trap_word(&mut disp, trap_word, &mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg(Register::D0), 0);
+        assert_eq!(
+            bus.read_long(pb + 90),
+            system_dir,
+            "trap ${trap_word:04X}: blessed System Folder"
+        );
     }
 }
 
@@ -11375,6 +11563,9 @@ fn resource_lookups_invoke_checkload_with_a_real_map_and_restore_the_caller() {
         disp.vfs_rsrc.insert("CheckLoad Test".into(), bytes);
         disp.set_launched_app_path("CheckLoad Test");
         disp.load_resources(&fork, &mut bus);
+        bus.write_word(addr::CUR_APREF_NUM, 2);
+        let live_map = bus.read_long(bus.read_long(0x0A50));
+        bus.write_word(live_map + 20, 2);
         disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
             .unwrap();
         cpu.write_reg(Register::PC, 0x290002);
@@ -11402,6 +11593,7 @@ fn resource_lookups_invoke_checkload_with_a_real_map_and_restore_the_caller() {
         let map_handle = bus.read_long(0x0A50);
         assert_eq!(cpu.read_reg(Register::PC), 0x300000, "trap {trap:04X}");
         assert_eq!(cpu.read_reg(Register::A4), map_handle);
+        assert_eq!(bus.read_word(bus.read_long(map_handle) + 20), 2);
         assert_eq!(
             cpu.read_reg(Register::A2),
             bus.read_long(map_handle) + reference_offset
@@ -11436,17 +11628,19 @@ fn resource_lookups_invoke_checkload_with_a_real_map_and_restore_the_caller() {
 #[test]
 fn checkload_callbacks_nest_and_release_temporary_maps() {
     let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    bus.write_word(addr::CUR_APREF_NUM, 2);
     let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
     let handle = disp.get_or_create_resource_handle(&mut bus, *b"TEST", 7, ptr);
     disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
         .unwrap();
     cpu.write_reg(Register::PC, 0x290002);
-    disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None);
+    disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None, false);
     let outer_reference = cpu.read_reg(Register::A2);
     let outer_sp = cpu.read_reg(Register::A7);
     let outer_map = cpu.read_reg(Register::A4);
+    assert_eq!(bus.read_word(bus.read_long(outer_map) + 20), 2);
     cpu.write_reg(Register::PC, 0x300020);
-    disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None);
+    disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None, false);
     assert_eq!(disp.resource_checkload_stack.len(), 2);
     assert_ne!(cpu.read_reg(Register::A4), outer_map);
     disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
@@ -11498,6 +11692,9 @@ fn named_resource_lookups_also_invoke_checkload() {
         let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
         let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"named");
         disp.insert_named_resource_for_test(0, (*b"TEST", "Named".to_string()), (7, ptr));
+        let original_handle =
+            disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+        assert_eq!(bus.read_long(original_handle), ptr);
         disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
             .unwrap();
         let name = bus.alloc(6);
@@ -11508,12 +11705,190 @@ fn named_resource_lookups_also_invoke_checkload() {
         call_trap_word(&mut disp, trap, &mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.read_reg(Register::PC), 0x300000);
         let handle = bus.read_long(TEST_SP + 8);
+        assert_eq!(handle, original_handle);
         assert_eq!(bus.read_long(cpu.read_reg(Register::A2) + 8), handle);
         assert_eq!(bus.read_long(handle), ptr);
         disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
         assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
         assert_eq!(cpu.read_reg(Register::PC), 0x290002);
     }
+}
+
+#[test]
+fn checkload_default_chain_materializes_newly_requested_resource() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    bus.write_word(TEST_SP, 7);
+    bus.write_long(TEST_SP + 2, u32::from_be_bytes(*b"TEST"));
+    cpu.write_reg(Register::PC, 0x290002);
+    call_trap_word(&mut disp, 0xA9A0, &mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x300000);
+    let handle = bus.read_long(TEST_SP + 6);
+    assert_ne!(handle, 0);
+    assert_eq!(
+        bus.read_long(handle),
+        0,
+        "newly requested resource must be empty at hook entry"
+    );
+    let gateway = bus.get_or_create_system_trap_gateway(0xA0FC);
+    cpu.write_reg(Register::PC, gateway + 2);
+    call_trap_word(&mut disp, 0xA0FC, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_long(handle), ptr);
+    assert_eq!(bus.read_bytes(ptr, 7), b"payload");
+    disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x290002);
+    assert_eq!(bus.read_long(TEST_SP + 6), handle);
+}
+
+#[test]
+fn explicit_loadresource_calls_checkload_before_filling_an_empty_handle() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    bus.write_byte(addr::RES_LOAD, 0);
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    assert_eq!(bus.read_long(handle), 0);
+    bus.write_byte(addr::RES_LOAD, 0xFF);
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    bus.write_long(TEST_SP, handle);
+    cpu.write_reg(Register::PC, 0x290002);
+    call_trap_word(&mut disp, 0xA9A2, &mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x300000);
+    assert_eq!(
+        bus.read_long(handle),
+        0,
+        "explicit loading must enter the hook before materialization"
+    );
+    let gateway = bus.get_or_create_system_trap_gateway(0xA0FC);
+    cpu.write_reg(Register::PC, gateway + 2);
+    call_trap_word(&mut disp, 0xA0FC, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_long(handle), ptr);
+    disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
+    assert_eq!(bus.read_long(handle), ptr);
+}
+
+#[test]
+fn installed_checkload_does_not_defer_unrelated_resource_bookkeeping() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    disp.current_trap_word = 0xA97C;
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    assert_eq!(bus.read_long(handle), ptr);
+    cpu.write_reg(Register::PC, 0x290002);
+    assert!(disp.resource_checkload_stack.is_empty());
+}
+
+#[test]
+fn nested_explicit_checkload_callbacks_restore_resload_in_stack_order() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    bus.write_byte(addr::RES_LOAD, 0);
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    cpu.write_reg(Register::PC, 0x290002);
+    assert!(disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None, true));
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0xFF);
+    cpu.write_reg(Register::PC, 0x300020);
+    assert!(disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None, true));
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0xFF);
+    disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x300020);
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0xFF);
+    disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x290002);
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0);
+    assert!(disp.resource_checkload_stack.is_empty());
+}
+
+#[test]
+fn explicit_loadresource_leaves_resident_handle_without_invoking_hook() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    assert_eq!(bus.read_long(handle), ptr);
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    bus.write_long(TEST_SP, handle);
+    cpu.write_reg(Register::PC, 0x290002);
+    call_trap_word(&mut disp, 0xA9A2, &mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x290002);
+    assert_eq!(bus.read_long(handle), ptr);
+    assert!(disp.resource_checkload_stack.is_empty());
+}
+
+#[test]
+fn abandoned_nested_checkload_callbacks_release_temporary_maps_and_restore_resload() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    bus.write_byte(addr::RES_LOAD, 0);
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    cpu.write_reg(Register::PC, 0x290002);
+    assert!(disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None, true));
+    let outer_handle = cpu.read_reg(Register::A4);
+    let outer_map = bus.read_long(outer_handle);
+    let trampoline = disp.resource_checkload_trampoline.unwrap();
+    cpu.write_reg(Register::PC, 0x300020);
+    assert!(disp.maybe_inject_resource_checkload(&mut bus, &mut cpu, handle, None, true));
+    let inner_handle = cpu.read_reg(Register::A4);
+    let inner_map = bus.read_long(inner_handle);
+    for ptr in [outer_handle, outer_map, inner_handle, inner_map, trampoline] {
+        assert!(bus.get_alloc_size(ptr).is_some());
+    }
+    disp.reset_resource_checkload_for_launch(&mut bus);
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0);
+    assert!(disp.resource_checkload_stack.is_empty());
+    assert!(disp.resource_checkload_trampoline.is_none());
+    for ptr in [outer_handle, outer_map, inner_handle, inner_map, trampoline] {
+        assert_eq!(bus.get_alloc_size(ptr), None);
+    }
+}
+
+#[test]
+fn explicit_loadresource_falls_back_when_callback_map_is_unavailable() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    bus.write_byte(addr::RES_LOAD, 0);
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    disp.with_resource_manager_mut(|manager| manager.resources = None);
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    bus.write_long(TEST_SP, handle);
+    cpu.write_reg(Register::PC, 0x290002);
+    call_trap_word(&mut disp, 0xA9A2, &mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x290002);
+    assert_eq!(bus.read_long(handle), ptr);
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0);
+    assert!(disp.resource_checkload_stack.is_empty());
+}
+
+#[test]
+fn explicit_loadresource_temporarily_enables_and_restores_resload() {
+    let (mut disp, mut cpu, mut bus) = setup_with_trap_tables();
+    let ptr = setup_resources(&mut disp, &mut bus, b"TEST", 7, b"payload");
+    bus.write_byte(addr::RES_LOAD, 0);
+    let handle = disp.get_or_create_resource_handle_in_file(&mut bus, *b"TEST", 7, ptr, 0);
+    disp.install_trap_address(&mut bus, 0xA0FC, 0x300000)
+        .unwrap();
+    bus.write_long(TEST_SP, handle);
+    cpu.write_reg(Register::PC, 0x290002);
+    call_trap_word(&mut disp, 0xA9A2, &mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_reg(Register::PC), 0x300000);
+    assert_eq!(bus.read_long(handle), 0);
+    assert_ne!(bus.read_byte(addr::RES_LOAD), 0);
+    let gateway = bus.get_or_create_system_trap_gateway(0xA0FC);
+    cpu.write_reg(Register::PC, gateway + 2);
+    call_trap_word(&mut disp, 0xA0FC, &mut cpu, &mut bus).unwrap();
+    assert_eq!(bus.read_long(handle), ptr);
+    disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
+    assert_eq!(bus.read_byte(addr::RES_LOAD), 0);
+    assert_eq!(bus.read_bytes(bus.read_long(handle), 7), b"payload");
 }
 
 #[test]
@@ -11541,6 +11916,10 @@ fn checkload_respects_resload_false_then_loadresource_materializes_the_handle() 
     bus.write_long(TEST_SP, handle);
     call_trap_word(&mut disp, 0xA9A2, &mut cpu, &mut bus).unwrap();
     assert_eq!(cpu.read_reg(Register::PC), 0x300000);
+    assert_eq!(bus.read_long(handle), 0);
+    let gateway = bus.get_or_create_system_trap_gateway(0xA0FC);
+    cpu.write_reg(Register::PC, gateway + 2);
+    call_trap_word(&mut disp, 0xA0FC, &mut cpu, &mut bus).unwrap();
     assert_eq!(bus.read_bytes(bus.read_long(handle), 7), b"payload");
     disp.resume_resource_checkload(&mut bus, &mut cpu).unwrap();
     assert_eq!(cpu.read_reg(Register::PC), 0x290010);

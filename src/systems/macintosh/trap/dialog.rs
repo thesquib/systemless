@@ -8384,6 +8384,35 @@ impl super::TrapDispatcher {
                     top, left, bottom, right,
                 ));
                 let (hilite_top, hilite_left, hilite_bottom, hilite_right) = outline.outer_rect();
+                // The ring of a disabled default button is drawn in gray:
+                // below 8 bits, in the gray pattern, as System 7 draws it
+                // (the button's own frame stays solid). Only the ring's own
+                // pixels take the pattern: drawn first on white to find them,
+                // what was under and around it is put back, then each ring
+                // pixel is set black where x + y is even, white elsewhere.
+                let dim_ring = !enabled && pixel_size < 8;
+                let in_button = |x: i16, y: i16| y >= top && y < bottom && x >= left && x < right;
+                let mut saved = Vec::new();
+                if dim_ring {
+                    for y in hilite_top..hilite_bottom {
+                        for x in hilite_left..hilite_right {
+                            if in_button(x, y) {
+                                continue;
+                            }
+                            let get = |bus: &MacMemoryBus| {
+                                Self::fb_get_pixel_index(
+                                    bus, base, row_bytes, pixel_size, width, height, x, y,
+                                )
+                            };
+                            if let Some(index) = get(bus) {
+                                Self::fb_set_pixel(
+                                    bus, base, row_bytes, pixel_size, width, height, x, y, false,
+                                );
+                                saved.push((x, y, index, get(bus)));
+                            }
+                        }
+                    }
+                }
                 self.fb_frame_round_rect(
                     bus,
                     hilite_top,
@@ -8394,6 +8423,30 @@ impl super::TrapDispatcher {
                     outline.oval_height(),
                     outline.thickness(),
                 );
+                if dim_ring {
+                    for (x, y, index, white) in saved {
+                        let on_ring = Self::fb_get_pixel_index(
+                            bus, base, row_bytes, pixel_size, width, height, x, y,
+                        ) != white;
+                        if on_ring {
+                            Self::fb_set_pixel(
+                                bus,
+                                base,
+                                row_bytes,
+                                pixel_size,
+                                width,
+                                height,
+                                x,
+                                y,
+                                (x + y) & 1 == 0,
+                            );
+                        } else {
+                            Self::fb_set_pixel_index(
+                                bus, base, row_bytes, pixel_size, width, height, x, y, index,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -8493,6 +8546,17 @@ impl super::TrapDispatcher {
                 font_id,
                 font_size,
             );
+            // Below 8 bits there is no gray to draw in: a disabled title is
+            // dimmed with the gray pattern, as multi-line titles are.
+            if !enabled && pixel_size < 8 {
+                self.dim_rect(
+                    bus,
+                    text_y - metrics.ascent,
+                    text_x,
+                    text_y + metrics.descent,
+                    text_x + text_w,
+                );
+            }
         } else {
             let gray_index = self
                 .device_clut
@@ -9207,23 +9271,25 @@ impl super::TrapDispatcher {
                     let line_height = metrics.ascent + metrics.descent + metrics.leading;
                     let selection_top = top;
                     let selection_bottom = top.saturating_add(line_height).min(bottom);
+                    // Measured as the text above is drawn (its font and
+                    // size, plain), not in the current port's txSize and
+                    // txFace; and kept inside the field.
+                    let width = |offset: usize| {
+                        Self::fb_measure_string(
+                            &decode_mac_roman(&text_bytes[..offset]),
+                            font_id,
+                            font_size,
+                        )
+                    };
                     let selection_left = if start == 0 {
                         left
                     } else {
-                        left + Self::TE_LINE_LEFT_INSET
-                            + self.te_measure_text_width(
-                                font_id,
-                                self.tx_size,
-                                &text_bytes,
-                                0,
-                                start,
-                            )
+                        (left + Self::TE_LINE_LEFT_INSET + width(start)).min(right)
                     };
                     let selection_right = if end >= text_bytes.len() {
                         right
                     } else {
-                        left + Self::TE_LINE_LEFT_INSET
-                            + self.te_measure_text_width(font_id, self.tx_size, &text_bytes, 0, end)
+                        (left + Self::TE_LINE_LEFT_INSET + width(end)).min(right)
                     };
                     if selection_left < selection_right && selection_top < selection_bottom {
                         if self.ui_theme_id() == UiThemeId::ClassicSystem7 {
@@ -9569,12 +9635,22 @@ impl super::TrapDispatcher {
                 if pixel_size == 8 {
                     let addr = screen_base + (y as u32) * row_bytes + (x as u32);
                     bus.invert_screen_byte(addr);
-                } else {
-                    let byte_offset = (y as u32) * row_bytes + (x as u32 / 8);
-                    let bit = 7 - (x as u32 % 8);
-                    let addr = screen_base + byte_offset;
+                } else if pixel_size < 8 {
+                    // 1, 2 or 4 bits a pixel, packed from the byte's high bits.
+                    let depth = u32::from(pixel_size);
+                    let bit = x as u32 * depth;
+                    let addr = screen_base + (y as u32) * row_bytes + bit / 8;
+                    let mask = (((1u16 << depth) - 1) as u8) << (8 - depth - bit % 8);
                     let b = bus.read_byte(addr);
-                    bus.write_byte(addr, b ^ (1 << bit));
+                    bus.write_byte(addr, b ^ mask);
+                } else {
+                    // 16 and 32 bits: every byte of the pixel.
+                    let bytes = u32::from(pixel_size) / 8;
+                    let addr = screen_base + (y as u32) * row_bytes + x as u32 * bytes;
+                    for offset in 0..bytes {
+                        let b = bus.read_byte(addr + offset);
+                        bus.write_byte(addr + offset, !b);
+                    }
                 }
             }
         }
