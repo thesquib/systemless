@@ -494,6 +494,7 @@ pub enum PpcImportDispatcherTarget {
     RestoreDeviceClut,
     DisposeCTable,
     NewPixMap,
+    CopyPixMap,
     DisposePixMap,
     GetGWorld,
     SetGWorld,
@@ -3986,6 +3987,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "RestoreDeviceClut") => PpcImportDispatcherTarget::RestoreDeviceClut,
         ("InterfaceLib", "DisposeCTable") => PpcImportDispatcherTarget::DisposeCTable,
         ("InterfaceLib", "NewPixMap") => PpcImportDispatcherTarget::NewPixMap,
+        ("InterfaceLib", "CopyPixMap") => PpcImportDispatcherTarget::CopyPixMap,
         ("InterfaceLib", "DisposePixMap") | ("InterfaceLib", "DisposPixMap") => {
             PpcImportDispatcherTarget::DisposePixMap
         }
