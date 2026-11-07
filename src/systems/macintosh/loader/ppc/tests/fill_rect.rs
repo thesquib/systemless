@@ -3,7 +3,11 @@
 
 use super::*;
 use crate::memory::write_log;
-use crate::trap::test_helpers::{fill_rect_8bpp_68k, region_storage_bytes, IndexedPortFixture};
+use crate::trap::test_helpers::{
+    draw_arc_8bpp_68k, draw_oval_8bpp_68k, draw_poly_8bpp_68k, draw_round_rect_8bpp_68k, fill_rect_8bpp_68k, region_storage_bytes,
+    seed_fill_68k, IndexedPortFixture,
+};
+use crate::trap::types::{Rect, ShapeOp};
 
 const STOP: i16 = i16::MAX;
 const GRAY: [u8; 8] = [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55];
@@ -1961,5 +1965,630 @@ fn invert_round_rect_complements_only_the_rounded_interior() {
         if *value != original[index] {
             assert_eq!(*value, square[index], "pixel {index} is not an inversion");
         }
+    }
+}
+
+const PIXPAT_HANDLE: u32 = SCRATCH + 0x500;
+const PIXPAT: u32 = SCRATCH + 0x510;
+const SHAPE: Rect = Rect {
+    top: -2,
+    left: -3,
+    bottom: 8,
+    right: 15,
+};
+
+/// Runs `target` on an 8-bit port clipped by `vis` and `clip`, with `pattern`
+/// as both the raw pattern at `PATTERN` and pat1Data of a bit-pattern PixPat.
+fn clipped_shape_pixels(
+    target: PpcImportDispatcherTarget,
+    regs: [u32; 4],
+    pattern: [u8; 8],
+    clips: (RegionSpec, RegionSpec),
+) -> Vec<u8> {
+    prepared_shape_pixels(target, regs, pattern, clips, |_| {})
+}
+
+/// `clipped_shape_pixels` with `prepare` run on the port before the call.
+fn prepared_shape_pixels(
+    target: PpcImportDispatcherTarget,
+    regs: [u32; 4],
+    pattern: [u8; 8],
+    (vis, clip): (RegionSpec, RegionSpec),
+    prepare: impl FnOnce(&mut PpcLoadedApp),
+) -> Vec<u8> {
+    let pixels = initial_pixels();
+    let fixture = fixture(&pixels, vis, clip);
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(b"InvertOval")).unwrap();
+    install_port(&mut loaded, &fixture, 8);
+    ppc_write_rect(
+        &mut loaded.memory,
+        RECT,
+        SHAPE.top,
+        SHAPE.left,
+        SHAPE.bottom,
+        SHAPE.right,
+    )
+    .unwrap();
+    loaded.memory.write_bytes(PATTERN, &pattern).unwrap();
+    loaded.memory.write_u32_be(PIXPAT_HANDLE, PIXPAT).unwrap();
+    loaded.memory.write_u16_be(PIXPAT, 0).unwrap();
+    loaded.memory.write_bytes(PIXPAT + 20, &pattern).unwrap();
+    for (register, value) in regs.into_iter().enumerate() {
+        loaded.cpu.gpr[3 + register] = value;
+    }
+    prepare(&mut loaded);
+    run_test_import(&mut loaded, target);
+    read_pixels(&mut loaded, pixels.len())
+}
+
+fn hide_pen(loaded: &mut PpcLoadedApp) {
+    loaded
+        .memory
+        .write_u16_be(PORT + PPC_CGRAF_PORT_PN_VIS_OFFSET, (-1i16) as u16)
+        .unwrap();
+}
+
+const SHAPE_CLIPS: [(RegionSpec, RegionSpec); 3] = [
+    (WHOLE_PORT, WHOLE_PORT),
+    (WHOLE_PORT, CLIP_WITH_HOLE),
+    (VIS_NOTCHED, CLIP_RECT),
+];
+
+fn shape_target(operation: PpcQuickDrawShapeOperation) -> PpcImportDispatcherTarget {
+    PpcImportDispatcherTarget::QuickDrawShape(operation)
+}
+
+#[test]
+fn oval_and_round_rect_imports_resolve_in_both_libraries() {
+    for (symbol, operation) in [
+        ("InvertOval", PpcQuickDrawShapeOperation::InvertOval),
+        ("FillCOval", PpcQuickDrawShapeOperation::FillCOval),
+        ("FillCRoundRect", PpcQuickDrawShapeOperation::FillCRoundRect),
+    ] {
+        for library in ["InterfaceLib", "CarbonLib"] {
+            assert_eq!(
+                dispatcher_target_for_import(library, symbol),
+                shape_target(operation),
+                "{library} {symbol}"
+            );
+        }
+    }
+}
+
+#[test]
+fn invert_oval_matches_the_68k_path_with_clipping() {
+    for (vis, clip) in SHAPE_CLIPS {
+        let pixels = initial_pixels();
+        let expected = draw_oval_8bpp_68k(&fixture(&pixels, vis, clip), SHAPE, ShapeOp::Invert);
+        assert_ne!(expected, pixels);
+        assert_eq!(
+            clipped_shape_pixels(
+                shape_target(PpcQuickDrawShapeOperation::InvertOval),
+                [RECT, 0, 0, 0],
+                [0; 8],
+                (vis, clip),
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn fill_c_oval_with_a_bit_pattern_matches_the_68k_path_with_clipping() {
+    for (vis, clip) in SHAPE_CLIPS {
+        for pattern in [GRAY, DIAGONAL, MIXED, [0xff; 8]] {
+            let pixels = initial_pixels();
+            let expected =
+                draw_oval_8bpp_68k(&fixture(&pixels, vis, clip), SHAPE, ShapeOp::Fill(pattern));
+            assert_ne!(expected, pixels);
+            assert_eq!(
+                clipped_shape_pixels(
+                    shape_target(PpcQuickDrawShapeOperation::FillCOval),
+                    [RECT, PIXPAT_HANDLE, 0, 0],
+                    pattern,
+                    (vis, clip),
+                ),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn fill_c_round_rect_with_a_bit_pattern_matches_the_68k_path_with_clipping() {
+    for (vis, clip) in SHAPE_CLIPS {
+        for pattern in [GRAY, DIAGONAL, MIXED, [0xff; 8]] {
+            let pixels = initial_pixels();
+            let expected = draw_round_rect_8bpp_68k(
+                &fixture(&pixels, vis, clip),
+                SHAPE,
+                (6, 4),
+                ShapeOp::Fill(pattern),
+            );
+            assert_ne!(expected, pixels);
+            assert_eq!(
+                clipped_shape_pixels(
+                    shape_target(PpcQuickDrawShapeOperation::FillCRoundRect),
+                    [RECT, 6, 4, PIXPAT_HANDLE],
+                    pattern,
+                    (vis, clip),
+                ),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn fill_c_shapes_ignore_a_nil_pixel_pattern() {
+    for (operation, regs) in [
+        (PpcQuickDrawShapeOperation::FillCOval, [RECT, 0, 0, 0]),
+        (PpcQuickDrawShapeOperation::FillCRoundRect, [RECT, 6, 4, 0]),
+    ] {
+        assert_eq!(
+            clipped_shape_pixels(shape_target(operation), regs, GRAY, (WHOLE_PORT, WHOLE_PORT)),
+            initial_pixels()
+        );
+    }
+}
+
+#[test]
+fn oval_and_round_rect_imports_draw_nothing_with_a_hidden_pen() {
+    for (operation, regs) in [
+        (PpcQuickDrawShapeOperation::InvertOval, [RECT, 0, 0, 0]),
+        (PpcQuickDrawShapeOperation::FillCOval, [RECT, PIXPAT_HANDLE, 0, 0]),
+        (PpcQuickDrawShapeOperation::FillCRoundRect, [RECT, 6, 4, PIXPAT_HANDLE]),
+    ] {
+        assert_eq!(
+            prepared_shape_pixels(
+                shape_target(operation),
+                regs,
+                GRAY,
+                (WHOLE_PORT, WHOLE_PORT),
+                hide_pen,
+            ),
+            initial_pixels()
+        );
+    }
+}
+
+/// Arcs including negative, wrapping and over-360 angles, as (start, arc).
+const ARCS: [(i16, i16); 5] = [(0, 90), (45, 180), (315, 90), (90, -135), (10, 400)];
+
+fn angle_regs(angles: (i16, i16), last: u32) -> [u32; 4] {
+    [RECT, angles.0 as u16 as u32, angles.1 as u16 as u32, last]
+}
+
+#[test]
+fn arc_imports_resolve_in_both_libraries() {
+    for (symbol, operation) in [
+        ("EraseArc", PpcQuickDrawShapeOperation::EraseArc),
+        ("InvertArc", PpcQuickDrawShapeOperation::InvertArc),
+        ("FillArc", PpcQuickDrawShapeOperation::FillArc),
+        ("FillCArc", PpcQuickDrawShapeOperation::FillCArc),
+    ] {
+        for library in ["InterfaceLib", "CarbonLib"] {
+            assert_eq!(
+                dispatcher_target_for_import(library, symbol),
+                shape_target(operation),
+                "{library} {symbol}"
+            );
+        }
+    }
+}
+
+#[test]
+fn invert_arc_matches_the_68k_path_with_clipping() {
+    for (vis, clip) in SHAPE_CLIPS {
+        for angles in ARCS {
+            let pixels = initial_pixels();
+            let expected =
+                draw_arc_8bpp_68k(&fixture(&pixels, vis, clip), SHAPE, angles, ShapeOp::Invert);
+            assert_ne!(expected, pixels, "{angles:?}");
+            assert_eq!(
+                clipped_shape_pixels(
+                    shape_target(PpcQuickDrawShapeOperation::InvertArc),
+                    angle_regs(angles, 0),
+                    [0; 8],
+                    (vis, clip),
+                ),
+                expected,
+                "{angles:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fill_arc_and_fill_c_arc_match_the_68k_path_with_clipping() {
+    for (vis, clip) in SHAPE_CLIPS {
+        for angles in ARCS {
+            for pattern in [GRAY, MIXED, [0xff; 8]] {
+                let pixels = initial_pixels();
+                let expected = draw_arc_8bpp_68k(
+                    &fixture(&pixels, vis, clip),
+                    SHAPE,
+                    angles,
+                    ShapeOp::Fill(pattern),
+                );
+                assert_ne!(expected, pixels, "{angles:?}");
+                for (operation, last) in [
+                    (PpcQuickDrawShapeOperation::FillArc, PATTERN),
+                    (PpcQuickDrawShapeOperation::FillCArc, PIXPAT_HANDLE),
+                ] {
+                    assert_eq!(
+                        clipped_shape_pixels(
+                            shape_target(operation),
+                            angle_regs(angles, last),
+                            pattern,
+                            (vis, clip),
+                        ),
+                        expected,
+                        "{operation:?} {angles:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn erase_arc_paints_the_background_inside_the_wedge_only() {
+    let pixels = initial_pixels();
+    let (vis, clip) = (WHOLE_PORT, CLIP_WITH_HOLE);
+    let erased = clipped_shape_pixels(
+        shape_target(PpcQuickDrawShapeOperation::EraseArc),
+        angle_regs((45, 180), 0),
+        [0; 8],
+        (vis, clip),
+    );
+    let wedge = draw_arc_8bpp_68k(
+        &fixture(&pixels, vis, clip),
+        SHAPE,
+        (45, 180),
+        ShapeOp::Fill([0; 8]),
+    );
+    assert_ne!(erased, pixels);
+    // An all-clear pattern is the back index everywhere the wedge reaches.
+    assert_eq!(erased, wedge);
+}
+
+#[test]
+fn arc_imports_draw_nothing_with_a_hidden_pen_or_a_zero_angle() {
+    for (operation, last) in [
+        (PpcQuickDrawShapeOperation::EraseArc, 0),
+        (PpcQuickDrawShapeOperation::InvertArc, 0),
+        (PpcQuickDrawShapeOperation::FillArc, PATTERN),
+        (PpcQuickDrawShapeOperation::FillCArc, PIXPAT_HANDLE),
+    ] {
+        let target = shape_target(operation);
+        let clips = (WHOLE_PORT, WHOLE_PORT);
+        assert_eq!(
+            prepared_shape_pixels(
+                target.clone(),
+                angle_regs((0, 90), last),
+                GRAY,
+                clips,
+                hide_pen
+            ),
+            initial_pixels()
+        );
+        assert_eq!(
+            clipped_shape_pixels(target, angle_regs((0, 0), last), GRAY, clips),
+            initial_pixels()
+        );
+    }
+}
+
+const POLY_HANDLE: u32 = SCRATCH + 0x5f0;
+const POLY: u32 = SCRATCH + 0x600;
+const MAP_SOURCE: u32 = SCRATCH + 0x420;
+const MAP_DESTINATION: u32 = SCRATCH + 0x430;
+
+/// polySize, polyBBox and vertices as big-endian words.
+fn polygon_record(bbox: [i16; 4], vertices: &[(i16, i16)]) -> Vec<u8> {
+    let mut words = vec![(10 + vertices.len() * 4) as i16];
+    words.extend(bbox);
+    for &(v, h) in vertices {
+        words.extend([v, h]);
+    }
+    words.iter().flat_map(|word| word.to_be_bytes()).collect()
+}
+
+/// A concave polygon, partly outside the pixel image, and a self-crossing
+/// bowtie that the even-odd rule leaves two lobes of.
+fn test_polygons() -> [Vec<u8>; 2] {
+    [
+        polygon_record(
+            [-5, -8, 8, 16],
+            &[(-5, -8), (8, 1), (0, 4), (6, 16), (-2, 9), (-5, -8)],
+        ),
+        polygon_record([-1, -2, 7, 14], &[(-1, -2), (7, 14), (-1, 14), (7, -2)]),
+    ]
+}
+
+fn write_polygon(loaded: &mut PpcLoadedApp, record: &[u8]) {
+    loaded.memory.write_u32_be(POLY_HANDLE, POLY).unwrap();
+    loaded.memory.write_bytes(POLY, record).unwrap();
+}
+
+#[test]
+fn polygon_imports_resolve_in_both_libraries() {
+    for (symbol, target) in [
+        ("InvertPoly", PpcImportDispatcherTarget::InvertPoly),
+        ("FillCPoly", PpcImportDispatcherTarget::FillCPoly),
+        ("OffsetPoly", PpcImportDispatcherTarget::OffsetPoly),
+        ("MapPoly", PpcImportDispatcherTarget::MapPoly),
+    ] {
+        for library in ["InterfaceLib", "CarbonLib"] {
+            assert_eq!(
+                dispatcher_target_for_import(library, symbol),
+                target.clone(),
+                "{library} {symbol}"
+            );
+        }
+    }
+}
+
+#[test]
+fn invert_poly_matches_the_68k_path_with_clipping() {
+    for record in test_polygons() {
+        for (vis, clip) in SHAPE_CLIPS {
+            let pixels = initial_pixels();
+            let expected =
+                draw_poly_8bpp_68k(&fixture(&pixels, vis, clip), &record, ShapeOp::Invert);
+            assert_ne!(expected, pixels);
+            assert_eq!(
+                prepared_shape_pixels(
+                    PpcImportDispatcherTarget::InvertPoly,
+                    [POLY_HANDLE, 0, 0, 0],
+                    [0; 8],
+                    (vis, clip),
+                    |loaded| write_polygon(loaded, &record),
+                ),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn fill_c_poly_with_a_bit_pattern_matches_the_68k_path_with_clipping() {
+    for record in test_polygons() {
+        for (vis, clip) in SHAPE_CLIPS {
+            for pattern in [GRAY, MIXED, [0xff; 8]] {
+                let pixels = initial_pixels();
+                let expected = draw_poly_8bpp_68k(
+                    &fixture(&pixels, vis, clip),
+                    &record,
+                    ShapeOp::Fill(pattern),
+                );
+                assert_ne!(expected, pixels);
+                assert_eq!(
+                    prepared_shape_pixels(
+                        PpcImportDispatcherTarget::FillCPoly,
+                        [POLY_HANDLE, PIXPAT_HANDLE, 0, 0],
+                        pattern,
+                        (vis, clip),
+                        |loaded| write_polygon(loaded, &record),
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn polygon_drawing_imports_honour_a_hidden_pen_and_a_nil_pixel_pattern() {
+    let [record, _] = test_polygons();
+    let clips = (WHOLE_PORT, WHOLE_PORT);
+    for (target, regs, hide) in [
+        (PpcImportDispatcherTarget::InvertPoly, [POLY_HANDLE, 0, 0, 0], true),
+        (PpcImportDispatcherTarget::FillCPoly, [POLY_HANDLE, PIXPAT_HANDLE, 0, 0], true),
+        (PpcImportDispatcherTarget::FillCPoly, [POLY_HANDLE, 0, 0, 0], false),
+    ] {
+        assert_eq!(
+            prepared_shape_pixels(target, regs, GRAY, clips, |loaded| {
+                write_polygon(loaded, &record);
+                if hide {
+                    hide_pen(loaded);
+                }
+            }),
+            initial_pixels()
+        );
+    }
+}
+
+/// Runs a polygon-record import with `regs` and returns the polygon record.
+fn transformed_polygon(
+    target: PpcImportDispatcherTarget,
+    regs: [u32; 3],
+    record: &[u8],
+) -> Vec<u8> {
+    let pixels = initial_pixels();
+    let fixture = fixture(&pixels, WHOLE_PORT, WHOLE_PORT);
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(b"OffsetPoly")).unwrap();
+    install_port(&mut loaded, &fixture, 8);
+    write_polygon(&mut loaded, record);
+    ppc_write_rect(&mut loaded.memory, MAP_SOURCE, 0, 0, 100, 200).unwrap();
+    ppc_write_rect(&mut loaded.memory, MAP_DESTINATION, 10, 20, 60, 420).unwrap();
+    for (register, value) in regs.into_iter().enumerate() {
+        loaded.cpu.gpr[3 + register] = value;
+    }
+    run_test_import(&mut loaded, target);
+    let mut out = vec![0; record.len()];
+    loaded.memory.read_bytes_into(POLY, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn offset_poly_moves_the_bounding_box_and_every_vertex() {
+    let record = polygon_record([1, 2, 5, 8], &[(1, 2), (5, 8), (3, 2)]);
+    assert_eq!(
+        transformed_polygon(
+            PpcImportDispatcherTarget::OffsetPoly,
+            // dh then dv, with junk in the upper halves of the registers.
+            [POLY_HANDLE, 0x1234_0003, 0x5678_fff6],
+            &record,
+        ),
+        polygon_record([-9, 5, -5, 11], &[(-9, 5), (-5, 11), (-7, 5)])
+    );
+}
+
+#[test]
+fn map_poly_scales_the_bounding_box_and_every_vertex() {
+    // v maps by 50/100 from 10, h by 400/200 from 20.
+    let record = polygon_record([0, 0, 100, 200], &[(0, 0), (100, 200), (50, 25), (0, 0)]);
+    assert_eq!(
+        transformed_polygon(
+            PpcImportDispatcherTarget::MapPoly,
+            [POLY_HANDLE, MAP_SOURCE, MAP_DESTINATION],
+            &record,
+        ),
+        polygon_record(
+            [10, 20, 60, 420],
+            &[(10, 20), (60, 420), (35, 70), (10, 20)]
+        )
+    );
+}
+
+const MASK_SOURCE: u32 = PPC_DATA_BASE + 0x3000;
+const MASK_DESTINATION: u32 = PPC_DATA_BASE + 0x3800;
+
+/// Runs SeedFill or CalcMask with r3..r10 on a source image and a destination
+/// of `destination_len` bytes filled with $A5, and returns the destination.
+fn mask_import(
+    operation: PpcQuickDrawCompatibilityOperation,
+    source: &[u8],
+    (source_row, destination_row): (i16, i16),
+    (height, words): (i16, i16),
+    seed: (i16, i16),
+    destination_len: usize,
+) -> Vec<u8> {
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(b"SeedFill")).unwrap();
+    loaded.memory.add_region(MASK_SOURCE, source.to_vec());
+    loaded
+        .memory
+        .add_region(MASK_DESTINATION, vec![0xa5; destination_len]);
+    let high = 0x1234_0000u32;
+    for (register, value) in [
+        MASK_SOURCE,
+        MASK_DESTINATION,
+        high | source_row as u16 as u32,
+        high | destination_row as u16 as u32,
+        high | height as u16 as u32,
+        high | words as u16 as u32,
+        high | seed.0 as u16 as u32,
+        high | seed.1 as u16 as u32,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        loaded.cpu.gpr[3 + register] = value;
+    }
+    run_test_import(
+        &mut loaded,
+        PpcImportDispatcherTarget::QuickDrawCompatibility(operation),
+    );
+    ppc_memory_read_bytes(&mut loaded.memory, MASK_DESTINATION, destination_len as u32).unwrap()
+}
+
+/// 16×5 image: a closed box at columns 1..=6 around a hole, and a box at
+/// columns 9..=14 open at the top.
+const MASK_IMAGE: [u8; 10] = [
+    0b0111_1110, 0b0100_0010,
+    0b0100_0010, 0b0100_0010,
+    0b0100_0010, 0b0100_0010,
+    0b0100_0010, 0b0100_0010,
+    0b0111_1110, 0b0111_1110,
+];
+
+#[test]
+fn mask_imports_resolve_in_both_libraries() {
+    for (symbol, operation) in [
+        ("SeedFill", PpcQuickDrawCompatibilityOperation::SeedFill),
+        ("CalcMask", PpcQuickDrawCompatibilityOperation::CalcMask),
+    ] {
+        for library in ["InterfaceLib", "CarbonLib"] {
+            assert_eq!(
+                dispatcher_target_for_import(library, symbol),
+                PpcImportDispatcherTarget::QuickDrawCompatibility(operation.clone()),
+                "{library} {symbol}"
+            );
+        }
+    }
+}
+
+#[test]
+fn seed_fill_matches_the_68k_path() {
+    // Inside each box, outside them, on an edge, and outside the image.
+    for seed in [(3, 2), (11, 2), (0, 0), (1, 0), (16, 0), (-1, 2), (0, 5)] {
+        assert_eq!(
+            mask_import(
+                PpcQuickDrawCompatibilityOperation::SeedFill,
+                &MASK_IMAGE,
+                (2, 2),
+                (5, 1),
+                seed,
+                MASK_IMAGE.len(),
+            ),
+            seed_fill_68k(&MASK_IMAGE, 5, 1, seed),
+            "{seed:?}"
+        );
+    }
+}
+
+#[test]
+fn calc_mask_sets_the_bits_paint_cannot_reach_from_an_edge() {
+    assert_eq!(
+        mask_import(
+            PpcQuickDrawCompatibilityOperation::CalcMask,
+            &MASK_IMAGE,
+            (2, 2),
+            (5, 1),
+            (0, 0),
+            MASK_IMAGE.len(),
+        ),
+        // The closed box keeps its hole; the open box keeps only its walls.
+        [
+            0b0111_1110, 0b0100_0010,
+            0b0111_1110, 0b0100_0010,
+            0b0111_1110, 0b0100_0010,
+            0b0111_1110, 0b0100_0010,
+            0b0111_1110, 0b0111_1110,
+        ]
+    );
+}
+
+#[test]
+fn mask_imports_keep_bytes_beyond_the_image_width() {
+    let source = [0xff, 0xff, 0x12, 0x34, 0xff, 0xff, 0x56, 0x78];
+    assert_eq!(
+        mask_import(
+            PpcQuickDrawCompatibilityOperation::CalcMask,
+            &source,
+            (4, 3),
+            (2, 1),
+            (0, 0),
+            6,
+        ),
+        [0xff, 0xff, 0xa5, 0xff, 0xff, 0xa5]
+    );
+}
+
+#[test]
+fn mask_imports_with_invalid_geometry_change_nothing() {
+    for (operation, rows, size) in [
+        (PpcQuickDrawCompatibilityOperation::SeedFill, (2, 2), (0, 1)),
+        (PpcQuickDrawCompatibilityOperation::SeedFill, (2, 2), (5, 0)),
+        (PpcQuickDrawCompatibilityOperation::CalcMask, (1, 2), (5, 1)),
+        (PpcQuickDrawCompatibilityOperation::CalcMask, (2, -2), (5, 1)),
+        (PpcQuickDrawCompatibilityOperation::CalcMask, (2, 2), (-5, 1)),
+    ] {
+        assert_eq!(
+            mask_import(operation, &MASK_IMAGE, rows, size, (0, 0), MASK_IMAGE.len()),
+            [0xa5; 10]
+        );
     }
 }

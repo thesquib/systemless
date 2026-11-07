@@ -3,6 +3,7 @@
 pub(crate) mod callbacks;
 pub(crate) mod controller;
 pub(crate) mod decompression;
+pub(crate) mod described_video;
 mod toolbox;
 
 pub(crate) use toolbox::{
@@ -20,7 +21,8 @@ use super::{
     format_ppc_fourcc, ppc_decode_aiff_samples, ppc_decoded_sound_data, ppc_draw_pict_bytes_to_16bpp,
     ppc_existing_path_for_fsspec, ppc_i16_result, ppc_live_quickdraw_surface,
     ppc_memory_can_write_bytes, ppc_parse_aiff_metadata, ppc_process_alloc_handle_with_bytes,
-    ppc_quickdraw_surface_color_pixel, ppc_quickdraw_write_raw_pixel, ppc_read_be_u32_from_slice,
+    ppc_quickdraw_surface_clut, ppc_quickdraw_surface_color_pixel, ppc_quickdraw_write_raw_pixel,
+    ppc_read_be_u32_from_slice, ppc_rgb_color_to_rgb555, ppc_rgb_color_to_index_in_clut,
     ppc_read_rect, ppc_sound_codec, ppc_write_rect, qt_trace_enabled, PpcCpu, PpcDecodedAiffData,
     PpcDecodedAiffPlaybackRecord, PpcFileRecord, PpcFrontBuffer, PpcGWorldRecord, PpcHandleRecord,
     PpcImportAction, PpcProcessAllocatorView, PpcQuickDrawSurface, PpcRgbColor, PpcSectionMem,
@@ -209,6 +211,18 @@ pub struct PpcQuickTimeVideoDecodeCacheRecord {
     pub(crate) sample_index: usize,
     pub(crate) rgb: Vec<u8>,
     pub(crate) cinepak_strips: Vec<PpcQuickTimeCinepakStripState>,
+    pub(crate) described_state: Option<described_video::State>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PpcQuickTimeMovieDrawKey {
+    sample_index: usize,
+    surface: PpcQuickDrawSurface,
+    rect: (i16, i16, i16, i16),
+    movie_box: (i16, i16, i16, i16),
+    matrix: Option<[u32; 9]>,
+    clip: Option<Vec<u8>>,
+    palette: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +284,8 @@ pub struct PpcQuickTimeControllerRecord {
     pub action_filter: u32,
     pub action_ref_con: u32,
     pub action_filter_rtoc: u32,
+    pub keys_enabled: bool,
+    pub control_flags: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +326,13 @@ pub struct PpcQuickTimeState {
     pub graphics_importer_data: Vec<u8>,
     pub graphics_importer_bounds: Option<(i16, i16, i16, i16)>,
     pub graphics_importer_image: Option<PpcQtGraphicsImage>,
+    /// Immutable source retained by the created Movie, independently of open files.
+    pub movie_data: Vec<u8>,
+    pub movie_sample_fork: Option<Rc<ProcessForkBytes>>,
+    pub movie_duration: u64,
+    pub movie_natural_bounds: Option<(i16, i16, i16, i16)>,
+    pub movie_path: String,
+    pub movie_ref_num: i16,
     pub movie_gworld: u32,
     pub movie_gdevice: u32,
     pub movie_box: (i16, i16, i16, i16),
@@ -331,6 +354,7 @@ pub struct PpcQuickTimeState {
     pub movie_video_track: Option<PpcQuickTimeVideoTrackRecord>,
     pub movie_video_samples: Option<PpcQuickTimeVideoSampleTableRecord>,
     pub movie_video_decode_cache: Option<PpcQuickTimeVideoDecodeCacheRecord>,
+    pub(crate) movie_last_idle_draw: Option<PpcQuickTimeMovieDrawKey>,
     pub movie_audio_track: Option<PpcQuickTimeAudioTrackRecord>,
     pub movie_tracks: Vec<PpcQuickTimeTrackRecord>,
     pub movie_controllers: Vec<PpcQuickTimeControllerRecord>,
@@ -387,6 +411,12 @@ impl Default for PpcQuickTimeState {
             graphics_importer_data: Vec::new(),
             graphics_importer_bounds: None,
             graphics_importer_image: None,
+            movie_data: Vec::new(),
+            movie_sample_fork: None,
+            movie_duration: 0,
+            movie_natural_bounds: None,
+            movie_path: String::new(),
+            movie_ref_num: 0,
             movie_gworld: 0,
             movie_gdevice: 0,
             movie_box: (
@@ -413,6 +443,7 @@ impl Default for PpcQuickTimeState {
             movie_video_track: None,
             movie_video_samples: None,
             movie_video_decode_cache: None,
+            movie_last_idle_draw: None,
             movie_audio_track: None,
             movie_tracks: Vec::new(),
             movie_controllers: Vec::new(),
@@ -712,7 +743,7 @@ pub(super) fn dispatch_quicktime_compatibility(
                 let _ = ppc_qt_record_error(quicktime, -2010); // invalidMovie
                 return PpcImportAction::Return(0);
             }
-            let user_data = if ppc_qt_movie_has_user_data(&quicktime.movie_file_data) {
+            let user_data = if ppc_qt_movie_has_user_data(&quicktime.movie_data) {
                 toolbox::PPC_QT_MOVIE_USER_DATA
             } else {
                 0
@@ -731,7 +762,7 @@ pub(super) fn dispatch_quicktime_compatibility(
                 return PpcImportAction::Return(ppc_i16_result(PPC_PARAM_ERR));
             }
             let Some(item) =
-                toolbox::ppc_qt_user_data_item(&quicktime.movie_file_data, range, cpu.gpr[5], index)
+                toolbox::ppc_qt_user_data_item(&quicktime.movie_data, range, cpu.gpr[5], index)
             else {
                 return PpcImportAction::Return(ppc_i16_result(-2026)); // userDataItemNotFound
             };
@@ -797,7 +828,7 @@ pub(super) fn dispatch_quicktime_compatibility(
                 return PpcImportAction::ReturnPreserve;
             };
             let Some(description) = ppc_qt_movie_sample_description(
-                &quicktime.movie_file_data,
+                &quicktime.movie_data,
                 ordinal + 1,
                 cpu.gpr[4],
             ) else {
@@ -862,9 +893,63 @@ pub(super) fn dispatch_quicktime_compatibility(
                     }
                     let controller = cpu.gpr[3];
                     cpu.gpr[3] = movie;
-                    let error =
+                    let (error, drew) =
                         ppc_qt_movies_task(cpu, memory, gworlds, current_gworld, quicktime, sound);
                     cpu.gpr[3] = controller;
+                    if error == PPC_NO_ERR {
+                        ppc_qt_mark_drawing_complete(quicktime, drew);
+                    }
+                    PpcImportAction::Return(ppc_i16_result(error))
+                }
+                2 => {
+                    // mcActionDraw is a window update, not a playback tick.
+                    // Render real decoded pixels without starting movie/audio.
+                    if !compatibility_valid_movie(quicktime, movie) {
+                        return PpcImportAction::Return(ppc_i16_result(-2010));
+                    }
+                    let window = cpu.gpr[5];
+                    let Some(surface) = (window != 0)
+                        .then(|| ppc_live_quickdraw_surface(memory, gworlds, window))
+                        .flatten()
+                    else {
+                        return PpcImportAction::Return(ppc_i16_result(PPC_PARAM_ERR));
+                    };
+                    let movie_port = if quicktime.movie_gworld != 0 {
+                        quicktime.movie_gworld
+                    } else {
+                        current_gworld
+                    };
+                    if window != movie_port || !quicktime.movie_active {
+                        return PpcImportAction::Return(0);
+                    }
+                    if quicktime.movie_audio_track.is_some()
+                        && quicktime.movie_video_track.is_none()
+                    {
+                        return PpcImportAction::Return(0);
+                    }
+                    let controller = quicktime
+                        .movie_controllers
+                        .iter()
+                        .find(|controller| controller.handle == cpu.gpr[3])
+                        .expect("controller was validated above");
+                    let detached = quicktime
+                        .detached_movie_controllers
+                        .contains(&controller.handle);
+                    let rect = if controller.window != window || detached {
+                        quicktime.movie_box
+                    } else {
+                        controller.rect
+                    };
+                    let error = match ppc_qt_draw_decoded_movie_frame(
+                        memory, surface, quicktime, rect,
+                    ) {
+                        Some(_) => PPC_NO_ERR, // Fully clipped updates still succeed.
+                        None => -8961, // noCodecErr; never draw a placeholder.
+                    };
+                    if qt_trace_enabled() {
+                        let codec = quicktime.movie_video_samples.as_ref().map_or(0, |s| s.codec);
+                        eprintln!("[QT-TRACE] ControllerDraw controller=${:08X} window=${window:08X} rect={rect:?} codec=${codec:08X} error={error}", cpu.gpr[3]);
+                    }
                     PpcImportAction::Return(ppc_i16_result(error))
                 }
                 8 => {
@@ -906,6 +991,76 @@ pub(super) fn dispatch_quicktime_compatibility(
                     ppc_qt_seek_movie(quicktime, sound, time);
                     PpcImportAction::Return(0)
                 }
+                14 | 15 => {
+                    // Apple's Movies.h: SetVolume carries a short value;
+                    // GetVolume takes a short pointer. Both share movie state
+                    // with GetMovieVolume and SetMovieVolume.
+                    if !compatibility_valid_movie(quicktime, movie) {
+                        return PpcImportAction::Return(ppc_i16_result(-2010));
+                    }
+                    if cpu.gpr[4] as i16 == 14 {
+                        quicktime.movie_volume = cpu.gpr[5] as u16 as i16;
+                        ppc_qt_apply_movie_volume(quicktime, sound);
+                    } else {
+                        let out = cpu.gpr[5];
+                        if out == 0 || !ppc_memory_can_write_bytes(memory, out, 2) {
+                            return PpcImportAction::Return(ppc_i16_result(PPC_PARAM_ERR));
+                        }
+                        let _ = memory.write_u16_be(out, quicktime.movie_volume as u16);
+                    }
+                    PpcImportAction::Return(0)
+                }
+                32 => {
+                    // QuickTime Components (1993), p. 2-19: SetKeysEnabled
+                    // carries a Boolean value directly in the params slot.
+                    let controller = quicktime
+                        .movie_controllers
+                        .iter_mut()
+                        .find(|controller| controller.handle == cpu.gpr[3])
+                        .expect("controller was validated above");
+                    controller.keys_enabled = cpu.gpr[5] as u8 != 0;
+                    PpcImportAction::Return(0)
+                }
+                33 => {
+                    // GetKeysEnabled writes one Boolean byte through params.
+                    let out = cpu.gpr[5];
+                    if out == 0 || !ppc_memory_can_write_bytes(memory, out, 1) {
+                        return PpcImportAction::Return(ppc_i16_result(PPC_PARAM_ERR));
+                    }
+                    let enabled = quicktime
+                        .movie_controllers
+                        .iter()
+                        .find(|controller| controller.handle == cpu.gpr[3])
+                        .expect("controller was validated above")
+                        .keys_enabled;
+                    let _ = memory.write_u8(out, u8::from(enabled));
+                    PpcImportAction::Return(0)
+                }
+                38 => {
+                    // QuickTime Components (1993), pp. 2-20–2-21: these
+                    // long-word control flags are not NewMovieController flags.
+                    let controller = quicktime
+                        .movie_controllers
+                        .iter_mut()
+                        .find(|controller| controller.handle == cpu.gpr[3])
+                        .expect("controller was validated above");
+                    controller.control_flags = cpu.gpr[5];
+                    PpcImportAction::Return(0)
+                }
+                39 => {
+                    let out = cpu.gpr[5];
+                    if out == 0 || !ppc_memory_can_write_bytes(memory, out, 4) {
+                        return PpcImportAction::Return(ppc_i16_result(PPC_PARAM_ERR));
+                    }
+                    let flags = quicktime
+                        .movie_controllers
+                        .iter()
+                        .find(|controller| controller.handle == cpu.gpr[3])
+                        .expect("controller was validated above")
+                        .control_flags;
+                    let _ = memory.write_u32_be(out, flags);
+                    PpcImportAction::Return(0)
+                }
                 42 => {
                     // mcActionGetPlayRate writes a Fixed to the caller's pointer.
                     if !compatibility_valid_movie(quicktime, movie) {
@@ -934,10 +1089,17 @@ pub(super) fn dispatch_quicktime_compatibility(
             let Some(rect) = ppc_read_rect(memory, cpu.gpr[4]) else {
                 return PpcImportAction::Return(0);
             };
+            let Some(rect) = toolbox::controller_movie_rect(quicktime.movie_box, rect, cpu.gpr[5]) else {
+                return PpcImportAction::Return(0);
+            };
             let handle = quicktime.next_movie_controller_handle;
             let Some(next) = handle.checked_add(0x10) else {
                 return PpcImportAction::Return(0);
             };
+            if !toolbox::ppc_qt_resize_movie_matrix(quicktime, rect) {
+                return PpcImportAction::Return(0);
+            }
+            quicktime.movie_box = rect;
             quicktime.next_movie_controller_handle = next;
             quicktime
                 .movie_controllers
@@ -946,11 +1108,17 @@ pub(super) fn dispatch_quicktime_compatibility(
                     movie: cpu.gpr[3],
                     rect,
                     flags: cpu.gpr[5],
-                    window: 0,
+                    window: if quicktime.movie_gworld != 0 {
+                        quicktime.movie_gworld
+                    } else {
+                        current_gworld
+                    },
                     origin: 0,
                     action_filter: 0,
                     action_ref_con: 0,
                     action_filter_rtoc: 0,
+                    keys_enabled: false,
+                    control_flags: 0,
                 });
             PpcImportAction::Return(handle)
         }
@@ -1101,12 +1269,13 @@ pub(super) fn dispatch_quicktime_compatibility(
             if movie != 0 {
                 let original = cpu.gpr[3];
                 cpu.gpr[3] = movie;
-                let error =
+                let (error, drew) =
                     ppc_qt_movies_task(cpu, memory, gworlds, current_gworld, quicktime, sound);
                 cpu.gpr[3] = original;
                 if error != PPC_NO_ERR {
                     return PpcImportAction::Return(ppc_i16_result(error));
                 }
+                ppc_qt_mark_drawing_complete(quicktime, drew);
             }
             PpcImportAction::Return(0)
         }
@@ -1141,6 +1310,7 @@ pub(super) fn dispatch_quicktime_compatibility(
         PpcQuickTimeCompatibilityOperation::SetMovieVolume => {
             if compatibility_valid_movie(quicktime, cpu.gpr[3]) {
                 quicktime.movie_volume = cpu.gpr[4] as u16 as i16;
+                ppc_qt_apply_movie_volume(quicktime, sound);
             }
             PpcImportAction::ReturnPreserve
         }
@@ -1175,6 +1345,9 @@ pub(super) fn dispatch_quicktime_compatibility(
         }
         PpcQuickTimeCompatibilityOperation::UpdateMovie => {
             let result = if compatibility_valid_movie(quicktime, cpu.gpr[3]) {
+                if quicktime.movie_active {
+                    let _ = ppc_qt_draw_movie_frame(memory, gworlds, current_gworld, quicktime, 0x40);
+                }
                 PPC_NO_ERR
             } else {
                 PPC_PARAM_ERR
@@ -1219,6 +1392,7 @@ pub(super) fn dispatch_quicktime_compatibility(
                 );
             }
             if cpu.gpr[4] as u16 as i16 == quicktime.movie_file_ref_num {
+                ppc_qt_retain_movie_source(quicktime);
                 if let Some(bounds) = quicktime.movie_file_bounds {
                     quicktime.movie_box = bounds;
                 }
@@ -1236,6 +1410,7 @@ pub(super) fn dispatch_quicktime_compatibility(
                 quicktime.movie_preferred_volume = quicktime.movie_file_preferred_volume;
                 quicktime.movie_volume = quicktime.movie_preferred_volume;
             } else {
+                ppc_qt_clear_movie_source(quicktime);
                 quicktime.movie_tasks_until_done = PPC_QT_FALLBACK_MOVIE_TASKS_UNTIL_DONE;
                 quicktime.movie_video_track = None;
                 quicktime.movie_video_samples = None;
@@ -1277,10 +1452,10 @@ pub(super) fn dispatch_quicktime_compatibility(
 
 /// The movie's duration in its current time scale.
 pub(crate) fn ppc_qt_movie_duration_value(quicktime: &PpcQuickTimeState) -> u64 {
-    let duration = if quicktime.movie_file_duration == 0 {
+    let duration = if quicktime.movie_duration == 0 {
         600
     } else {
-        quicktime.movie_file_duration
+        quicktime.movie_duration
     };
     toolbox::ppc_qt_to_movie_scale(quicktime, duration.min(i64::MAX as u64) as i64).max(0) as u64
 }
@@ -3895,7 +4070,6 @@ pub(crate) fn ppc_qt_new_movie_from_file(
     if res_id_ptr != 0 && memory.write_u16_be(res_id_ptr, 0).is_none() {
         return PPC_PARAM_ERR;
     }
-    ppc_qt_stop_movie_audio(sound);
     let ref_num = cpu.gpr[4] as i16;
     if ref_num != 0 && ref_num == quicktime.movie_file_ref_num {
         let mut selected_data = vfs_files
@@ -3922,6 +4096,7 @@ pub(crate) fn ppc_qt_new_movie_from_file(
         {
             return PPC_PARAM_ERR;
         }
+        ppc_qt_retain_movie_source(quicktime);
         if let Some(bounds) = quicktime.movie_file_bounds {
             quicktime.movie_box = bounds;
         }
@@ -3939,6 +4114,7 @@ pub(crate) fn ppc_qt_new_movie_from_file(
         quicktime.movie_preferred_volume = quicktime.movie_file_preferred_volume;
         quicktime.movie_volume = quicktime.movie_preferred_volume;
     } else {
+        ppc_qt_clear_movie_source(quicktime);
         quicktime.movie_tasks_until_done = PPC_QT_FALLBACK_MOVIE_TASKS_UNTIL_DONE;
         quicktime.movie_video_track = None;
         quicktime.movie_video_samples = None;
@@ -3955,6 +4131,7 @@ pub(crate) fn ppc_qt_new_movie_from_file(
     if data_ref_was_changed_ptr != 0 && memory.write_u8(data_ref_was_changed_ptr, 0).is_none() {
         return PPC_PARAM_ERR;
     }
+    ppc_qt_stop_movie_audio(sound);
     quicktime.movie_started = false;
     // newMovieActive is bit 0 of newMovieFlags (pp. 2-88–2-89).
     quicktime.movie_active = cpu.gpr[7] & 1 != 0;
@@ -4147,6 +4324,24 @@ fn ppc_qt_top_level_atom_offsets(data: &[u8], expected_type: &[u8; 4]) -> Option
         offset = atom_end;
     }
     None
+}
+
+fn ppc_qt_retain_movie_source(quicktime: &mut PpcQuickTimeState) {
+    quicktime.movie_data = quicktime.movie_file_data.clone();
+    quicktime.movie_sample_fork = quicktime.movie_file_sample_fork.clone();
+    quicktime.movie_duration = quicktime.movie_file_duration;
+    quicktime.movie_natural_bounds = quicktime.movie_file_bounds;
+    quicktime.movie_path = quicktime.movie_file_path.clone();
+    quicktime.movie_ref_num = quicktime.movie_file_ref_num;
+}
+
+fn ppc_qt_clear_movie_source(quicktime: &mut PpcQuickTimeState) {
+    quicktime.movie_data.clear();
+    quicktime.movie_sample_fork = None;
+    quicktime.movie_duration = 0;
+    quicktime.movie_natural_bounds = None;
+    quicktime.movie_path.clear();
+    quicktime.movie_ref_num = 0;
 }
 
 fn ppc_qt_refresh_open_movie_metadata(quicktime: &mut PpcQuickTimeState) {
@@ -4389,7 +4584,7 @@ pub(crate) fn ppc_qt_set_movie_rate(
             .map(|cache| cache.sample_index);
         eprintln!(
             "[QT-TRACE] StartMovie path='{}' task_count={} drawn={} decoded={} audio={} cache_before={:?} cache_after={:?}",
-            quicktime.movie_file_path,
+            quicktime.movie_path,
             quicktime.movie_task_count,
             drawn,
             cache_after.is_some() && cache_after != cache_before,
@@ -4499,13 +4694,14 @@ pub(crate) fn ppc_qt_movies_task(
     current_gworld: u32,
     quicktime: &mut PpcQuickTimeState,
     _sound: &mut PpcSoundState,
-) -> i16 {
+) -> (i16, bool) {
     if cpu.gpr[3] != PPC_QT_MOVIE || quicktime.movie_disposed {
-        return PPC_PARAM_ERR;
+        return (PPC_PARAM_ERR, false);
     }
     if !quicktime.movie_active {
-        return PPC_NO_ERR;
+        return (PPC_NO_ERR, false);
     }
+    let drawn;
     {
         quicktime.movie_at_beginning =
             quicktime.movie_task_count == 0 && quicktime.movie_task_fraction == 0;
@@ -4513,13 +4709,19 @@ pub(crate) fn ppc_qt_movies_task(
             .movie_video_decode_cache
             .as_ref()
             .map(|cache| cache.sample_index);
-        let drawn = ppc_qt_draw_movie_frame(
-            memory,
-            gworlds,
-            current_gworld,
-            quicktime,
-            0x30u32.saturating_add(quicktime.movie_task_count),
-        );
+        let key = ppc_qt_movie_draw_key(memory, gworlds, current_gworld, quicktime);
+        let changed = key.is_none() || key != quicktime.movie_last_idle_draw;
+        drawn = changed
+            && ppc_qt_draw_movie_frame(
+                memory,
+                gworlds,
+                current_gworld,
+                quicktime,
+                0x30u32.saturating_add(quicktime.movie_task_count),
+            );
+        if changed {
+            quicktime.movie_last_idle_draw = key;
+        }
         if qt_trace_enabled() {
             let cache_after = quicktime
                 .movie_video_decode_cache
@@ -4527,7 +4729,7 @@ pub(crate) fn ppc_qt_movies_task(
                 .map(|cache| cache.sample_index);
             eprintln!(
                 "[QT-TRACE] MoviesTask path='{}' task_count={} drawn={} decoded={} cache_before={:?} cache_after={:?}",
-                quicktime.movie_file_path,
+                quicktime.movie_path,
                 quicktime.movie_task_count,
                 drawn,
                 cache_after.is_some() && cache_after != cache_before,
@@ -4536,7 +4738,7 @@ pub(crate) fn ppc_qt_movies_task(
             );
         }
     }
-    PPC_NO_ERR
+    (PPC_NO_ERR, drawn)
 }
 
 pub(crate) fn ppc_qt_is_movie_done(cpu: &mut PpcCpu, quicktime: &PpcQuickTimeState) -> (i16, bool) {
@@ -4560,6 +4762,7 @@ pub(crate) fn ppc_qt_dispose_movie(
     }
     quicktime.movie_started = false;
     quicktime.movie_disposed = true;
+    ppc_qt_clear_movie_source(quicktime);
     quicktime.movie_controllers.clear();
     quicktime.movie_active = false;
     quicktime.movie_video_track = None;
@@ -4573,6 +4776,7 @@ pub(crate) fn ppc_qt_dispose_movie(
 
 pub(crate) fn ppc_qt_reset_movie_video_decode_cache(quicktime: &mut PpcQuickTimeState) {
     quicktime.movie_video_decode_cache = None;
+    quicktime.movie_last_idle_draw = None;
 }
 
 pub(crate) fn ppc_qt_start_movie_audio(
@@ -4629,6 +4833,7 @@ pub(crate) fn ppc_qt_start_movie_audio(
         summary.sample_rate_fixed,
         None,
     );
+    ppc_qt_apply_movie_volume(quicktime, sound);
     sound
         .decoded_file_playbacks
         .push(PpcDecodedAiffPlaybackRecord {
@@ -4639,7 +4844,7 @@ pub(crate) fn ppc_qt_start_movie_audio(
         });
     sound.file_playbacks.push(PpcSoundFilePlaybackRecord {
         channel: PPC_QT_MOVIE,
-        ref_num: quicktime.movie_file_ref_num,
+        ref_num: quicktime.movie_ref_num,
         resource_id: 0,
         buffer_size: 0,
         buffer: 0,
@@ -4653,6 +4858,15 @@ pub(crate) fn ppc_qt_start_movie_audio(
     true
 }
 
+fn ppc_qt_apply_movie_volume(quicktime: &PpcQuickTimeState, sound: &mut PpcSoundState) {
+    // Signed 8.8 movie volume: negative values retain the setting but mute.
+    // Sound Manager uses unsigned 8.8 gains packed for the two channels.
+    let gain = u32::from(quicktime.movie_volume.max(0) as u16);
+    let _ = sound.manager.with_channel_mut(PPC_QT_MOVIE, |channel| {
+        channel.set_volume((gain << 16) | gain)
+    });
+}
+
 fn ppc_qt_stop_movie_audio(sound: &mut PpcSoundState) {
     sound.manager.quiet_channel(PPC_QT_MOVIE);
 }
@@ -4661,10 +4875,10 @@ pub(crate) fn ppc_qt_decode_movie_audio_samples(
     quicktime: &PpcQuickTimeState,
 ) -> Option<PpcDecodedAiffData> {
     let sample_data = quicktime
-        .movie_file_sample_fork
+        .movie_sample_fork
         .as_ref()
         .map(|fork| fork.as_slice())
-        .unwrap_or(&quicktime.movie_file_data);
+        .unwrap_or(&quicktime.movie_data);
     if let Some(decoded) = ppc_qt_movie_audio_samples(sample_data) {
         return Some(decoded);
     }
@@ -5484,6 +5698,7 @@ impl PpcQuickTimeCinepakDecoder {
             sample_index,
             rgb: self.frame.clone(),
             cinepak_strips: self.strips.clone(),
+            described_state: None,
         }
     }
 }
@@ -5497,15 +5712,18 @@ pub(crate) fn ppc_qt_decode_current_movie_video_frame(
     quicktime: &mut PpcQuickTimeState,
 ) -> Option<PpcQuickTimeDecodedVideoFrame> {
     let samples = quicktime.movie_video_samples.clone()?;
-    if samples.codec != u32::from_be_bytes(*b"cvid") || samples.samples.is_empty() {
+    if samples.samples.is_empty() {
         return None;
+    }
+    if samples.codec != u32::from_be_bytes(*b"cvid") {
+        return described_video::decode(quicktime, &samples);
     }
     let sample_index = ppc_qt_movie_timed_sample_index(quicktime, &samples)?;
     let sample_data = quicktime
-        .movie_file_sample_fork
+        .movie_sample_fork
         .as_ref()
         .map(|fork| fork.as_slice())
-        .unwrap_or(&quicktime.movie_file_data);
+        .unwrap_or(&quicktime.movie_data);
     let first_sample = ppc_qt_movie_video_sample_bytes(sample_data, &samples, 0)?;
     if first_sample.len() < 10 {
         return None;
@@ -5791,28 +6009,19 @@ fn ppc_qt_write_cinepak_rgb(
     Some(())
 }
 
-pub(crate) fn ppc_qt_draw_movie_frame(
+fn ppc_qt_movie_draw_target(
     memory: &mut PpcSectionMem,
     gworlds: &[PpcGWorldRecord],
     current_gworld: u32,
-    quicktime: &mut PpcQuickTimeState,
-    salt: u32,
-) -> bool {
-    if quicktime.movie_audio_track.is_some() && quicktime.movie_video_track.is_none() {
-        return false;
-    }
+    quicktime: &PpcQuickTimeState,
+) -> Option<(PpcQuickDrawSurface, (i16, i16, i16, i16))> {
     let gworld = if quicktime.movie_gworld != 0 {
         quicktime.movie_gworld
     } else {
         current_gworld
     };
-    let Some(surface) = ppc_live_quickdraw_surface(memory, gworlds, gworld) else {
-        return false;
-    };
-    let front_buffer = surface.front_buffer;
-    // Inside Macintosh: QuickTime Components (1993), p. 2-38: the bounds
-    // of an attached controller also position its movie.
-    let draw_rect = quicktime
+    let surface = ppc_live_quickdraw_surface(memory, gworlds, gworld)?;
+    let rect = quicktime
         .movie_controllers
         .iter()
         .rev()
@@ -5824,6 +6033,52 @@ pub(crate) fn ppc_qt_draw_movie_frame(
                     .contains(&controller.handle)
         })
         .map_or(quicktime.movie_box, |controller| controller.rect);
+    Some((surface, rect))
+}
+
+fn ppc_qt_movie_draw_key(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    current_gworld: u32,
+    quicktime: &PpcQuickTimeState,
+) -> Option<PpcQuickTimeMovieDrawKey> {
+    let (surface, rect) = ppc_qt_movie_draw_target(memory, gworlds, current_gworld, quicktime)?;
+    let palette = surface.ctable_handle.and_then(|handle| {
+        let table = memory.read_u32_be(handle)?;
+        Some((table, memory.read_u32_be(table)?))
+    });
+    let sample_index = quicktime
+        .movie_video_samples
+        .as_ref()
+        .and_then(|samples| ppc_qt_movie_timed_sample_index(quicktime, samples))
+        .unwrap_or(quicktime.movie_task_count as usize);
+    Some(PpcQuickTimeMovieDrawKey {
+        sample_index,
+        surface,
+        rect,
+        movie_box: quicktime.movie_box,
+        matrix: quicktime.movie_matrix,
+        clip: quicktime.movie_display_clip.clone(),
+        palette,
+    })
+}
+
+pub(crate) fn ppc_qt_draw_movie_frame(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    current_gworld: u32,
+    quicktime: &mut PpcQuickTimeState,
+    salt: u32,
+) -> bool {
+    if quicktime.movie_audio_track.is_some() && quicktime.movie_video_track.is_none() {
+        return false;
+    }
+    let Some((surface, draw_rect)) =
+        ppc_qt_movie_draw_target(memory, gworlds, current_gworld, quicktime)
+    else {
+        return false;
+    };
+    let front_buffer = surface.front_buffer;
     if let Some(drawn) = ppc_qt_draw_decoded_movie_frame(memory, surface, quicktime, draw_rect) {
         return drawn;
     }
@@ -5885,6 +6140,15 @@ fn ppc_qt_draw_decoded_movie_frame(
         return Some(false);
     }
 
+    // Snapshot the logical destination table once. Matching already quantizes
+    // RGB to 5:5:5, so the same 15-bit key is an exact per-draw lookup cache.
+    let indexed_clut = matches!(front_buffer.depth, 1 | 2 | 4 | 8)
+        .then(|| ppc_quickdraw_surface_clut(memory, surface, front_buffer.depth));
+    let mut index_cache = if indexed_clut.is_some() {
+        vec![u16::MAX; 1 << 15]
+    } else {
+        Vec::new()
+    };
     let mut wrote_any = false;
     for dst_y in dst_top..dst_bottom {
         for dst_x in dst_left..dst_right {
@@ -5920,8 +6184,21 @@ fn ppc_qt_draw_decoded_movie_frame(
                 green: u16::from(rgb[1]) * 257,
                 blue: u16::from(rgb[2]) * 257,
             };
-            let Some(pixel) = ppc_qt_graphics_pixel_value(memory, surface, color) else {
-                continue;
+            let pixel = if let Some(clut) = &indexed_clut {
+                let key = usize::from(ppc_rgb_color_to_rgb555(color));
+                if index_cache[key] == u16::MAX {
+                    index_cache[key] = u16::from(ppc_rgb_color_to_index_in_clut(
+                        color,
+                        clut,
+                        1usize << front_buffer.depth,
+                    ));
+                }
+                u32::from(index_cache[key])
+            } else {
+                let Some(pixel) = ppc_qt_graphics_pixel_value(memory, surface, color) else {
+                    continue;
+                };
+                pixel
             };
             if ppc_qt_write_graphics_pixel(
                 memory,

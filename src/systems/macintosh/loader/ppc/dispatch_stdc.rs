@@ -39,6 +39,18 @@ pub struct PpcQsortState {
     pub(super) swapped: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PpcBsearchState {
+    key: u32,
+    base: u32,
+    width: u32,
+    comparator: PpcCallbackTarget,
+    final_pc: u32,
+    restore_rtoc: u32,
+    lower: u32,
+    upper: u32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PpcStdSignalState {
     pub(super) handlers: [u32; 32],
@@ -64,6 +76,7 @@ pub(super) struct PpcStdCDispatchContext<'a> {
     pub(super) heap_cursor: &'a mut u32,
     pub(super) last_mem_error: &'a mut i16,
     pub(super) stdc_qsort_stack: &'a mut Vec<PpcQsortState>,
+    pub(super) stdc_bsearch_stack: &'a mut Vec<PpcBsearchState>,
     pub(super) stdc_signal_state: &'a mut PpcStdSignalState,
     pub(super) stdc_jmpbufs: &'a mut HashMap<u32, PpcStdJmpContext>,
 }
@@ -77,6 +90,7 @@ pub(super) fn dispatch_stdc_import(ctx: PpcStdCDispatchContext<'_>) -> Option<Pp
         heap_cursor,
         last_mem_error,
         stdc_qsort_stack,
+        stdc_bsearch_stack,
         stdc_signal_state,
         stdc_jmpbufs,
     } = ctx;
@@ -473,6 +487,7 @@ pub(super) fn dispatch_stdc_import(ctx: PpcStdCDispatchContext<'_>) -> Option<Pp
                 cpu,
                 memory,
                 stdc_qsort_stack,
+                stdc_bsearch_stack,
                 stdc_signal_state,
             ))
         }
@@ -507,7 +522,11 @@ pub(super) fn ppc_dispatch_stdc_signal(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpcStdCCompatibilityOperation {
+    PlStrcpy,
+    PlStrcat,
+    PlStrcmp,
     Qsort,
+    Bsearch,
     Signal,
     Sscanf,
     Strftime,
@@ -519,9 +538,15 @@ pub(super) fn ppc_dispatch_stdc_compatibility(
     cpu: &mut PpcCpu,
     memory: &mut PpcSectionMem,
     qsort_stack: &mut Vec<PpcQsortState>,
+    bsearch_stack: &mut Vec<PpcBsearchState>,
     signal_state: &mut PpcStdSignalState,
 ) -> PpcImportAction {
     match operation {
+        PpcStdCCompatibilityOperation::PlStrcpy
+        | PpcStdCCompatibilityOperation::PlStrcat
+        | PpcStdCCompatibilityOperation::PlStrcmp => {
+            ppc_dispatch_pascal_string(operation, cpu, memory)
+        }
         PpcStdCCompatibilityOperation::Signal => ppc_dispatch_stdc_signal(cpu, signal_state),
         PpcStdCCompatibilityOperation::Sscanf => {
             PpcImportAction::Return(ppc_dispatch_stdc_sscanf(cpu, memory))
@@ -530,10 +555,60 @@ pub(super) fn ppc_dispatch_stdc_compatibility(
             PpcImportAction::Return(ppc_dispatch_stdc_strftime(cpu, memory))
         }
         PpcStdCCompatibilityOperation::Qsort => ppc_dispatch_stdc_qsort(cpu, memory, qsort_stack),
+        PpcStdCCompatibilityOperation::Bsearch => {
+            ppc_dispatch_stdc_bsearch(cpu, memory, bsearch_stack)
+        }
         PpcStdCCompatibilityOperation::Vsprintf => {
             PpcImportAction::Return(ppc_std_vsprintf(cpu, memory))
         }
     }
+}
+
+fn ppc_dispatch_pascal_string(
+    operation: PpcStdCCompatibilityOperation,
+    cpu: &PpcCpu,
+    memory: &mut PpcSectionMem,
+) -> PpcImportAction {
+    // Apple PLStringFuncs.h: length-prefixed bytes (including embedded NULs),
+    // unsigned lexical comparison, and concatenation truncated to Str255.
+    let read = |memory: &mut PpcSectionMem, address| {
+        let length = memory.read_u8(address)?;
+        ppc_memory_read_bytes(memory, address, u32::from(length) + 1)
+    };
+    let destination = cpu.gpr[3];
+    let Some(source) = read(memory, cpu.gpr[4]) else {
+        return PpcImportAction::Halt;
+    };
+    let output = match operation {
+        PpcStdCCompatibilityOperation::PlStrcpy => source,
+        PpcStdCCompatibilityOperation::PlStrcat => {
+            let Some(mut output) = read(memory, destination) else {
+                return PpcImportAction::Halt;
+            };
+            let count = (256 - output.len()).min(source.len() - 1);
+            output.extend_from_slice(&source[1..1 + count]);
+            output[0] = (output.len() - 1) as u8;
+            output
+        }
+        PpcStdCCompatibilityOperation::PlStrcmp => {
+            let Some(first) = read(memory, destination) else {
+                return PpcImportAction::Halt;
+            };
+            let result: i16 = match first[1..].cmp(&source[1..]) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            return PpcImportAction::Return(i32::from(result) as u32);
+        }
+        _ => unreachable!("only Pascal-string operations reach this helper"),
+    };
+    if !ppc_memory_can_write_bytes(memory, destination, output.len() as u32)
+        || memory.write_bytes(destination, &output).is_none()
+    {
+        return PpcImportAction::Halt;
+    }
+    PpcImportAction::Return(destination)
 }
 
 pub(super) fn ppc_sscanf_store_integer(
@@ -1590,6 +1665,102 @@ pub(super) fn ppc_dispatch_stdc_qsort(
     ppc_qsort_compare_next(cpu, memory, state).unwrap_or_else(|| {
         states.pop();
         PpcImportAction::ReturnPreserve
+    })
+}
+
+fn ppc_bsearch_compare_next(
+    cpu: &mut PpcCpu,
+    memory: &mut PpcSectionMem,
+    state: PpcBsearchState,
+) -> Option<PpcImportAction> {
+    let index = state.lower + (state.upper - state.lower) / 2;
+    let element = state.base.checked_add(index.checked_mul(state.width)?)?;
+    install_powerpc_call_arguments(cpu, memory, &[state.key, element])?;
+    GuestCallEffect::call_guest(
+        GuestCallRequest::new(GuestCallTarget {
+            isa: GuestIsa::PowerPc,
+            entry: state.comparator.entry,
+            rtoc: state.comparator.rtoc,
+        }),
+        GuestCallContinuation::to_powerpc(
+            PPC_GUEST_CALL_RETURN_PC,
+            cpu.pc,
+            state.restore_rtoc,
+            PpcNativeReturnGpr3::Preserve,
+        ),
+    )
+    .into_ppc_import_action()
+}
+
+pub(super) fn ppc_dispatch_stdc_bsearch(
+    cpu: &mut PpcCpu,
+    memory: &mut PpcSectionMem,
+    states: &mut Vec<PpcBsearchState>,
+) -> PpcImportAction {
+    // C90 bsearch: callback(key, element), then return a matching element or
+    // NULL. Apple bsearch(3), BSD April 1994. Ordinary PPC C arguments use
+    // r3 onward, with callback linkage handled as for qsort above.
+    let state = if cpu.lr == cpu.pc {
+        let Some(mut state) = states.pop() else {
+            return PpcImportAction::Halt;
+        };
+        let middle = state.lower + (state.upper - state.lower) / 2;
+        match (cpu.gpr[3] as i32).cmp(&0) {
+            std::cmp::Ordering::Less => state.upper = middle,
+            std::cmp::Ordering::Greater => state.lower = middle + 1,
+            std::cmp::Ordering::Equal => {
+                cpu.lr = state.final_pc;
+                cpu.gpr[2] = state.restore_rtoc;
+                return PpcImportAction::Return(state.base + middle * state.width);
+            }
+        }
+        if state.lower == state.upper {
+            cpu.lr = state.final_pc;
+            cpu.gpr[2] = state.restore_rtoc;
+            return PpcImportAction::Return(0);
+        }
+        state
+    } else {
+        let (key, base, count, width, comparator_ptr) =
+            (cpu.gpr[3], cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]);
+        if count == 0 {
+            return PpcImportAction::Return(0);
+        }
+        // A real C array cannot wrap the 32-bit guest address space. Keep
+        // the key opaque: its type/size may differ from an array element.
+        if width == 0
+            || count
+                .checked_mul(width)
+                .and_then(|n| base.checked_add(n))
+                .is_none()
+        {
+            return PpcImportAction::Halt;
+        }
+        let Some(comparator) =
+            ppc_resolve_callback_target(memory, comparator_ptr, cpu.gpr[2], None)
+        else {
+            return PpcImportAction::Halt;
+        };
+        if memory.read_u32_be(comparator.entry).is_none() {
+            return PpcImportAction::Halt;
+        }
+        PpcBsearchState {
+            key,
+            base,
+            width,
+            comparator,
+            final_pc: cpu.lr,
+            restore_rtoc: cpu.gpr[2],
+            lower: 0,
+            upper: count,
+        }
+    };
+    states.push(state);
+    ppc_bsearch_compare_next(cpu, memory, state).unwrap_or_else(|| {
+        states.pop();
+        cpu.lr = state.final_pc;
+        cpu.gpr[2] = state.restore_rtoc;
+        PpcImportAction::Halt
     })
 }
 
