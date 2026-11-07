@@ -249,6 +249,91 @@ pub(crate) fn fill_rect_8bpp_68k(
     (top, left, bottom, right): (i16, i16, i16, i16),
     pattern: [u8; 8],
 ) -> Vec<u8> {
+    let rect = super::types::Rect {
+        top,
+        left,
+        bottom,
+        right,
+    };
+    on_8bpp_68k_port(fixture, |d, cpu, bus| {
+        d.draw_rect(cpu, bus, &rect, super::types::ShapeOp::Fill(pattern));
+    })
+}
+
+/// Runs the 68K `draw_oval` path on `fixture` and returns the pixel bytes.
+pub(crate) fn draw_oval_8bpp_68k(
+    fixture: &IndexedPortFixture<'_>,
+    rect: super::types::Rect,
+    op: super::types::ShapeOp,
+) -> Vec<u8> {
+    on_8bpp_68k_port(fixture, |d, cpu, bus| d.draw_oval(cpu, bus, &rect, op))
+}
+
+/// Runs the 68K `draw_round_rect` path on `fixture` and returns the pixel bytes.
+pub(crate) fn draw_round_rect_8bpp_68k(
+    fixture: &IndexedPortFixture<'_>,
+    rect: super::types::Rect,
+    (oval_width, oval_height): (i16, i16),
+    op: super::types::ShapeOp,
+) -> Vec<u8> {
+    on_8bpp_68k_port(fixture, |d, cpu, bus| {
+        d.draw_round_rect(cpu, bus, &rect, oval_width, oval_height, op)
+    })
+}
+
+/// Runs the 68K `draw_arc` path on `fixture` and returns the pixel bytes.
+pub(crate) fn draw_arc_8bpp_68k(
+    fixture: &IndexedPortFixture<'_>,
+    rect: super::types::Rect,
+    (start_angle, arc_angle): (i16, i16),
+    op: super::types::ShapeOp,
+) -> Vec<u8> {
+    on_8bpp_68k_port(fixture, |d, cpu, bus| {
+        d.draw_arc(cpu, bus, &rect, start_angle, arc_angle, op)
+    })
+}
+
+/// Runs the 68K `draw_poly` path on `fixture` for a polygon stored as `record`
+/// and returns the pixel bytes.
+pub(crate) fn draw_poly_8bpp_68k(
+    fixture: &IndexedPortFixture<'_>,
+    record: &[u8],
+    op: super::types::ShapeOp,
+) -> Vec<u8> {
+    on_8bpp_68k_port(fixture, |d, cpu, bus| {
+        let handle = bus.alloc(4);
+        let ptr = bus.alloc(record.len() as u32);
+        bus.write_bytes(ptr, record);
+        bus.write_long(handle, ptr);
+        d.draw_poly(cpu, bus, handle, op);
+    })
+}
+
+/// Runs the 68K SeedFill on a `words`-wide image with tightly packed rows and
+/// returns the destination bytes.
+pub(crate) fn seed_fill_68k(
+    source: &[u8],
+    height: i16,
+    words: i16,
+    (seed_h, seed_v): (i16, i16),
+) -> Vec<u8> {
+    let (_, _, mut bus) = setup();
+    let (src, dst) = (bus.alloc(source.len() as u32), bus.alloc(source.len() as u32));
+    bus.write_bytes(src, source);
+    bus.write_bytes(dst, &vec![0xa5; source.len()]);
+    let row = words * 2;
+    assert!(TrapDispatcher::seed_fill_1bpp_mask(
+        &mut bus, src, dst, row, row, height, words, seed_h, seed_v,
+    ));
+    bus.read_bytes(dst, source.len())
+}
+
+/// Builds `fixture` as the current 8-bit colour port of a 68K dispatcher, runs
+/// `draw` and returns the pixel bytes afterwards.
+fn on_8bpp_68k_port(
+    fixture: &IndexedPortFixture<'_>,
+    draw: impl FnOnce(&mut TrapDispatcher, &mut MockCpu, &mut MacMemoryBus),
+) -> Vec<u8> {
     let (mut d, mut cpu, mut bus) = setup();
     let base = bus.alloc(fixture.pixels.len() as u32);
     bus.write_bytes(base, fixture.pixels);
@@ -287,17 +372,6 @@ pub(crate) fn fill_rect_8bpp_68k(
     // fgColor and bkColor hold the resolved pixel values above.
     d.resolved_port_color_fields.insert(port, 0x03);
 
-    let rect = super::types::Rect {
-        top,
-        left,
-        bottom,
-        right,
-    };
-    d.draw_rect(
-        &mut cpu,
-        &mut bus,
-        &rect,
-        super::types::ShapeOp::Fill(pattern),
-    );
+    draw(&mut d, &mut cpu, &mut bus);
     bus.read_bytes(base, fixture.pixels.len())
 }

@@ -55,9 +55,6 @@ pub(super) fn ppc_fs_make_fsspec(
         return PPC_PARAM_ERR;
     }
 
-    let effective_vref = ppc_resolve_volume_ref_num(requested_vref);
-    let effective_dir_id =
-        ppc_resolve_directory_id(requested_vref, requested_dir_id, default_dir_id);
     let name_bytes = if name_ptr == 0 {
         Vec::new()
     } else {
@@ -65,6 +62,18 @@ pub(super) fn ppc_fs_make_fsspec(
             return PPC_PARAM_ERR;
         };
         bytes
+    };
+    // Files, table 2-10: a full pathname overrides both input identifiers.
+    let absolute_boot_name = ppc_absolute_boot_volume_name(&name_bytes);
+    let effective_vref = if absolute_boot_name.is_some() {
+        PPC_BOOT_VOLUME_REF_NUM
+    } else {
+        ppc_resolve_volume_ref_num(requested_vref)
+    };
+    let effective_dir_id = if absolute_boot_name.is_some() {
+        PPC_ROOT_DIR_ID
+    } else {
+        ppc_resolve_directory_id(requested_vref, requested_dir_id, default_dir_id)
     };
 
     let mut output_dir_id = effective_dir_id;
@@ -81,15 +90,30 @@ pub(super) fn ppc_fs_make_fsspec(
         &name_bytes,
     ) {
         if !name_bytes.is_empty() {
-            output_dir_id = ppc_parent_dir_id_for_path(vfs_directories, &target_path);
-            output_name_bytes = ppc_vfs_basename_bytes(&target_path);
+            if target_path.is_empty() {
+                // The root directory is named by its volume inside fsRtParID.
+                output_dir_id = 1;
+                output_name_bytes = encode_mac_roman_lossy(
+                    crate::trap::TrapDispatcher::boot_volume_name(),
+                );
+            } else {
+                output_dir_id = ppc_parent_dir_id_for_path(vfs_directories, &target_path);
+                output_name_bytes = ppc_vfs_basename_bytes(&target_path);
+            }
         }
         PPC_NO_ERR
     } else {
         // Inside Macintosh: Files (1992), pp. 2-28 and 2-35, 1-54:
         // a partial pathname names a leaf relative to the supplied directory;
         // fnfErr still returns a valid spec only when its parent exists.
-        match ppc_missing_partial_fsspec_leaf(vfs_directories, effective_dir_id, &name_bytes) {
+        let missing_name = if let Some(relative_name) = absolute_boot_name {
+            let mut partial_name = vec![b':'];
+            partial_name.extend_from_slice(relative_name);
+            partial_name
+        } else {
+            name_bytes.clone()
+        };
+        match ppc_missing_partial_fsspec_leaf(vfs_directories, effective_dir_id, &missing_name) {
             Ok((parent_dir_id, leaf_name)) => {
                 output_dir_id = parent_dir_id;
                 output_name_bytes = leaf_name;
@@ -125,6 +149,15 @@ pub(super) fn ppc_fs_make_fsspec(
         );
     }
     result
+}
+
+/// The boot-volume-relative suffix of an HFS full pathname, including the
+/// empty suffix that identifies the root directory itself.
+fn ppc_absolute_boot_volume_name(name: &[u8]) -> Option<&[u8]> {
+    let colon = name.iter().position(|&byte| byte == b':')?;
+    decode_mac_roman(&name[..colon])
+        .eq_ignore_ascii_case(crate::trap::TrapDispatcher::boot_volume_name())
+        .then_some(&name[colon + 1..])
 }
 
 fn ppc_missing_partial_fsspec_leaf(
@@ -175,6 +208,7 @@ pub(super) fn ppc_pb_get_cat_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     vfs_resources: &[PpcVfsResourceRecord],
     default_dir_id: u32,
+    working_directories: &HashMap<i16, ProcessWorkingDirectory>,
 ) -> i16 {
     let pb = cpu.gpr[3];
     if pb == 0 {
@@ -197,7 +231,16 @@ pub(super) fn ppc_pb_get_cat_info(
     let Some(requested_dir_id) = memory.read_u32_be(pb + 48) else {
         return PPC_PARAM_ERR;
     };
-    let effective_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
+    // Files, table 2-10: a working-directory reference with dirID zero
+    // selects that directory, rather than the containing volume's root.
+    let working_directory = working_directories.get(&vref);
+    let effective_dir_id = if requested_dir_id == 0 {
+        working_directory.map(|record| record.dir_id).unwrap_or_else(|| {
+            ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id)
+        })
+    } else {
+        requested_dir_id
+    };
     // A negative index selects the directory by ID. ioNamePtr is output-only,
     // including when its buffer does not yet contain a valid Pascal string.
     // Inside Macintosh: Files (1992), pp. 2-191 and 3-36.
@@ -220,7 +263,13 @@ pub(super) fn ppc_pb_get_cat_info(
                 .find(|volume| volume.name.eq_ignore_ascii_case(name))
         });
     let resolved_vref =
-        pathname_volume.map_or_else(|| ppc_resolve_volume_ref_num(vref), |volume| volume.ref_num);
+        pathname_volume.map_or_else(
+            || working_directory.map_or_else(
+                || ppc_resolve_volume_ref_num(vref),
+                |record| record.volume_ref_num,
+            ),
+            |volume| volume.ref_num,
+        );
     if !absolute_pathname
         && effective_dir_id > 1
         && ppc_directory_path_for_id(vfs_directories, effective_dir_id).is_none()
@@ -1937,6 +1986,12 @@ pub(super) fn ppc_resolved_fsspec_target_path(
 ) -> Option<String> {
     if name_bytes.is_empty() {
         return ppc_directory_path_for_id(vfs_directories, dir_id).map(str::to_string);
+    }
+    if let Some(relative_name) = ppc_absolute_boot_volume_name(name_bytes) {
+        let path = crate::trap::TrapDispatcher::normalize_hfs_path(
+            &decode_mac_roman(relative_name),
+        );
+        return ppc_vfs_target_path(vfs_directories, vfs_files, vfs_resource_files, &path);
     }
     let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, dir_id) else {
         return None;

@@ -68,38 +68,118 @@ pub(crate) fn ppc_set_pen_normal(memory: &mut PpcSectionMem, current_gworld: u32
     }
 }
 
-pub(crate) fn ppc_get_pen_state(memory: &mut PpcSectionMem, current_gworld: u32, state_ptr: u32) {
-    const PEN_STATE_SIZE: u32 = 18;
-    let Some(bytes) = ppc_memory_read_bytes(
-        memory,
-        current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_LOC_OFFSET),
-        PEN_STATE_SIZE,
-    ) else {
+/// `pnLoc`, `pnSize` and `pnMode`, the part of PenState every port stores
+/// contiguously at the same offsets.
+const PPC_PEN_STATE_HEADER_SIZE: u32 = 10;
+const PPC_PEN_STATE_SIZE: u32 = PPC_PEN_STATE_HEADER_SIZE + 8;
+const PPC_PORT_PN_PAT_OFFSET: u32 = PPC_CGRAF_PORT_PN_MODE_OFFSET + 2;
+const PPC_PIXPAT_PAT1_DATA_OFFSET: u32 = 20;
+
+fn ppc_port_is_color(memory: &mut PpcSectionMem, port: u32) -> bool {
+    memory
+        .read_u16_be(port.wrapping_add(6))
+        .is_some_and(|version| version & 0xc000 == 0xc000)
+}
+
+/// PenState.pnPat for a colour port, whose bytes at +58 are the pnPixPat and
+/// fillPixPat handles rather than a pattern: pat1Data of the installed PixPat
+/// (Imaging With QuickDraw (1994), p. 4-58), or the bit pattern from PenPat.
+fn ppc_color_port_pen_pattern(
+    memory: &mut PpcSectionMem,
+    port: u32,
+    bit_pattern: [u8; 8],
+) -> [u8; 8] {
+    let mut pattern = [0u8; 8];
+    let installed = memory
+        .read_u32_be(port.wrapping_add(PPC_PORT_PN_PAT_OFFSET))
+        .filter(|handle| *handle != 0)
+        .and_then(|handle| memory.read_u32_be(handle))
+        .filter(|record| *record != 0)
+        .and_then(|record| {
+            memory.read_bytes_into(
+                record.wrapping_add(PPC_PIXPAT_PAT1_DATA_OFFSET),
+                &mut pattern,
+            )
+        });
+    if installed.is_some() {
+        pattern
+    } else {
+        bit_pattern
+    }
+}
+
+pub(crate) fn ppc_get_pen_state(
+    memory: &mut PpcSectionMem,
+    current_gworld: u32,
+    state_ptr: u32,
+    bit_pattern: [u8; 8],
+) {
+    let pen = current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_LOC_OFFSET);
+    let size = if ppc_port_is_color(memory, current_gworld) {
+        PPC_PEN_STATE_HEADER_SIZE
+    } else {
+        PPC_PEN_STATE_SIZE
+    };
+    let Some(mut bytes) = ppc_memory_read_bytes(memory, pen, size) else {
         return;
     };
-    if ppc_memory_can_write_bytes(memory, state_ptr, PEN_STATE_SIZE) {
+    if size == PPC_PEN_STATE_HEADER_SIZE {
+        bytes.extend_from_slice(&ppc_color_port_pen_pattern(
+            memory,
+            current_gworld,
+            bit_pattern,
+        ));
+    }
+    if ppc_memory_can_write_bytes(memory, state_ptr, PPC_PEN_STATE_SIZE) {
         let _ = memory.write_bytes(state_ptr, &bytes);
     }
 }
 
-pub(crate) fn ppc_set_pen_state(memory: &mut PpcSectionMem, current_gworld: u32, state_ptr: u32) {
-    const PEN_STATE_SIZE: u32 = 18;
-    let Some(bytes) = ppc_memory_read_bytes(memory, state_ptr, PEN_STATE_SIZE) else {
-        return;
-    };
-    if ppc_memory_can_write_bytes(
-        memory,
-        current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_LOC_OFFSET),
-        PEN_STATE_SIZE,
-    ) {
-        // Imaging With QuickDraw (1994), pp. 3-37 and 3-43--3-44: PenState
-        // is the contiguous pnLoc, pnSize, pnMode, and 8-byte pnPat portion of
-        // the current graphics port, totaling 18 bytes.
-        let _ = memory.write_bytes(
-            current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_LOC_OFFSET),
-            &bytes,
-        );
+/// The pen values SetPenState installed that the dispatcher also holds outside
+/// the port.
+pub(crate) struct PpcRestoredPen {
+    pub(crate) location: (i16, i16),
+    pub(crate) pattern: [u8; 8],
+}
+
+pub(crate) fn ppc_set_pen_state(
+    memory: &mut PpcSectionMem,
+    current_gworld: u32,
+    state_ptr: u32,
+) -> Option<PpcRestoredPen> {
+    if state_ptr == 0 {
+        return None;
     }
+    let bytes = ppc_memory_read_bytes(memory, state_ptr, PPC_PEN_STATE_SIZE)?;
+    let pen = current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_LOC_OFFSET);
+    // Imaging With QuickDraw (1994), pp. 3-37 and 3-43--3-44: PenState is
+    // pnLoc, pnSize, pnMode and an 8-byte pnPat, 18 bytes in all. Only a basic
+    // GrafPort stores it contiguously. A colour port has the pnPixPat and
+    // fillPixPat handles where pnPat would be, so its pattern goes through the
+    // same path as PenPat: the fill pattern is untouched, and the selected
+    // PixPat is retired without disposing a caller-owned handle.
+    let color_port = ppc_port_is_color(memory, current_gworld);
+    let size = if color_port {
+        PPC_PEN_STATE_HEADER_SIZE
+    } else {
+        PPC_PEN_STATE_SIZE
+    };
+    if !ppc_memory_can_write_bytes(memory, pen, size) {
+        return None;
+    }
+    memory.write_bytes(pen, &bytes[..size as usize])?;
+    if color_port {
+        memory.write_u32_be(current_gworld.wrapping_add(PPC_PORT_PN_PAT_OFFSET), 0)?;
+    }
+    let mut pattern = [0u8; 8];
+    pattern.copy_from_slice(&bytes[PPC_PEN_STATE_HEADER_SIZE as usize..]);
+    Some(PpcRestoredPen {
+        location: (
+            i16::from_be_bytes([bytes[2], bytes[3]]),
+            i16::from_be_bytes([bytes[0], bytes[1]]),
+        ),
+        pattern,
+    })
 }
 
 pub(crate) fn ppc_sync_gworld_text(
@@ -1574,6 +1654,381 @@ pub(crate) fn ppc_frame_region(
         }
     }
     wrote
+}
+
+/// The oval inscribed in `rect` as one interval list per row from `rect.0`.
+pub(crate) fn ppc_oval_rows((top, left, bottom, right): (i16, i16, i16, i16)) -> Vec<Vec<i16>> {
+    TrapDispatcher::compute_oval_spans(right.saturating_sub(left), bottom.saturating_sub(top))
+        .into_iter()
+        .map(|(l, r)| vec![left.saturating_add(l), left.saturating_add(r)])
+        .collect()
+}
+
+/// A rounded rectangle as one interval list per row from `rect.0`.
+pub(crate) fn ppc_round_rect_rows(
+    (top, left, bottom, right): (i16, i16, i16, i16),
+    oval_width: i16,
+    oval_height: i16,
+) -> Vec<Vec<i16>> {
+    let shape = Rect {
+        top,
+        left,
+        bottom,
+        right,
+    };
+    TrapDispatcher::compute_rrect_spans(&shape, oval_width, oval_height)
+        .into_iter()
+        .map(|(l, r)| vec![l, r])
+        .collect()
+}
+
+/// A negative pnVis hides every shape verb, as in the 68K shape path.
+fn ppc_port_pen_hidden(memory: &mut PpcSectionMem, port: u32) -> bool {
+    memory
+        .read_u16_be(port.wrapping_add(PPC_CGRAF_PORT_PN_VIS_OFFSET))
+        .is_some_and(|visibility| (visibility as i16) < 0)
+}
+
+/// Intersects port-coordinate rows starting at `top` with visRgn and clipRgn.
+fn ppc_clip_rows_to_port(
+    memory: &mut PpcSectionMem,
+    current_gworld: u32,
+    top: i16,
+    rows: &mut [Vec<i16>],
+) -> Option<()> {
+    let bottom = top.checked_add(i16::try_from(rows.len()).ok()?)?;
+    for offset in [PPC_CGRAF_PORT_VIS_RGN_OFFSET, PPC_CGRAF_PORT_CLIP_RGN_OFFSET] {
+        let Some(storage) = memory
+            .read_u32_be(current_gworld.wrapping_add(offset))
+            .and_then(|region| ppc_region_storage(memory, region))
+        else {
+            continue;
+        };
+        let clip_rows = ppc_region_rows_for_band(&storage, top, bottom)?;
+        for (row, clip) in rows.iter_mut().zip(clip_rows) {
+            *row = ppc_region_intersect_rows(row, &clip);
+        }
+    }
+    Some(())
+}
+
+/// Complements the pixels of port-coordinate rows starting at `top`, clipped
+/// to visRgn and clipRgn, independent of the pen and colours.
+pub(crate) fn ppc_invert_rows(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    current_gworld: u32,
+    top: i16,
+    mut rows: Vec<Vec<i16>>,
+) -> bool {
+    if ppc_port_pen_hidden(memory, current_gworld) {
+        return false;
+    }
+    let Some(surface) = ppc_live_quickdraw_surface(memory, gworlds, current_gworld) else {
+        return false;
+    };
+    let front_buffer = surface.front_buffer;
+    let mask = match front_buffer.depth {
+        depth @ (1 | 2 | 4 | 8) => (1u16 << depth) - 1,
+        16 => 0x7fff,
+        _ => return false,
+    };
+    if ppc_clip_rows_to_port(memory, current_gworld, top, &mut rows).is_none() {
+        return false;
+    }
+    let mut wrote = false;
+    for (row, endpoints) in rows.iter().enumerate() {
+        let y = i32::from(top) + row as i32 - i32::from(surface.top);
+        if y < 0 || y >= front_buffer.height as i32 {
+            continue;
+        }
+        for interval in endpoints.chunks_exact(2) {
+            let left = (i32::from(interval[0]) - i32::from(surface.left)).max(0);
+            let right = (i32::from(interval[1]) - i32::from(surface.left))
+                .min(front_buffer.width as i32);
+            for x in left..right {
+                if let Some(pixel) = ppc_quickdraw_read_pixel(memory, front_buffer, (x, y)) {
+                    wrote |= ppc_invert_pixel_detail(memory, front_buffer, (x, y), pixel, mask);
+                }
+            }
+        }
+    }
+    wrote
+}
+
+/// Fills port-coordinate rows starting at `top` with a PixPat in patCopy mode,
+/// clipped to visRgn and clipRgn by `ppc_fill_rows_with_pixpat`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ppc_fill_color_rows(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    current_gworld: u32,
+    top: i16,
+    rows: Vec<Vec<i16>>,
+    ppat_handle: u32,
+    (fore_color, fore_index): (PpcRgbColor, Option<u8>),
+    (back_color, back_index): (PpcRgbColor, Option<u8>),
+) -> bool {
+    if ppc_port_pen_hidden(memory, current_gworld) {
+        return false;
+    }
+    let Some(bottom) = i16::try_from(rows.len())
+        .ok()
+        .and_then(|height| top.checked_add(height))
+    else {
+        return false;
+    };
+    let Some(surface) = ppc_live_quickdraw_surface(memory, gworlds, current_gworld) else {
+        return false;
+    };
+    let fore_pixel =
+        ppc_quickdraw_surface_fore_pixel(memory, surface, fore_color, fore_index).unwrap_or(1);
+    let back_pixel =
+        ppc_quickdraw_surface_fore_pixel(memory, surface, back_color, back_index).unwrap_or(0);
+    let sampler = ppc_decode_pixpat_sampler(memory, surface, ppat_handle, fore_pixel, back_pixel);
+    ppc_fill_rows_with_pixpat(
+        memory,
+        gworlds,
+        current_gworld,
+        top,
+        bottom,
+        rows,
+        &sampler,
+        8,
+    )
+}
+
+/// Fills port-coordinate rows starting at `top` with a bit pattern in patCopy
+/// mode, clipped to visRgn and clipRgn by `ppc_fill_rows_with_pixpat`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ppc_fill_mono_rows(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    current_gworld: u32,
+    top: i16,
+    rows: Vec<Vec<i16>>,
+    pat1: [u8; 8],
+    (fore_color, fore_index): (PpcRgbColor, Option<u8>),
+    (back_color, back_index): (PpcRgbColor, Option<u8>),
+) -> bool {
+    if ppc_port_pen_hidden(memory, current_gworld) {
+        return false;
+    }
+    let Some(bottom) = i16::try_from(rows.len())
+        .ok()
+        .and_then(|height| top.checked_add(height))
+    else {
+        return false;
+    };
+    let Some(surface) = ppc_live_quickdraw_surface(memory, gworlds, current_gworld) else {
+        return false;
+    };
+    let sampler = PpcPixPatSampler {
+        width: 8,
+        height: 8,
+        kind: PpcPixPatKind::Mono {
+            pat1,
+            fore_pixel: ppc_quickdraw_surface_fore_pixel(memory, surface, fore_color, fore_index)
+                .unwrap_or(1),
+            back_pixel: ppc_quickdraw_surface_fore_pixel(memory, surface, back_color, back_index)
+                .unwrap_or(0),
+        },
+    };
+    ppc_fill_rows_with_pixpat(
+        memory,
+        gworlds,
+        current_gworld,
+        top,
+        bottom,
+        rows,
+        &sampler,
+        8,
+    )
+}
+
+/// The wedge of the oval in `rect` as interval lists per row, limited to the
+/// port's pixel image, with the first row's port coordinate. Uses the same
+/// pixel-centre test as PowerPC PaintArc and the 68K `draw_arc`.
+pub(crate) fn ppc_arc_rows(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    current_gworld: u32,
+    (top, left, bottom, right): (i16, i16, i16, i16),
+    (start_angle, arc_angle): (i16, i16),
+) -> Option<(i16, Vec<Vec<i16>>)> {
+    let surface = ppc_live_quickdraw_surface(memory, gworlds, current_gworld)?;
+    let (width, height) = (i32::from(right) - i32::from(left), i32::from(bottom) - i32::from(top));
+    if width <= 0 || height <= 0 || arc_angle == 0 {
+        return None;
+    }
+    let mut a_start = f64::from(start_angle);
+    let mut a_extent = f64::from(arc_angle);
+    if a_extent < 0.0 {
+        a_start += a_extent;
+        a_extent = -a_extent;
+    }
+    let a_start = a_start.rem_euclid(360.0);
+    let a_end = a_start + a_extent.min(360.0);
+    let cx = (f64::from(left) + f64::from(right)) / 2.0;
+    let cy = (f64::from(top) + f64::from(bottom)) / 2.0;
+    let (rx, ry) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let covered = |x: i32, y: i32| {
+        let (ox, oy) = (f64::from(x) - cx + 0.5, f64::from(y) - cy + 0.5);
+        if (ox / rx).powi(2) + (oy / ry).powi(2) > 1.0 {
+            return false;
+        }
+        let mut mac_angle = 90.0 - (-oy).atan2(ox).to_degrees();
+        if mac_angle < 0.0 {
+            mac_angle += 360.0;
+        }
+        (mac_angle >= a_start && mac_angle < a_end) || (a_end > 360.0 && mac_angle + 360.0 < a_end)
+    };
+    let image_left = i32::from(surface.left);
+    let image_top = i32::from(surface.top);
+    let x0 = i32::from(left).max(image_left);
+    let x1 = i32::from(right).min(image_left + surface.front_buffer.width as i32);
+    let y0 = i32::from(top).max(image_top);
+    let y1 = i32::from(bottom).min(image_top + surface.front_buffer.height as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let rows = (y0..y1)
+        .map(|y| {
+            let mut row = Vec::new();
+            let mut start = None;
+            for x in x0..=x1 {
+                match (x < x1 && covered(x, y), start) {
+                    (true, None) => start = Some(x),
+                    (false, Some(from)) => {
+                        row.extend([from as i16, x as i16]);
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            row
+        })
+        .collect();
+    Some((i16::try_from(y0).ok()?, rows))
+}
+
+/// The bit images and geometry shared by SeedFill and CalcMask.
+#[derive(Clone, Copy)]
+pub(crate) struct PpcMaskImages {
+    pub(crate) source: u32,
+    pub(crate) destination: u32,
+    pub(crate) source_row: i16,
+    pub(crate) destination_row: i16,
+    pub(crate) height: i16,
+    pub(crate) words: i16,
+}
+
+/// The largest image either call processes, the 68K SeedFill limit.
+const PPC_MASK_MAX_PIXELS: usize = 4 * 1024 * 1024;
+
+/// SeedFill when `seed` holds (seedH, seedV), otherwise CalcMask.
+///
+/// SeedFill sets the bits 4-connected to the seed with the seed's value, as
+/// the 68K `seed_fill_1bpp_mask` does, and a seed outside the image clears the
+/// destination. CalcMask sets the bits paint cannot reach through 0 bits from
+/// any edge (Inside Macintosh Volume IV (1986), p. IV-22). A call with invalid
+/// geometry or inaccessible memory changes nothing.
+pub(crate) fn ppc_compute_bit_mask(
+    memory: &mut PpcSectionMem,
+    images: PpcMaskImages,
+    seed: Option<(i16, i16)>,
+) -> Option<()> {
+    let height = usize::try_from(images.height).ok().filter(|h| *h > 0)?;
+    let width_bytes = usize::try_from(images.words).ok().filter(|w| *w > 0)? * 2;
+    let width = width_bytes * 8;
+    let source_row = usize::try_from(images.source_row).ok()?;
+    let destination_row = usize::try_from(images.destination_row).ok()?;
+    if images.source == 0
+        || images.destination == 0
+        || source_row < width_bytes
+        || destination_row < width_bytes
+        || width * height > PPC_MASK_MAX_PIXELS
+    {
+        return None;
+    }
+
+    let row_address = |base: u32, row_bytes: usize, y: usize| base.wrapping_add((y * row_bytes) as u32);
+    let mut source = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let bytes = ppc_memory_read_bytes(
+            memory,
+            row_address(images.source, source_row, y),
+            width_bytes as u32,
+        )?;
+        source.extend((0..width).map(|x| bytes[x / 8] & (0x80 >> (x % 8)) != 0));
+    }
+    for y in 0..height {
+        if !ppc_memory_can_write_bytes(
+            memory,
+            row_address(images.destination, destination_row, y),
+            width_bytes as u32,
+        ) {
+            return None;
+        }
+    }
+
+    let mut stack = Vec::new();
+    let passable = match seed {
+        Some((h, v)) => {
+            let (x, y) = (usize::try_from(h).ok(), usize::try_from(v).ok());
+            match (x, y) {
+                (Some(x), Some(y)) if x < width && y < height => {
+                    stack.push((x, y));
+                    Some(source[y * width + x])
+                }
+                _ => None,
+            }
+        }
+        None => {
+            for y in 0..height {
+                stack.extend([(0, y), (width - 1, y)]);
+            }
+            for x in 0..width {
+                stack.extend([(x, 0), (x, height - 1)]);
+            }
+            Some(false)
+        }
+    };
+    let mut reached = vec![false; width * height];
+    if let Some(passable) = passable {
+        while let Some((x, y)) = stack.pop() {
+            let index = y * width + x;
+            if reached[index] || source[index] != passable {
+                continue;
+            }
+            reached[index] = true;
+            if x > 0 {
+                stack.push((x - 1, y));
+            }
+            if x + 1 < width {
+                stack.push((x + 1, y));
+            }
+            if y > 0 {
+                stack.push((x, y - 1));
+            }
+            if y + 1 < height {
+                stack.push((x, y + 1));
+            }
+        }
+    }
+
+    let mut bytes = vec![0u8; width_bytes];
+    for y in 0..height {
+        bytes.fill(0);
+        for x in 0..width {
+            // SeedFill sets what the flood reached, CalcMask what it did not.
+            if reached[y * width + x] == seed.is_some() {
+                bytes[x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+        memory.write_bytes(row_address(images.destination, destination_row, y), &bytes)?;
+    }
+    Some(())
 }
 
 pub(crate) fn ppc_invert_region(

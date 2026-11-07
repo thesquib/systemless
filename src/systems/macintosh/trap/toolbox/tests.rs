@@ -21767,3 +21767,232 @@ fn launchapplication_keeps_caller_identity_until_a_process_switch() {
         }
     }
 }
+fn classic_smc_movie_fixture() -> (TrapDispatcher, MacMemoryBus, u32, u32) {
+    use super::super::movie_media::{MediaSample, VideoTrack};
+    let (mut disp, _, mut bus) = setup();
+    let (movie, port, handle, pixmap, pixels) = (0x300000, 0x300100, 0x300200, 0x300300, 0x310000);
+    bus.write_word(port + 6, 0xC000);
+    bus.write_long(port + 2, handle);
+    bus.write_long(handle, pixmap);
+    bus.write_long(pixmap, pixels);
+    bus.write_word(pixmap + 4, 0x8000 | 32);
+    bus.write_word(pixmap + 32, 32);
+    let mut state = super::MovieState::new(0, -1, 0, (0, 0, 4, 8), 3, 60);
+    state.gworld_port = port;
+    // Two solid blocks, then preserve the left block and replace the right.
+    state.data_fork = vec![0, 0, 0, 6, 0x61, 1, 0, 0, 0, 7, 0x00, 0x60, 2];
+    state.media = Some(VideoTrack {
+        codec: *b"smc ",
+        width: 8,
+        height: 4,
+        depth: 8,
+        time_scale: 60,
+        samples: vec![
+            MediaSample {
+                offset: 0,
+                size: 6,
+                start_time: 0,
+                duration: 1,
+                sync: true,
+            },
+            MediaSample {
+                offset: 6,
+                size: 7,
+                start_time: 1,
+                duration: 1,
+                sync: false,
+            },
+        ],
+        clut: Some(vec![[0, 0, 0], [240, 16, 8], [8, 32, 224]]),
+    });
+    disp.movie_states.insert(movie, state);
+    (disp, bus, movie, pixels)
+}
+
+#[test]
+fn classic_smc_movie_renders_palette_deltas_and_backward_seek() {
+    let (mut disp, mut bus, movie, pixels) = classic_smc_movie_fixture();
+    // An uncached delta must reconstruct its reference frame first.
+    disp.render_movie_frame(&mut bus, movie, 1);
+    assert_eq!(bus.read_long(pixels), 0x00F01008);
+    assert_eq!(bus.read_long(pixels + 16), 0x000820E0);
+    assert_eq!(bus.read_long(pixels + 3 * 32 + 28), 0x000820E0);
+    assert_eq!(disp.movie_states[&movie].rendered_sample, Some(1));
+    disp.render_movie_frame(&mut bus, movie, 0);
+    assert_eq!(bus.read_long(pixels + 16), 0x00F01008);
+    disp.render_movie_frame(&mut bus, movie, 1);
+    assert_eq!(bus.read_long(pixels + 16), 0x000820E0);
+}
+
+#[test]
+fn classic_smc_movie_service_draws_without_advancing_the_clock() {
+    let (mut disp, mut bus, movie, pixels) = classic_smc_movie_fixture();
+    let now = disp.current_tick();
+    let state = disp.movie_states.get_mut(&movie).unwrap();
+    state.current_time = 1;
+    state.rate = 65536;
+    state.last_service_tick = Some(now);
+    disp.advance_and_render_active_movies(&mut bus);
+    assert_eq!(bus.read_long(pixels + 16), 0x000820E0);
+    assert_eq!(disp.movie_states[&movie].current_time, 1);
+    // The same sample is cached, so a second service does not decode again.
+    disp.movie_states.get_mut(&movie).unwrap().data_fork.clear();
+    disp.advance_and_render_active_movies(&mut bus);
+    assert_eq!(bus.read_long(pixels + 16), 0x000820E0);
+}
+
+#[test]
+fn classic_smc_movie_rejects_bad_deltas_without_publishing_partial_state() {
+    let (mut disp, mut bus, movie, pixels) = classic_smc_movie_fixture();
+    disp.render_movie_frame(&mut bus, movie, 0);
+    // Change the first block, then truncate before the second block opcode.
+    disp.movie_states.get_mut(&movie).unwrap().data_fork[10..].copy_from_slice(&[0x60, 2, 0xE0]);
+    disp.render_movie_frame(&mut bus, movie, 1);
+    assert_eq!(disp.movie_states[&movie].rendered_sample, Some(0));
+    assert_eq!(bus.read_long(pixels), 0x00F01008);
+    disp.movie_states.get_mut(&movie).unwrap().data_fork[10..].copy_from_slice(&[0x00, 0x60, 2]);
+    disp.render_movie_frame(&mut bus, movie, 1);
+    assert_eq!(bus.read_long(pixels), 0x00F01008);
+    assert_eq!(bus.read_long(pixels + 16), 0x000820E0);
+    // Unknown codecs and invalid SMC depths must not reach a decoder.
+    for (codec, depth) in [(*b"xxxx", 8), (*b"smc ", 16)] {
+        let state = disp.movie_states.get_mut(&movie).unwrap();
+        state.media.as_mut().unwrap().codec = codec;
+        state.media.as_mut().unwrap().depth = depth;
+        state.rendered_sample = None;
+        disp.render_movie_frame(&mut bus, movie, 0);
+        assert_eq!(disp.movie_states[&movie].rendered_sample, None);
+        assert_eq!(bus.read_long(pixels + 16), 0x000820E0);
+    }
+}
+
+#[test]
+fn classic_smc_movie_uses_standard_palette_when_no_inline_table_exists() {
+    let (mut disp, mut bus, movie, pixels) = classic_smc_movie_fixture();
+    disp.movie_states
+        .get_mut(&movie)
+        .unwrap()
+        .media
+        .as_mut()
+        .unwrap()
+        .clut = None;
+    disp.render_movie_frame(&mut bus, movie, 0);
+    let color = TrapDispatcher::standard_mac_8bpp_clut()[1];
+    let expected =
+        ((color[0] as u32 >> 8) << 16) | ((color[1] as u32 >> 8) << 8) | (color[2] as u32 >> 8);
+    assert_eq!(bus.read_long(pixels), expected);
+}
+
+fn lazy_movie_metadata_fixture() -> Vec<u8> {
+    let mut mvhd = vec![0; 20];
+    mvhd[12..16].copy_from_slice(&600u32.to_be_bytes());
+    mvhd[16..20].copy_from_slice(&240u32.to_be_bytes());
+    let mut tkhd = vec![0; 84];
+    tkhd[76..80].copy_from_slice(&(640u32 << 16).to_be_bytes());
+    tkhd[80..84].copy_from_slice(&(400u32 << 16).to_be_bytes());
+    let mut payload = quicktime_atom(*b"mvhd", &mvhd);
+    payload.extend(quicktime_atom(*b"trak", &quicktime_atom(*b"tkhd", &tkhd)));
+    quicktime_atom(*b"moov", &payload)
+}
+
+fn call_lazy_movie_from_file(
+    disp: &mut TrapDispatcher,
+    cpu: &mut MockCpu,
+    bus: &mut MacMemoryBus,
+    refnum: u16,
+    requested_id: i16,
+) -> (i16, u32) {
+    bus.write_long(0x300200, 0xBAD);
+    bus.write_word(0x300204, requested_id as u16);
+    bus.write_byte(0x300208, 0xCC);
+    bus.write_byte(0x300310, 0xCC);
+    cpu.write_reg(Register::A7, TEST_SP);
+    cpu.write_reg(Register::D0, 0x00F0);
+    bus.write_long(TEST_SP, 0x300310);
+    bus.write_word(TEST_SP + 4, 1);
+    bus.write_long(TEST_SP + 6, 0x300208);
+    bus.write_long(TEST_SP + 10, 0x300204);
+    bus.write_word(TEST_SP + 14, refnum);
+    bus.write_long(TEST_SP + 16, 0x300200);
+    bus.write_long(TEST_SP + 22, 0xBEEF_CAFE);
+    disp.dispatch_toolbox(true, 0x2AA, cpu, bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 20);
+    assert_eq!(bus.read_long(TEST_SP + 22), 0xBEEF_CAFE);
+    (bus.read_word(TEST_SP + 20) as i16, bus.read_long(0x300200))
+}
+
+#[test]
+fn movie_from_file_materializes_lazy_or_released_metadata_by_identity() {
+    for requested_id in [0, 128] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let refnum = 125;
+        disp.register_empty_resource_file(refnum);
+        disp.set_resource_file_name(refnum, "Movies/Lazy");
+        disp.insert_resource_pointer_for_test(refnum, (*b"moov", 128), 0);
+        disp.with_resource_file_mut_for_test(refnum, |file| {
+            file.names_by_id.insert((*b"moov", 128), "Lazy".into());
+        });
+        disp.remember_resource_backing_data(refnum, *b"moov", 128, lazy_movie_metadata_fixture());
+        disp.vfs.insert("Movies/Lazy".into(), vec![1, 2, 3, 4]);
+        // Selecting a movie reads its resource even when automatic GetResource
+        // loading is disabled; this must not change the application's flag.
+        bus.write_byte(0x0A5E, 0);
+        let (error, movie) =
+            call_lazy_movie_from_file(&mut disp, &mut cpu, &mut bus, refnum, requested_id);
+        assert_eq!(error, 0);
+        let state = &disp.movie_states[&movie];
+        assert_eq!(state.box_rect, (0, 0, 400, 640));
+        assert_eq!((state.duration, state.time_scale), (240, 600));
+        assert_eq!(state.data_fork, [1, 2, 3, 4]);
+        assert_eq!(bus.read_word(0x300204), 128);
+        assert_eq!(bus.read_pstring(0x300208), b"Lazy");
+        assert_eq!(bus.read_byte(0x300310), 0);
+        assert_eq!(bus.read_byte(0x0A5E), 0);
+    }
+}
+
+#[test]
+fn movie_from_file_keeps_resident_edits_and_explicit_id_selection() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let refnum = 126;
+    disp.register_empty_resource_file(refnum);
+    disp.set_resource_file_name(refnum, "Movies/Resident");
+    disp.install_named_test_resource_in_file(
+        &mut bus,
+        refnum,
+        *b"moov",
+        128,
+        "Live",
+        &lazy_movie_metadata_fixture(),
+    );
+    disp.remember_resource_backing_data(refnum, *b"moov", 128, vec![0; 4]);
+    disp.insert_resource_pointer_for_test(refnum, (*b"moov", 127), 0);
+    disp.remember_resource_backing_data(refnum, *b"moov", 127, vec![0; 4]);
+    let (error, movie) = call_lazy_movie_from_file(&mut disp, &mut cpu, &mut bus, refnum, 128);
+    assert_eq!(error, 0);
+    assert_eq!(disp.movie_states[&movie].box_rect, (0, 0, 400, 640));
+    assert_eq!(bus.read_pstring(0x300208), b"Live");
+}
+
+#[test]
+fn movie_from_file_missing_lazy_payload_reports_error_without_empty_movie() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let refnum = 127;
+    disp.register_empty_resource_file(refnum);
+    disp.set_resource_file_name(refnum, "Movies/Missing");
+    disp.insert_resource_pointer_for_test(refnum, (*b"moov", 128), 0);
+    // A present map entry whose payload cannot be loaded must not silently
+    // fall back to the data fork and return a different or empty movie.
+    disp.vfs
+        .insert("Movies/Missing".into(), lazy_movie_metadata_fixture());
+    let (error, movie) = call_lazy_movie_from_file(&mut disp, &mut cpu, &mut bus, refnum, 0);
+    assert_eq!(error, -2010);
+    assert_eq!(movie, 0);
+    assert!(disp.movie_states.is_empty());
+    assert_eq!(disp.movie_error, -2010);
+    assert_eq!(bus.read_word(0x300204), 0);
+    assert_eq!(bus.read_byte(0x300208), 0xCC);
+    assert_eq!(bus.read_byte(0x300310), 0xCC);
+}

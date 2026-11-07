@@ -1,6 +1,6 @@
 [package]
 name = "systemless"
-version = "0.110.0"
+version = "0.111.0"
 edition = "2021"
 rust-version = "1.93"
 # Emulator code is GPL-3.0-or-later.
@@ -29,7 +29,7 @@ include = [
 ]
 
 [workspace]
-members = ["www/tools/catalogue", "www"]
+members = ["www/tools/catalogue", "www", "www/api"]
 exclude = ["tests/toolbox-showcase/packer", ".agents/tools/play-oracle"]
 default-members = ["."]
 resolver = "2"

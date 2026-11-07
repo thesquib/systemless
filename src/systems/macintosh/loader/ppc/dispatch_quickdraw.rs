@@ -1153,6 +1153,165 @@ pub(super) fn dispatch_quickdraw_import(
             }
             Some(PpcImportAction::ReturnPreserve)
         }
+        PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::InvertOval) => {
+            // Imaging With QuickDraw (1994), p. 3-78: InvertOval complements
+            // the pixels of the oval and ignores the pen. Pictures record it
+            // as invertOval ($0053).
+            if let Some(rect) = ppc_read_rect(memory, cpu.gpr[3]) {
+                let rows = ppc_oval_rows(rect);
+                if let Some(commands) = ppc_open_picture_commands(toolbox_startup, current_gworld) {
+                    pict::recording_push_rect(commands, 0x0053, rect);
+                } else if toolbox_startup.open_region_port == current_gworld {
+                    ppc_open_region_include_rows(toolbox_startup, rect.0, rows);
+                } else {
+                    let _ = ppc_invert_rows(memory, gworlds, current_gworld, rect.0, rows);
+                }
+            }
+            Some(PpcImportAction::ReturnPreserve)
+        }
+        PpcImportDispatcherTarget::QuickDrawShape(
+            operation @ (PpcQuickDrawShapeOperation::FillCOval
+            | PpcQuickDrawShapeOperation::FillCRoundRect),
+        ) => {
+            // Imaging With QuickDraw (1994), pp. 4-75--4-76: fill the shape
+            // with the given pixel pattern in patCopy mode. Like FillCRect,
+            // this does not record into an open picture.
+            let Some(rect) = ppc_read_rect(memory, cpu.gpr[3]) else {
+                return Some(PpcImportAction::ReturnPreserve);
+            };
+            let (rows, pattern) = if operation == PpcQuickDrawShapeOperation::FillCOval {
+                (ppc_oval_rows(rect), cpu.gpr[4])
+            } else {
+                (
+                    ppc_round_rect_rows(rect, cpu.gpr[4] as u16 as i16, cpu.gpr[5] as u16 as i16),
+                    cpu.gpr[6],
+                )
+            };
+            if toolbox_startup.open_region_port == current_gworld {
+                ppc_open_region_include_rows(toolbox_startup, rect.0, rows);
+            } else if pattern != 0 {
+                let _ = ppc_fill_color_rows(
+                    memory,
+                    gworlds,
+                    current_gworld,
+                    rect.0,
+                    rows,
+                    pattern,
+                    (
+                        *quickdraw_fore_color,
+                        quickdraw_fore_indices.get(&current_gworld).copied(),
+                    ),
+                    (
+                        *quickdraw_back_color,
+                        toolbox_startup
+                            .quickdraw_back_indices
+                            .get(&current_gworld)
+                            .copied(),
+                    ),
+                );
+            }
+            Some(PpcImportAction::ReturnPreserve)
+        }
+        PpcImportDispatcherTarget::QuickDrawShape(
+            operation @ (PpcQuickDrawShapeOperation::EraseArc
+            | PpcQuickDrawShapeOperation::InvertArc
+            | PpcQuickDrawShapeOperation::FillArc
+            | PpcQuickDrawShapeOperation::FillCArc),
+        ) => {
+            // Imaging With QuickDraw (1994), pp. 3-73--3-77: wedges of the
+            // oval with 0 at 12 o'clock and positive angles clockwise. Arcs
+            // never add to a region being recorded.
+            if toolbox_startup.open_region_port == current_gworld {
+                return Some(PpcImportAction::ReturnPreserve);
+            }
+            let Some(rect) = ppc_read_rect(memory, cpu.gpr[3]) else {
+                return Some(PpcImportAction::ReturnPreserve);
+            };
+            let angles = (cpu.gpr[4] as u16 as i16, cpu.gpr[5] as u16 as i16);
+            let pattern = match operation {
+                PpcQuickDrawShapeOperation::EraseArc => Some(ppc_quickdraw_background_pattern(
+                    memory,
+                    current_gworld,
+                    toolbox_startup.quickdraw_back_pattern,
+                )),
+                PpcQuickDrawShapeOperation::FillArc => {
+                    let mut pattern = [0u8; 8];
+                    if memory.read_bytes_into(cpu.gpr[6], &mut pattern).is_none() {
+                        return Some(PpcImportAction::ReturnPreserve);
+                    }
+                    Some(pattern)
+                }
+                _ => None,
+            };
+            let opcode = match operation {
+                PpcQuickDrawShapeOperation::EraseArc => Some(0x0062),
+                PpcQuickDrawShapeOperation::InvertArc => Some(0x0063),
+                PpcQuickDrawShapeOperation::FillArc => Some(0x0064),
+                _ => None,
+            };
+            if let (Some(opcode), Some(commands)) = (
+                opcode,
+                ppc_open_picture_commands(toolbox_startup, current_gworld),
+            ) {
+                if operation == PpcQuickDrawShapeOperation::FillArc {
+                    pict::recording_push_word(commands, 0x000A); // FillPat
+                    commands.extend_from_slice(&pattern.unwrap_or([0; 8]));
+                }
+                pict::recording_push_rect(commands, opcode, rect);
+                pict::recording_push_word(commands, angles.0 as u16);
+                pict::recording_push_word(commands, angles.1 as u16);
+                return Some(PpcImportAction::ReturnPreserve);
+            }
+            let Some((top, rows)) =
+                ppc_arc_rows(memory, gworlds, current_gworld, rect, angles)
+            else {
+                return Some(PpcImportAction::ReturnPreserve);
+            };
+            let fore = (
+                *quickdraw_fore_color,
+                quickdraw_fore_indices.get(&current_gworld).copied(),
+            );
+            let back = (
+                *quickdraw_back_color,
+                toolbox_startup
+                    .quickdraw_back_indices
+                    .get(&current_gworld)
+                    .copied(),
+            );
+            match (operation, pattern) {
+                (PpcQuickDrawShapeOperation::InvertArc, _) => {
+                    let _ = ppc_invert_rows(memory, gworlds, current_gworld, top, rows);
+                }
+                (PpcQuickDrawShapeOperation::FillCArc, _) => {
+                    if cpu.gpr[6] != 0 {
+                        let _ = ppc_fill_color_rows(
+                            memory,
+                            gworlds,
+                            current_gworld,
+                            top,
+                            rows,
+                            cpu.gpr[6],
+                            fore,
+                            back,
+                        );
+                    }
+                }
+                (_, Some(pattern)) => {
+                    let _ = ppc_fill_mono_rows(
+                        memory,
+                        gworlds,
+                        current_gworld,
+                        top,
+                        rows,
+                        pattern,
+                        fore,
+                        back,
+                    );
+                }
+                _ => {}
+            }
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FrameArc) => {
             // Inside Macintosh: Imaging With QuickDraw (FrameArc): draws the
             // arc of the oval's outline with the pen; arcs are not added to
@@ -1599,11 +1758,19 @@ pub(super) fn dispatch_quickdraw_import(
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::GetPenState => {
-            ppc_get_pen_state(memory, current_gworld, cpu.gpr[3]);
+            ppc_get_pen_state(
+                memory,
+                current_gworld,
+                cpu.gpr[3],
+                toolbox_startup.quickdraw_pen_pattern,
+            );
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::SetPenState => {
-            ppc_set_pen_state(memory, current_gworld, cpu.gpr[3]);
+            if let Some(pen) = ppc_set_pen_state(memory, current_gworld, cpu.gpr[3]) {
+                (*quickdraw_pen_h, *quickdraw_pen_v) = pen.location;
+                toolbox_startup.quickdraw_pen_pattern = pen.pattern;
+            }
             Some(PpcImportAction::ReturnPreserve)
         }
         _ => None,
@@ -1614,6 +1781,20 @@ pub(super) fn dispatch_quickdraw_import(
 pub enum PpcQuickDrawShapeOperation {
     /// FillOval(const Rect *, const Pattern *)
     FillOval,
+    /// InvertOval(const Rect *)
+    InvertOval,
+    /// FillCOval(const Rect *, PixPatHandle)
+    FillCOval,
+    /// FillCRoundRect(const Rect *, short ovalWidth, short ovalHeight, PixPatHandle)
+    FillCRoundRect,
+    /// EraseArc(const Rect *, short startAngle, short arcAngle)
+    EraseArc,
+    /// InvertArc(const Rect *, short startAngle, short arcAngle)
+    InvertArc,
+    /// FillArc(const Rect *, short startAngle, short arcAngle, const Pattern *)
+    FillArc,
+    /// FillCArc(const Rect *, short startAngle, short arcAngle, PixPatHandle)
+    FillCArc,
     /// FrameArc(const Rect *, short startAngle, short arcAngle)
     FrameArc,
     /// StdRect(GrafVerb, const Rect *)
@@ -1644,6 +1825,8 @@ pub enum PpcQuickDrawCompatibilityOperation {
     Exp1To6,
     GetCPixel,
     GetPixel,
+    SeedFill,
+    CalcMask,
     GetEntryColor,
     GetEntryUsage,
     GetItemIcon,
@@ -2986,6 +3169,23 @@ pub(super) fn ppc_dispatch_quickdraw_compatibility(
                     }
                 }
             }
+            PpcImportAction::ReturnPreserve
+        }
+        PpcQuickDrawCompatibilityOperation::SeedFill
+        | PpcQuickDrawCompatibilityOperation::CalcMask => {
+            // Inside Macintosh Volume IV (1986), p. IV-22: raw bit images, not
+            // clipped to the port and not stored in pictures.
+            let image = PpcMaskImages {
+                source: cpu.gpr[3],
+                destination: cpu.gpr[4],
+                source_row: cpu.gpr[5] as u16 as i16,
+                destination_row: cpu.gpr[6] as u16 as i16,
+                height: cpu.gpr[7] as u16 as i16,
+                words: cpu.gpr[8] as u16 as i16,
+            };
+            let seed = matches!(operation, PpcQuickDrawCompatibilityOperation::SeedFill)
+                .then_some((cpu.gpr[9] as u16 as i16, cpu.gpr[10] as u16 as i16));
+            let _ = ppc_compute_bit_mask(memory, image, seed);
             PpcImportAction::ReturnPreserve
         }
         PpcQuickDrawCompatibilityOperation::PenPat => {

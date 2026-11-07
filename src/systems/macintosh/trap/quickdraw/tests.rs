@@ -16654,6 +16654,48 @@ fn copy_bits_converts_between_direct_color_depths() {
     }
 
     #[test]
+    fn plotcicon_draws_into_standard_grafport_with_shifted_bitmap_bounds() {
+        // Inside Macintosh Volume I, I-148: GrafPort.device precedes
+        // portBits, so its embedded BitMap begins at byte 2, not byte 0.
+        let (mut d, mut cpu, mut bus) = setup();
+        let destination = bus.alloc(4);
+        bus.write_bytes(destination, &[0x0F, 0xA5, 0xC3, 0x69]);
+        let port = bus.alloc(128);
+        bus.fill_zeros(port, 128);
+        bus.write_word(port, 0x1234); // device is not part of baseAddr
+        bus.write_long(port + 2, destination);
+        bus.write_word(port + 6, 2);
+        write_rect(&mut bus, port + 8, -2, -8, 0, 8);
+        write_rect(&mut bus, port + 16, -2, -8, 0, 8);
+        let globals = bus.read_long(cpu.read_reg(Register::A5));
+        bus.write_long(globals, port);
+        bus.write_long(TEST_SP, port);
+        d.dispatch_quickdraw(true, 0x073, &mut cpu, &mut bus)
+            .unwrap().unwrap();
+
+        let artwork = make_test_cicn_resource(0xF0, 0x00, 0x55);
+        d.install_test_resource(&mut bus, *b"cicn", 128, &artwork);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_word(TEST_SP, 128);
+        d.dispatch_quickdraw(true, 0x21E, &mut cpu, &mut bus)
+            .unwrap().unwrap();
+        let icon = bus.read_long(TEST_SP + 2);
+        assert_ne!(icon, 0);
+        let rect = bus.alloc(8);
+        write_rect(&mut bus, rect, -2, -8, -1, 0);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, icon);
+        bus.write_long(TEST_SP + 4, rect);
+        d.dispatch_quickdraw(true, 0x21F, &mut cpu, &mut bus)
+            .unwrap().unwrap();
+
+        assert_eq!(bus.read_bytes(destination, 4), [0x5F, 0xA5, 0xC3, 0x69]);
+        assert_eq!(bus.read_word(port), 0x1234);
+        assert_eq!(bus.read_long(port + 2), destination);
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+    }
+
+    #[test]
     fn plotcicon_consumes_theicon_and_therect_arguments() {
         // More Macintosh Toolbox (1993), p. 5-25: PlotCIcon is a
         // procedure with Rect and CIconHandle arguments.
@@ -16666,6 +16708,66 @@ fn copy_bits_converts_between_direct_color_depths() {
         let result = d.dispatch_quickdraw(true, 0x21F, &mut cpu, &mut bus);
         assert!(result.unwrap().is_ok());
         assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+    }
+
+    #[test]
+    fn plotcicon_uses_selected_port_when_a5_is_absent_or_unrelated() {
+        // PlotCIcon draws into the current graphics port selected by SetPort.
+        // A5 is application state, not a required pointer to QuickDraw globals.
+        let (mut d, mut cpu, mut bus) = setup();
+        let destination = bus.alloc(8);
+        let pixmap_handle = bus.alloc(4);
+        let pixmap = bus.alloc(64);
+        bus.fill_zeros(pixmap, 64);
+        bus.write_long(pixmap_handle, pixmap);
+        bus.write_long(pixmap, destination);
+        bus.write_word(pixmap + 4, 1);
+        write_rect(&mut bus, pixmap + 6, 0, 0, 1, 8);
+        bus.write_word(pixmap + 32, 1);
+        let port = bus.alloc(128);
+        bus.fill_zeros(port, 128);
+        bus.write_long(port + 2, pixmap_handle);
+        bus.write_word(port + 6, 0xC000);
+
+        bus.write_long(TEST_SP, port);
+        d.dispatch_quickdraw(true, 0x073, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+
+        let icon_data = make_test_cicn_resource(0xF0, 0x00, 0x55);
+        d.install_test_resource(&mut bus, *b"cicn", 128, &icon_data);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_word(TEST_SP, 128);
+        d.dispatch_quickdraw(true, 0x21E, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        let icon = bus.read_long(TEST_SP + 2);
+        assert_ne!(icon, 0);
+        let rect = 0x300120;
+        write_rect(&mut bus, rect, 0, 0, 1, 8);
+        let unrelated_a5 = bus.alloc(4);
+        let unrelated_globals = bus.alloc(4);
+        bus.write_long(unrelated_a5, unrelated_globals);
+        bus.write_long(unrelated_globals, 0);
+
+        for a5 in [0, unrelated_a5] {
+            cpu.write_reg(Register::A5, a5);
+            cpu.write_reg(Register::A7, TEST_SP);
+            bus.write_byte(destination, 0x0F);
+            bus.write_long(TEST_SP, icon);
+            bus.write_long(TEST_SP + 4, rect);
+            d.dispatch_quickdraw(true, 0x21F, &mut cpu, &mut bus)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                bus.read_byte(destination),
+                0x5F,
+                "the selected port receives the icon's masked pixels with A5={a5:#x}"
+            );
+            assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+            assert_eq!(cpu.read_reg(Register::A5), a5);
+            assert_eq!(bus.read_long(unrelated_globals), 0);
+        }
     }
 
     #[test]

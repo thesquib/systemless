@@ -1,6 +1,6 @@
 # Catalogue expansion targets: 1,000 entries
 
-Research snapshot: **10 October 2026**; qualification updates through **12 October 2026**. Scope: original classic Macintosh games for **68K and PowerPC**, including intact official demos, shareware distributions, and full games only where an applicable distribution grant can be established. This is an acquisition and qualification backlog, not permission to publish.
+Research snapshot: **10 October 2026**; qualification updates through **7 November 2026**. Scope: original classic Macintosh games for **68K and PowerPC**, including intact official demos, shareware distributions, and full games only where an applicable distribution grant can be established. This is an acquisition and qualification backlog, not permission to publish.
 
 ## Stocktake and arithmetic
 
@@ -125,8 +125,8 @@ Each number is an intake slot. The apparent catalogue total in the second column
 | 78 | 265 | Angband | Original 68K/PPC packages; see per-slice qualification | P | [Original grant, architecture and bounded evidence](catalogue/angband.md) |
 | 79 | 266 | Moria | Original 68K only; native/browser evidence | P | [Original grant, architecture and bounded evidence](catalogue/moria.md) |
 | 80 | 267 | Rogue | Original 68K only; pacing fix merged; private gameplay verified; public held | P | [Rights, architecture and gameplay/pacing evidence](CATALOGUE-SOURCES.md#rogue-iii-mac-release-6--primary-slot-80) |
-| 81 | 268 | MacSokoban | 68K lead | U | [Archive index](https://www.vintageapplemac.com/software/games/m/) |
-| 82 | 269 | Sokoban | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/s/) |
+| 81 | 268 | MacSokoban | Original 3.0.2/3.0.3 68K; retained exclusivity notices unresolved | U | [Publication hold #2303](https://github.com/benletchford/systemless/issues/2303) |
+| 82 | 269 | Sokoban | Original 2.4.2a 68K; push/control verified; browser pacing held | P | [Online grant and exact-package evidence](catalogue/sokoban.md); [#5711](https://github.com/benletchford/systemless/issues/5711) |
 | 83 | 270 | MacBrickout | 3.1 CODE / 4.1 native PPC; both unqualified | U | [Original package, independent parity and runtime evidence](CATALOGUE-SOURCES.md#macbrickout-41-original-package-and-current-startup) |
 | 84 | 271 | Pac the Man | Verify 68K/PPC | F | [Archive index](https://www.vintageapplemac.com/software/games/p/); [Garden](https://macintoshgarden.org/games/pac-the-man) |
 | 85 | 272 | PacMac Deluxe | 68K lead | U | [Archive index](https://www.vintageapplemac.com/software/games/p/) |
@@ -135,7 +135,7 @@ Each number is an intake slot. The apparent catalogue total in the second column
 | 88 | 275 | Oxyd | 68K lead | U | [Archive index](https://www.vintageapplemac.com/software/games/o/) |
 | 89 | 276 | per-oxyd | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/p/) |
 | 90 | 277 | Lode Runner 2 | PPC lead | D | [Demo index](https://classicmacdemos.com/lode-runner-2); [Archive index](https://www.vintageapplemac.com/software/games/l/) |
-| 91 | 278 | Mantra | 68K lead | U | [Archive index](https://www.vintageapplemac.com/software/games/m/) |
+| 91 | 278 | Mantra | Original 1.02 68K; private native/browser approved; released replay pending | P | [Original grant and qualification](catalogue/mantra.md); [#5656](https://github.com/benletchford/systemless/issues/5656) |
 | 92 | 279 | Mantra II | 68K lead | U | [Archive index](https://www.vintageapplemac.com/software/games/m/) |
 | 93 | 280 | Sapiens | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/s/) |
 | 94 | 281 | Macnopoly | 68K lead | U | [Archive index](https://www.vintageapplemac.com/software/games/m/) |
@@ -149,7 +149,7 @@ Each number is an intake slot. The apparent catalogue total in the second column
 | 102 | 289 | Mahjong | Original 1.0.5 International CODE-only 68K | P | [Original noncommercial grant; native and browser discard/replies verified](CATALOGUE-SOURCES.md#mahjong-105--primary-102-original-sti3-installer-intake); [#4672](https://github.com/benletchford/systemless/issues/4672)  [Qualified public v0.97.0 discard/replies](https://systemless.org/mahjong/) |
 | 103 | 290 | MacTaipei | Original CODE-only 68K; pair removal verified | U | [Exact original intake; scoped archival request, broader hosting held](CATALOGUE-SOURCES.md#mactaipei-10--primary-103-original-package-intake); [#4670](https://github.com/benletchford/systemless/issues/4670) |
 | 104 | 291 | Pegged | 68K verified; native PPC absent | U | [Archive index](https://www.vintageapplemac.com/software/games/p/) |
-| 105 | 292 | Powerball | Original 1.3: actual 68K + PPC | P | [Original non-profit grant; seven files/fourteen forks matched; startup blockers](CATALOGUE-SOURCES.md#powerball-13--primary-105-original-fat-shareware-intake); [#4681](https://github.com/benletchford/systemless/issues/4681) |
+| 105 | 292 | Powerball | Original 1.3: actual 68K + PPC | P | [Original non-profit grant; seven files/fourteen forks matched; dual-CPU bounded approval, release pending](CATALOGUE-SOURCES.md#powerball-13--primary-105-original-fat-shareware-intake); [#4681](https://github.com/benletchford/systemless/issues/4681) |
 | 106 | 293 | Brickles Plus | Original 3.0: 68K only | U | [Original package and bounded probes; hosting grant unresolved](CATALOGUE-SOURCES.md#brickles-plus-30-original-package-and-bounded-probes) |
 | 107 | 294 | Brick Attack | Original 1.0: PPC only | P | [Original non-profit grant; exact package/forks; paddle and library rights held](CATALOGUE-SOURCES.md#brick-attack-10--primary-107-original-ppc-shareware-intake); [#4689](https://github.com/benletchford/systemless/issues/4689) |
 | 108 | 295 | Bubbles | Original 1.3: PPC verified | P | [Original Internet grant; native and hosted-browser gameplay verified; launch approved](CATALOGUE-SOURCES.md#bubbles-13--primary-108-original-ppc-shareware-intake); [entry #4719](https://github.com/benletchford/systemless/pull/4719); [qualified public v0.97.0 gameplay](https://systemless.org/bubbles/) |
@@ -596,7 +596,7 @@ Each number is an intake slot. The apparent catalogue total in the second column
 | 539 | 726 | Tablut | Verify 68K/PPC | U | [Garden](https://macintoshgarden.org/games/tablut) |
 | 540 | 727 | Ultimaze | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/u/) |
 | 541 | 728 | Vic Kombat | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/v/) |
-| 542 | 729 | War of Flowers | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/w/) |
+| 542 | 729 | War of Flowers | Original 1.1; native 68K card turn verified; browser/rendering pending | P | [Original-package grant and evidence](catalogue/war-of-flowers.md); [#2316](https://github.com/benletchford/systemless/issues/2316) |
 | 543 | 730 | X-Moto | Verify 68K/PPC | U | [Garden](https://macintoshgarden.org/games/x-moto) |
 | 544 | 731 | Yipe III | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/y/) |
 | 545 | 732 | Zauron | Verify 68K/PPC | U | [Garden](https://macintoshgarden.org/games/zauron) |
@@ -689,7 +689,7 @@ Each number is an intake slot. The apparent catalogue total in the second column
 | 627 | 814 | Galactic Revolt | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/g/) |
 | 628 | 815 | Haunted House | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/t/) |
 | 629 | 816 | Invaders! | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/i/) |
-| 630 | 817 | JSokoban | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/j/) |
+| 630 | 817 | JSokoban | Original 1.0b13 68K; native/browser push and pacing approved; released replay pending | P | [Original complete-package grant and evidence](catalogue/jsokoban.md); [#2279](https://github.com/benletchford/systemless/issues/2279) |
 | 631 | 818 | Killer Dice | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/k/) |
 | 632 | 819 | Lazer Zone | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/l/) |
 | 633 | 820 | Mac Libs | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/m/) |
@@ -924,7 +924,7 @@ On 2026-10-11, reserve R62 was corrected from WadTyper for Doom to NetHack 3.3.1
 | R40 | The Orbs | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/t/) |
 | R41 | Valerie Porter and the Scarlet Scandal | Verify 68K/PPC | U | [Garden](https://macintoshgarden.org/games/valerie-porter-and-the-scarlet-scandal) |
 | R42 | Wadtool | Verify 68K/PPC | U | [Garden](https://macintoshgarden.org/games/wadtool) |
-| R43 | Antibody | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/a/) |
+| R43 | Antibody | Original fat 1.0.0; both native CPUs verified; browser qualification held | P | [Original complete-package grant and evidence](catalogue/antibody.md); [#2308](https://github.com/benletchford/systemless/issues/2308) |
 | R44 | Bedlam | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/b/) |
 | R45 | Catch the Bunny II | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/c/) |
 | R46 | Desk Fighter | Verify 68K/PPC | U | [Archive index](https://www.vintageapplemac.com/software/games/d/) |

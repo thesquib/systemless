@@ -308,6 +308,10 @@ pub enum PpcImportDispatcherTarget {
     FramePoly,
     FillPoly,
     ErasePoly,
+    InvertPoly,
+    FillCPoly,
+    OffsetPoly,
+    MapPoly,
     NewCWindow,
     GetNewCWindow,
     GetWRefCon,
@@ -1349,6 +1353,7 @@ pub enum PpcImportDispatcherTarget {
     QtBeginFullScreen,
     QtEndFullScreen,
     QtEnterMovies,
+    QtAlignScreenRect,
     QtExitMovies,
     QtGetMoviesError,
     QtGetMoviesStickyError,
@@ -1419,6 +1424,7 @@ pub enum PpcImportDispatcherTarget {
     CallUniversalProc,
     CallOSTrapUniversalProc,
     NGetTrapAddress,
+    TrapAvailable,
     GetToolTrapAddress,
     GetOSTrapAddress,
     LMGetCurrentA5,
@@ -2737,6 +2743,7 @@ pub(crate) fn dispatcher_target_for_import(
         // point Systemless releases all guest state together.
         ("StdCLib", "atexit") => PpcImportDispatcherTarget::ReturnNoErr,
         ("StdCLib", "clock") => PpcImportDispatcherTarget::TickCount,
+        ("StdCLib", "TrapAvailable") => PpcImportDispatcherTarget::TrapAvailable,
         ("StdCLib", "memset") => PpcImportDispatcherTarget::StdMemset,
         ("StdCLib", "memcmp") => PpcImportDispatcherTarget::StdMemcmp,
         ("StdCLib", "memcpy") => PpcImportDispatcherTarget::StdMemcpy,
@@ -3694,6 +3701,10 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "FramePoly") => PpcImportDispatcherTarget::FramePoly,
         ("InterfaceLib", "FillPoly") => PpcImportDispatcherTarget::FillPoly,
         ("InterfaceLib", "ErasePoly") => PpcImportDispatcherTarget::ErasePoly,
+        ("InterfaceLib", "InvertPoly") => PpcImportDispatcherTarget::InvertPoly,
+        ("InterfaceLib", "FillCPoly") => PpcImportDispatcherTarget::FillCPoly,
+        ("InterfaceLib", "OffsetPoly") => PpcImportDispatcherTarget::OffsetPoly,
+        ("InterfaceLib", "MapPoly") => PpcImportDispatcherTarget::MapPoly,
         ("InterfaceLib" | "AppearanceLib" | "CarbonLib", "NewCWindow" | "newcwindow") => {
             PpcImportDispatcherTarget::NewCWindow
         }
@@ -4127,6 +4138,27 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "DisposeIconSuite") => PpcImportDispatcherTarget::DisposeIconSuite,
         ("InterfaceLib", "FillOval") => {
             PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FillOval)
+        }
+        ("InterfaceLib", "InvertOval") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::InvertOval)
+        }
+        ("InterfaceLib", "FillCOval") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FillCOval)
+        }
+        ("InterfaceLib", "FillCRoundRect") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FillCRoundRect)
+        }
+        ("InterfaceLib", "EraseArc") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::EraseArc)
+        }
+        ("InterfaceLib", "InvertArc") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::InvertArc)
+        }
+        ("InterfaceLib", "FillArc") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FillArc)
+        }
+        ("InterfaceLib", "FillCArc") => {
+            PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FillCArc)
         }
         ("InterfaceLib", "FrameArc") => {
             PpcImportDispatcherTarget::QuickDrawShape(PpcQuickDrawShapeOperation::FrameArc)
@@ -5528,6 +5560,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("QuickTimeLib", "CloseMovieFile") => PpcImportDispatcherTarget::QtCloseMovieFile,
         ("QuickTimeLib", "BeginFullScreen") => PpcImportDispatcherTarget::QtBeginFullScreen,
         ("QuickTimeLib", "EndFullScreen") => PpcImportDispatcherTarget::QtEndFullScreen,
+        ("QuickTimeLib", "AlignScreenRect") => PpcImportDispatcherTarget::QtAlignScreenRect,
         ("QuickTimeLib", "EnterMovies") => PpcImportDispatcherTarget::QtEnterMovies,
         ("QuickTimeLib", "ExitMovies") => PpcImportDispatcherTarget::QtExitMovies,
         ("QuickTimeLib", "GetMoviesError") => PpcImportDispatcherTarget::QtGetMoviesError,
@@ -6549,6 +6582,12 @@ pub(crate) fn dispatcher_target_for_import(
                 PpcQuickDrawCompatibilityOperation::DisposePixPat,
             )
         }
+        ("InterfaceLib", "SeedFill") => PpcImportDispatcherTarget::QuickDrawCompatibility(
+            PpcQuickDrawCompatibilityOperation::SeedFill,
+        ),
+        ("InterfaceLib", "CalcMask") => PpcImportDispatcherTarget::QuickDrawCompatibility(
+            PpcQuickDrawCompatibilityOperation::CalcMask,
+        ),
         ("InterfaceLib", "Exp1to3") => PpcImportDispatcherTarget::QuickDrawCompatibility(
             PpcQuickDrawCompatibilityOperation::Exp1To3,
         ),
@@ -7645,6 +7684,18 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("MathLib", "str2dec") => {
             PpcImportDispatcherTarget::MathCompatibility(PpcMathCompatibilityOperation::Str2Dec)
+        }
+        ("StdCLib", "PLstrcpy") => {
+            PpcImportDispatcherTarget::StdCCompatibility(PpcStdCCompatibilityOperation::PlStrcpy)
+        }
+        ("StdCLib", "PLstrcat") => {
+            PpcImportDispatcherTarget::StdCCompatibility(PpcStdCCompatibilityOperation::PlStrcat)
+        }
+        ("StdCLib", "PLstrcmp") => {
+            PpcImportDispatcherTarget::StdCCompatibility(PpcStdCCompatibilityOperation::PlStrcmp)
+        }
+        ("StdCLib", "bsearch") => {
+            PpcImportDispatcherTarget::StdCCompatibility(PpcStdCCompatibilityOperation::Bsearch)
         }
         ("StdCLib", "qsort") => {
             PpcImportDispatcherTarget::StdCCompatibility(PpcStdCCompatibilityOperation::Qsort)
