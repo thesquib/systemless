@@ -862,40 +862,6 @@ fn record_movie_error(dispatcher: &mut super::TrapDispatcher, err: i16) {
     }
 }
 
-/// Read a QuickDraw ColorTable (via its CTabHandle) into a 256-entry RGB
-/// palette for nearest-colour matching. Missing/short tables fall back to the
-/// standard Macintosh 8-bit CLUT. ColorTable layout: ctSeed(4) ctFlags(2)
-/// ctSize(2) then (ctSize+1) ColorSpec entries of value(2) r(2) g(2) b(2).
-fn read_color_table(bus: &MacMemoryBus, ctab_handle: u32) -> Vec<[u8; 3]> {
-    let mut palette: Vec<[u8; 3]> = super::TrapDispatcher::standard_mac_8bpp_clut()
-        .iter()
-        .map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8])
-        .collect();
-    if ctab_handle == 0 {
-        return palette;
-    }
-    let ctab = bus.read_long(ctab_handle);
-    if ctab == 0 {
-        return palette;
-    }
-    let ct_size = bus.read_word(ctab + 6) as i16;
-    if ct_size < 0 {
-        return palette;
-    }
-    let count = (ct_size as usize + 1).min(256);
-    for i in 0..count {
-        let entry = ctab + 8 + (i as u32) * 8;
-        let value = bus.read_word(entry) as usize;
-        let r = (bus.read_word(entry + 2) >> 8) as u8;
-        let g = (bus.read_word(entry + 4) >> 8) as u8;
-        let b = (bus.read_word(entry + 6) >> 8) as u8;
-        // ColorSpec.value is the palette index for indexed device tables.
-        let idx = if value < 256 { value } else { i };
-        palette[idx] = [r, g, b];
-    }
-    palette
-}
-
 /// Nearest palette index by squared Euclidean distance in RGB.
 fn nearest_color_index(palette: &[[u8; 3]], r: u8, g: u8, b: u8) -> u8 {
     let mut best = 0usize;
@@ -5346,7 +5312,7 @@ impl super::TrapDispatcher {
                 }
                 state.current_time = new_time.clamp(0, state.duration as i64) as i32;
                 let has_video = state.media.as_ref().is_some_and(|m| {
-                    (&m.codec == b"cvid" || &m.codec == b"rle ") && !m.samples.is_empty()
+                    matches!(&m.codec, b"cvid" | b"rle " | b"smc ") && !m.samples.is_empty()
                 });
                 (finished, state.current_time, has_video)
             };
@@ -5364,7 +5330,7 @@ impl super::TrapDispatcher {
         }
     }
 
-    /// Decode the Cinepak video sample due at `movie_time` (in the movie's
+    /// Decode the video sample due at `movie_time` (in the movie's
     /// time scale) and blit it into the movie's destination GWorld pixmap.
     /// Inter-coded frames are decoded forward from the nearest preceding sync
     /// sample so the reconstructed frame is correct after a seek.
@@ -5375,7 +5341,7 @@ impl super::TrapDispatcher {
         let Some(media) = state.media.as_ref() else {
             return;
         };
-        if media.samples.is_empty() {
+        if media.samples.is_empty() || !matches!(&media.codec, b"cvid" | b"rle " | b"smc ") {
             return;
         }
         // Map movie time to this track's media time scale.
@@ -5410,12 +5376,58 @@ impl super::TrapDispatcher {
         };
 
         let is_rle = &media.codec == b"rle ";
-        // The rle path maps indices through the track's embedded CLUT.
-        let clut = media.clut.clone();
+        // Indexed paths map through the track CLUT; SMC without an inline
+        // table uses the standard 8-bit Macintosh palette.
+        let clut = media.clut.clone().or_else(|| {
+            (&media.codec == b"smc ").then(|| {
+                Self::standard_mac_8bpp_clut()
+                    .into_iter()
+                    .map(|color| color.map(|component| (component >> 8) as u8))
+                    .collect()
+            })
+        });
 
         // Decode the reference chain; keep the final RGB frame to blit.
         let mut frame_rgb: Option<Vec<u8>> = None;
-        if is_rle {
+        if &media.codec == b"smc " {
+            if media.depth != 8 {
+                return;
+            }
+            // SMC dictionaries can outlive a sync sample. Replay from the
+            // beginning after a seek, and publish state only after every
+            // intervening delta has decoded successfully.
+            let (mut decoder, start) = match (state.rendered_sample, &state.smc_decoder) {
+                (Some(previous), Some(decoder)) if previous < target => {
+                    (decoder.clone(), previous + 1)
+                }
+                _ => (super::smc::SmcDecoder::new(width, height), 0),
+            };
+            for i in start..=target {
+                let sample = &media.samples[i];
+                let Some(end) = sample.offset.checked_add(sample.size) else {
+                    return;
+                };
+                let Some(bytes) = state.data_fork.get(sample.offset..end) else {
+                    return;
+                };
+                let Ok(indices) = decoder.decode(bytes) else {
+                    return;
+                };
+                if i == target {
+                    let mut rgb = vec![0; width * height * 3];
+                    for (pixel, &index) in indices.iter().enumerate() {
+                        let color = clut
+                            .as_ref()
+                            .and_then(|p| p.get(index as usize))
+                            .copied()
+                            .unwrap_or([0, 0, 0]);
+                        rgb[pixel * 3..pixel * 3 + 3].copy_from_slice(&color);
+                    }
+                    frame_rgb = Some(rgb);
+                }
+            }
+            state.smc_decoder = Some(decoder);
+        } else if is_rle {
             if state.rle_decoder.is_none() {
                 state.rle_decoder = Some(super::qtrle::QtRleDecoder::new(width, height));
             }
@@ -5484,13 +5496,14 @@ impl super::TrapDispatcher {
             );
         }
 
-        Self::blit_rgb_into_port(bus, port, box_rect, width, height, &rgb);
+        self.blit_rgb_into_port(bus, port, box_rect, width, height, &rgb);
     }
 
     /// Blit a `width`×`height` RGB frame into a QuickDraw port's pixmap,
     /// positioned at the movie box origin. Handles 8-bit (nearest CLUT match),
     /// 16-bit (RGB555), and 32-bit destinations.
     fn blit_rgb_into_port(
+        &self,
         bus: &mut MacMemoryBus,
         port: u32,
         box_rect: (i16, i16, i16, i16),
@@ -5546,7 +5559,12 @@ impl super::TrapDispatcher {
         // Cache RGB→index results across the frame: movie palettes are small,
         // so this collapses the per-pixel 256-way nearest search to a hash hit.
         let palette: Option<Vec<[u8; 3]>> = if pixel_size == 8 {
-            Some(read_color_table(bus, ctab))
+            Some(
+                self.read_port_clut(bus, ctab)
+                    .into_iter()
+                    .map(|color| color.map(|component| (component >> 8) as u8))
+                    .collect(),
+            )
         } else {
             None
         };
@@ -15040,57 +15058,35 @@ impl super::TrapDispatcher {
                             0
                         };
 
-                        let mut selected_resource: Option<(i16, String, Vec<u8>)> = None;
-                        if requested_id != -1 {
-                            if let Some(resources) = self.resources.as_ref() {
-                                if let Some(file) = resources.files.get(&res_refnum) {
-                                    if requested_id != 0
-                                        && file.loaded.contains_key(&(*b"moov", requested_id))
-                                    {
-                                        let name = file
-                                            .names_by_id
-                                            .get(&(*b"moov", requested_id))
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        let data_ptr = file.loaded[&(*b"moov", requested_id)];
-                                        selected_resource = Some((
-                                            requested_id,
-                                            name,
-                                            read_allocated_bytes(bus, data_ptr),
-                                        ));
-                                    } else if requested_id == 0 {
-                                        let mut ids: Vec<i16> = file
-                                            .loaded
-                                            .keys()
-                                            .filter_map(|(res_type, id)| {
-                                                (*res_type == *b"moov").then_some(*id)
-                                            })
-                                            .collect();
-                                        ids.sort_unstable();
-                                        if let Some(id) = ids.first().copied() {
-                                            let name = file
-                                                .names_by_id
-                                                .get(&(*b"moov", id))
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if let Some(&data_ptr) =
-                                                file.loaded.get(&(*b"moov", id))
-                                            {
-                                                selected_resource = Some((
-                                                    id,
-                                                    name,
-                                                    read_allocated_bytes(bus, data_ptr),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // Resource maps contain unloaded entries with a zero data
+                        // pointer. Select the identity first, then materialize it
+                        // through the Resource Manager before reading the bytes.
+                        let selected_resource = self.resources.as_ref().and_then(|resources| {
+                            let file = resources.files.get(&res_refnum)?;
+                            let id = if requested_id == 0 {
+                                file.loaded
+                                    .keys()
+                                    .filter_map(|(kind, id)| (*kind == *b"moov").then_some(*id))
+                                    .min()?
+                            } else if requested_id != -1
+                                && file.loaded.contains_key(&(*b"moov", requested_id))
+                            {
+                                requested_id
+                            } else {
+                                return None;
+                            };
+                            let name = file
+                                .names_by_id
+                                .get(&(*b"moov", id))
+                                .cloned()
+                                .unwrap_or_default();
+                            Some((id, name))
+                        });
 
                         let file_name = self.resource_file_name(res_refnum).map(str::to_owned);
-                        let selected_movie = if selected_resource.is_some() {
-                            selected_resource
+                        let selected_movie = if let Some((id, name)) = selected_resource {
+                            self.find_or_load_resource_in_file(bus, res_refnum, *b"moov", id)
+                                .map(|(_, ptr)| (id, name, read_allocated_bytes(bus, ptr)))
                         } else if requested_id == 0 || requested_id == -1 {
                             file_name.as_ref().and_then(|name| {
                                 self.vfs
@@ -18498,3 +18494,6 @@ impl super::TrapDispatcher {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod movie_palette_tests;

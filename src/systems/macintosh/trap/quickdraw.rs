@@ -9991,10 +9991,21 @@ impl super::TrapDispatcher {
                     return Some(Ok(()));
                 }
 
-                // Get current port's pixmap for destination
-                let a5 = cpu.read_reg(Register::A5);
-                let global_ptr = bus.read_long(a5);
-                let port = bus.read_long(global_ptr);
+                // PlotCIcon draws in the port selected by SetPort/SetGWorld.
+                // An application's A5 need not point to QuickDraw globals.
+                // Retain the legacy bootstrap lookup only before a port has
+                // been established, as the other current-port traps do.
+                let port = if *self.current_port != 0 {
+                    *self.current_port
+                } else {
+                    let a5 = cpu.read_reg(Register::A5);
+                    let globals = if a5 != 0 { bus.read_long(a5) } else { 0 };
+                    if globals != 0 {
+                        bus.read_long(globals)
+                    } else {
+                        0
+                    }
+                };
                 if port == 0 {
                     return Some(Ok(()));
                 }
@@ -10031,7 +10042,9 @@ impl super::TrapDispatcher {
                         bus.read_long(pm_ptr + 42),
                     )
                 } else {
-                    let base = bus.read_long(port);
+                    // GrafPort.device occupies the first two bytes; portBits
+                    // is the embedded BitMap beginning at +2 (IM I, I-148).
+                    let base = bus.read_long(port + 2);
                     let (screen_base, _, _, _, screen_ps) = self.screen_mode;
                     let pixel_size = if base == screen_base && screen_ps > 1 {
                         u32::from(screen_ps)
@@ -10040,9 +10053,9 @@ impl super::TrapDispatcher {
                     };
                     (
                         base,
-                        (bus.read_word(port + 4) & 0x3FFF) as u32,
-                        bus.read_word(port + 6) as i16,
+                        (bus.read_word(port + 6) & 0x3FFF) as u32,
                         bus.read_word(port + 8) as i16,
+                        bus.read_word(port + 10) as i16,
                         pixel_size,
                         0,
                     )
@@ -22510,7 +22523,7 @@ impl super::TrapDispatcher {
         }
     }
 
-    fn seed_fill_1bpp_mask(
+    pub(super) fn seed_fill_1bpp_mask(
         bus: &mut MacMemoryBus,
         src_ptr: u32,
         dst_ptr: u32,

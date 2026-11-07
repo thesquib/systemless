@@ -2246,6 +2246,8 @@ Production packing from native `f1110f94ca3f7492c360a0fa357659160b650504` emits 
 
 Untouched shareware archive, native `e3366558e1a1094a36567c16df06ee0f214a030d`, explicit depth 8: PPC halts at unsupported `InterfaceLib:LMGetCurMap`, PC `$01F00188`, SP `$07F6FF00`, LR `$0100EE8C`. 68K completes the bounded 600-frontend checkpoint with zero exhaustion but a blank screen and zero assertions; gameplay is unqualified. These are baseline failures, not the current support state. Ordinary accessor PR [#4684](https://github.com/benletchford/systemless/pull/4684) merged after all nine checks passed (merge `32861fbf9318930b68f55cb2045367483afe17df`); display Status/GetGamma PR #4685 also merged (`3405882741553d10ece4660ed904b90c47f3c06f`). Integrated native source `9a8e9a622e26dce1f6d91789adb49b4295dbfcce` reaches the original title on both slices. After a normal title-dismissal click and Cmd-N, 68K remains black and PPC halts at PC zero, SP `$07F6FC00`, LR `$01009F8C`, 19,904 cycles. The fresh 68K trace completes 972 frontend ticks / 1,572 guest ticks with zero exhaustion and zero assertions: it proves the observed failure, not gameplay. Original CODE 9 writes a gamma-table pointer through guest address zero before Control; Systemless rejects that record with paramErr. [#4688](https://github.com/benletchford/systemless/issues/4688) tracks this reproduced mismatch; draft fix [#4690](https://github.com/benletchford/systemless/pull/4690) passed six focused gamma tests before formatting. Fresh committed native `c71c24bb336339225daa16babb6e5614714ef6b6` reads the real table `$00208280` through guest address zero and returns success. The bounded New Game replay still has an inspected black screen, so the parameter repair is not a gameplay qualification; CI exposed a formatter filename accidentally retained in the test file, locally corrected with final tests pending. Bounded gameplay, browser validation, content-only screenshot, normal promotion/CI/merge, human release and public replay remain pending. No catalogue entry or hosted game asset yet.
 
+Current 7 November 2026 status supersedes the historical startup blockers above: the existing managed original and screenshot receipts match; both CPU slices pass native paddle/scoring checks and direct-hosted-archive browser paddle assertions, scoring captures and mixed-state pacing. [Fresh evidence and limits](https://github.com/benletchford/systemless/issues/4681#issuecomment-6689034416). The original upstream PPC support disclaimer remains material. Source launch approval does not establish live qualification; human release and public replay remain pending.
+
 ## Brick Attack 1.0 — primary 107 original PPC shareware intake
 
 [Intake #4689](https://github.com/benletchford/systemless/issues/4689), inspected 12 October 2026. Requested [B index](https://www.vintageapplemac.com/software/games/b/) supplies [original 1.0 installer](https://www.vintageapplemac.com/files/games/Brick%20Attack%201.0.sit): **1,244,481 bytes**, SHA-256 `abc9aea8dc3b7356abfe755dc27e0e293becd34b6bb82567bc5c1e0f7905d396`. Native unar exposes the original ST46 self-extractor data and independently extracts five package files: Brick Attack, level, DrawSprocketLib, Register and Brick Attack Read Me.
@@ -3027,3 +3029,32 @@ zero exhausted frames; the outcome captures differ by 3,371 pixels. This is
 bounded native weapon input, not a confirmed hit, completed game or browser
 performance result. The original licence restriction remains; no hosting or
 live qualification is claimed. [Replay details](https://github.com/benletchford/systemless/issues/5535).
+
+## Alan's Solitaire 1.0.3 — early redistribution hold
+
+Primary 596's [original Info-Mac archive](https://mirrors.nic.funet.fi/pub/mac/info-mac/game/alans-solitaire-103.hqx)
+is 210,584 bytes, SHA-256 `4b170e7ad7799ce668b2758ac2a4c8ef4a8247923651a07207e8e4cd8ac59833`.
+Independent unar extraction retains the game and Read Me. The original November 29,
+1997 Read Me explicitly requires written permission from the author for
+redistribution. No such permission is established; shareware status is not treated
+as a hosting grant. It identifies this version as PowerPC-only. Executable-slice
+inspection, popularity and gameplay remain unverified. The archive stays outside
+tracked source and unhosted. [Intake #5633](https://github.com/benletchford/systemless/issues/5633).
+
+## Hexen original Macintosh demo — original intake and rights hold
+
+Primary 255's [demo discovery page](https://classicmacdemos.com/hexen-beyond-heretic)
+records circulation on 17 period cover discs. Its [unchanged original download](https://classicmacdemos.com/download/hexen-beyond-heretic/)
+is 7,230,478 bytes, SHA-256 `22039d68c475148b5a658e2e91b4cc47eb21b92f89fa2755a6e50408e2639679`.
+Independent unar extraction retains the May 10, 1996 Readme, application, demo WAD
+and both music variants. The application has classic CODE and cfrg resources;
+the PPC application fragment parses in current master's static audit, whose sole
+unsupported import is InterfaceLib PGetAppleTalkInfo. This is not a reproduced
+runtime failure, actual 68K/PPC gameplay or independent production-fork parity.
+
+No applicable full-package redistribution grant was found in the inspected Readme
+or TEXT/STR resources. Embedded SoundMusicSys terms grant rights to Presage as
+licensee; they do not establish an arbitrary redistributor's permission. Modern
+engine source licensing is not applied to this original demo data. The original
+archive remains unhosted while rights are unresolved, and no catalogue entry,
+launch approval or qualified-live count is claimed. [Intake and audit #5634](https://github.com/benletchford/systemless/issues/5634).
