@@ -2942,7 +2942,7 @@ pub(crate) fn dispatcher_target_for_import(
         (
             "InterfaceLib",
             "PicComment" | "SpaceExtra" | "SysBreakStr" | "DisposeMCInfo" | "CopyPixMap"
-            | "ResizePalette" | "ColorBit" | "InvertPoly",
+            | "ResizePalette" | "ColorBit",
         )
         | ("QuickTimeLib", "CustomGetFilePreview") => PpcImportDispatcherTarget::NoOpPreserve,
         ("InterfaceLib", "AEInstallSpecialHandler") => {
