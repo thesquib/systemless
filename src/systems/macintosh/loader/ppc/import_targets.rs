@@ -2942,7 +2942,7 @@ pub(crate) fn dispatcher_target_for_import(
         | ("QuickTimeLib", "MCIsPlayerEvent") => PpcImportDispatcherTarget::ReturnNoErr,
         (
             "InterfaceLib",
-            "PicComment" | "SpaceExtra" | "SysBreakStr" | "DisposeMCInfo" | "CopyPixMap"
+            "PicComment" | "SpaceExtra" | "SysBreakStr" | "DisposeMCInfo"
             | "ResizePalette" | "ColorBit",
         )
         | ("QuickTimeLib", "CustomGetFilePreview") => PpcImportDispatcherTarget::NoOpPreserve,
