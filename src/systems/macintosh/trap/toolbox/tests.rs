@@ -5290,10 +5290,9 @@ fn open_rf_perm_present_file_returns_refnum_and_sets_current_file() {
     assert_eq!(cpu.read_reg(Register::A7), sp + 8);
 }
 
-// MTb 1993 p. 1-65: if already open, OpenRFPerm returns the same refnum
-// and does not make that file current.
+// Apple TN1120 corrects the older manual: read reopens create current maps.
 #[test]
-fn open_rf_perm_reopen_returns_existing_refnum_without_switching_current_file() {
+fn open_rf_perm_reopen_creates_a_new_current_map() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200200u32;
@@ -5302,7 +5301,7 @@ fn open_rf_perm_reopen_returns_existing_refnum_without_switching_current_file() 
     disp.vfs_rsrc.insert("Sounds".to_string(), vec![]);
 
     // First open: Shapes.
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5316,7 +5315,7 @@ fn open_rf_perm_reopen_returns_existing_refnum_without_switching_current_file() 
 
     // Second open: Sounds.
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5330,9 +5329,9 @@ fn open_rf_perm_reopen_returns_existing_refnum_without_switching_current_file() 
     assert_eq!(disp.current_resource_refnum(), sounds_ref);
     assert_eq!(cpu.read_reg(Register::D0), sounds_ref as u32);
 
-    // Re-open Shapes: refnum re-used, current file unchanged.
+    // TN1120: a read reopen creates a separate current map.
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5340,15 +5339,16 @@ fn open_rf_perm_reopen_returns_existing_refnum_without_switching_current_file() 
     let result = disp.dispatch_toolbox(true, 0x1C4, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 8), shapes_ref);
-    assert_eq!(cpu.read_reg(Register::D0), shapes_ref as u32);
-    assert_eq!(disp.current_resource_refnum(), sounds_ref);
+    let reopened = bus.read_word(sp + 8);
+    assert_ne!(reopened, shapes_ref);
+    assert_eq!(cpu.read_reg(Register::D0), reopened as u32);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 8);
 }
 
 #[test]
-fn open_rf_perm_read_after_write_reuses_existing_read_only_refnum() {
+fn open_rf_perm_read_after_write_creates_distinct_read_only_maps() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200240u32;
@@ -5368,7 +5368,7 @@ fn open_rf_perm_read_after_write_reuses_existing_read_only_refnum() {
     assert!(disp.write_refnums.contains(&write_ref));
 
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1); // fsRdPerm
+    bus.write_word(sp, 0x0100); // fsRdPerm
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5381,7 +5381,7 @@ fn open_rf_perm_read_after_write_reuses_existing_read_only_refnum() {
     assert!(!disp.write_refnums.contains(&read_ref));
 
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1); // fsRdPerm
+    bus.write_word(sp, 0x0100); // fsRdPerm
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5390,8 +5390,9 @@ fn open_rf_perm_read_after_write_reuses_existing_read_only_refnum() {
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
 
-    assert_eq!(bus.read_word(sp + 8), read_ref);
-    assert_eq!(cpu.read_reg(Register::D0), read_ref as u32);
+    let reopened = bus.read_word(sp + 8);
+    assert_ne!(reopened, read_ref);
+    assert_eq!(cpu.read_reg(Register::D0), reopened as u32);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(
         disp.resources
@@ -5401,13 +5402,12 @@ fn open_rf_perm_read_after_write_reuses_existing_read_only_refnum() {
             .values()
             .filter(|name| name.as_str() == "Shapes")
             .count(),
-        2,
-        "one write and one read-only access path should be enough"
+        3,
+        "each read-only request creates a distinct access path"
     );
 }
 
-// OpenRFPerm should mirror the current refnum in D0 for both the first
-// open and the already-open reuse path.
+// OpenRFPerm mirrors the returned refnum in D0 on initial and read reopens.
 #[test]
 fn open_rf_perm_mirrors_refnum_in_d0_on_success_and_reopen() {
     let (mut disp, mut cpu, mut bus) = setup();
@@ -5417,7 +5417,7 @@ fn open_rf_perm_mirrors_refnum_in_d0_on_success_and_reopen() {
     disp.vfs_rsrc.insert("Shapes".to_string(), vec![]);
     disp.vfs_rsrc.insert("Sounds".to_string(), vec![]);
 
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5431,7 +5431,7 @@ fn open_rf_perm_mirrors_refnum_in_d0_on_success_and_reopen() {
     assert_eq!(disp.current_resource_refnum(), shapes_ref);
 
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5445,7 +5445,7 @@ fn open_rf_perm_mirrors_refnum_in_d0_on_success_and_reopen() {
     assert_eq!(disp.current_resource_refnum(), sounds_ref);
 
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5453,18 +5453,18 @@ fn open_rf_perm_mirrors_refnum_in_d0_on_success_and_reopen() {
     let result = disp.dispatch_toolbox(true, 0x1C4, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 8), shapes_ref);
-    assert_eq!(cpu.read_reg(Register::D0), shapes_ref as u32);
-    assert_eq!(disp.current_resource_refnum(), sounds_ref);
+    let reopened = bus.read_word(sp + 8);
+    assert_ne!(reopened, shapes_ref);
+    assert_eq!(cpu.read_reg(Register::D0), reopened as u32);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 8);
 }
 
 // MTb 1993 p. 1-65: if already open, OpenRFPerm returns the same refnum
-// and does not make that file current, even when a different file is
-// current at the time of the reopen.
+// Read reopens select their new map even when another file was current.
 #[test]
-fn open_rf_perm_reopen_keeps_current_file_when_a_different_file_is_current() {
+fn open_rf_perm_reopen_selects_new_map_after_a_different_file_was_current() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200280u32;
@@ -5473,7 +5473,7 @@ fn open_rf_perm_reopen_keeps_current_file_when_a_different_file_is_current() {
     disp.vfs_rsrc.insert("Sounds".to_string(), vec![]);
 
     // Open Shapes.
-    bus.write_word(sp, 1); // fsRdPerm
+    bus.write_word(sp, 0x0100); // fsRdPerm
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5487,7 +5487,7 @@ fn open_rf_perm_reopen_keeps_current_file_when_a_different_file_is_current() {
 
     // Open Sounds so we can later make Shapes current again.
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5500,8 +5500,7 @@ fn open_rf_perm_reopen_keeps_current_file_when_a_different_file_is_current() {
     assert_ne!(sounds_ref, shapes_ref);
     assert_eq!(disp.current_resource_refnum(), sounds_ref);
 
-    // Make Shapes current again, then reopen Sounds. The reopen must
-    // return the original refnum and leave Shapes current.
+    // Make Shapes current again, then reopen Sounds into a new current map.
     cpu.write_reg(Register::A7, sp);
     bus.write_word(sp, shapes_ref);
     let result = disp.dispatch_toolbox(true, 0x198, &mut cpu, &mut bus);
@@ -5510,7 +5509,7 @@ fn open_rf_perm_reopen_keeps_current_file_when_a_different_file_is_current() {
     assert_eq!(disp.current_resource_refnum(), shapes_ref);
 
     cpu.write_reg(Register::A7, sp);
-    bus.write_word(sp, 1);
+    bus.write_word(sp, 0x0100);
     bus.write_word(sp + 2, 0);
     bus.write_long(sp + 4, name_ptr);
     bus.write_word(sp + 8, 0xBEEF);
@@ -5518,8 +5517,9 @@ fn open_rf_perm_reopen_keeps_current_file_when_a_different_file_is_current() {
     let result = disp.dispatch_toolbox(true, 0x1C4, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 8), sounds_ref);
-    assert_eq!(disp.current_resource_refnum(), shapes_ref);
+    let reopened = bus.read_word(sp + 8);
+    assert_ne!(reopened, sounds_ref);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 8);
 }
@@ -5566,7 +5566,8 @@ fn open_res_file_publishes_a_valid_fcb_and_preserves_other_access_paths() {
     disp.vfs_rsrc.insert("Profiles/Player".to_string(), vec![]);
     disp.set_vfs_entry_metadata("Profiles/Player", *b"SAVE", *b"TEST", 0);
     let metadata = disp.vfs_file_metadata("Profiles/Player").unwrap();
-    let name_ptr = 0x200250;
+    // Keep the Pascal filename outside allocations made by the Resource Manager.
+    let name_ptr = bus.alloc(256);
     bus.write_pstring(name_ptr, b"Profiles:Player");
     bus.write_long(TEST_SP, name_ptr);
 
@@ -5583,7 +5584,8 @@ fn open_res_file_publishes_a_valid_fcb_and_preserves_other_access_paths() {
     assert_eq!(bus.read_long(buffer + 2), 1234);
     let fcb = buffer + refnum as u32;
     assert_eq!(bus.read_long(fcb), metadata.file_id);
-    assert_eq!(bus.read_word(fcb + 4), 0x0200);
+    // TN1120: the initial fsCurPerm open grants read/write when available.
+    assert_eq!(bus.read_word(fcb + 4), 0x0300);
     assert_eq!(bus.read_long(fcb + 50), u32::from_be_bytes(*b"SAVE"));
     assert_eq!(bus.read_long(fcb + 58), metadata.parent_dir_id);
     assert_eq!(bus.read_pstring(fcb + 62), b"Player");
@@ -5626,10 +5628,9 @@ fn open_res_file_reports_exhausted_fcb_table_without_changing_current_file() {
     assert_eq!(disp.refnum_for_resource_file_name("Player"), None);
 }
 
-// Inside Macintosh Volume I (1985), p. I-115: reopening an already-open
-// resource file returns its refnum but does not make it current.
+// Apple TN1120: a read reopen creates a new current resource map.
 #[test]
-fn open_res_file_reopen_returns_existing_refnum_without_switching_current_file() {
+fn open_res_file_reopen_creates_a_new_current_map() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200260u32;
@@ -5668,19 +5669,17 @@ fn open_res_file_reopen_returns_existing_refnum_without_switching_current_file()
     let result = disp.dispatch_toolbox(true, 0x197, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 4), shapes_ref);
-    assert_eq!(cpu.read_reg(Register::D0), shapes_ref as u32);
-    assert_eq!(disp.current_resource_refnum(), sounds_ref);
+    let reopened = bus.read_word(sp + 4);
+    assert_ne!(reopened, shapes_ref);
+    assert_eq!(cpu.read_reg(Register::D0), reopened as u32);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 4);
 }
 
 #[test]
-fn open_res_file_canonical_reopen_reuses_existing_refnum_without_switching_current_file() {
-    // IM:I I-115: already-open OpenResFile returns the existing refnum
-    // and does not make that file current. This holds even when the
-    // second open spells the same file via a more explicit path that
-    // resolves to the same VFS resource fork.
+fn open_res_file_canonical_read_reopen_creates_a_new_current_map() {
+    // Apple TN1120 applies the corrected read-reopen rules to canonical paths.
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200265u32;
@@ -5718,8 +5717,9 @@ fn open_res_file_canonical_reopen_reuses_existing_refnum_without_switching_curre
     let result = disp.dispatch_toolbox(true, 0x197, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 4), shapes_ref);
-    assert_eq!(disp.current_resource_refnum(), sounds_ref);
+    let reopened = bus.read_word(sp + 4);
+    assert_ne!(reopened, shapes_ref);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 4);
 }
@@ -5799,10 +5799,9 @@ fn hopenresfile_missing_file_returns_minus_one_and_fnferr() {
     assert_eq!(cpu.read_reg(Register::A7), sp + 12);
 }
 
-// MTb 1993 p. 1-63: already-open HOpenResFile returns the existing refnum
-// and does not make that file current.
+// Apple TN1120: a read reopen creates a new current resource map.
 #[test]
-fn hopenresfile_already_open_returns_same_refnum_without_switching_current_file() {
+fn hopenresfile_read_reopen_creates_a_new_current_map() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200400u32;
@@ -5841,7 +5840,7 @@ fn hopenresfile_already_open_returns_same_refnum_without_switching_current_file(
     assert_ne!(sounds_ref, shapes_ref);
     assert_eq!(disp.current_resource_refnum(), sounds_ref);
 
-    // Re-open Shapes: refnum re-used, current file unchanged.
+    // TN1120: a read reopen creates a separate current map.
     cpu.write_reg(Register::A7, sp);
     bus.write_word(sp, 1);
     bus.write_long(sp + 2, name_ptr);
@@ -5852,17 +5851,16 @@ fn hopenresfile_already_open_returns_same_refnum_without_switching_current_file(
     let result = disp.dispatch_toolbox(true, 0x01A, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 12), shapes_ref);
-    assert_eq!(disp.current_resource_refnum(), sounds_ref);
+    let reopened = bus.read_word(sp + 12);
+    assert_ne!(reopened, shapes_ref);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 12);
 }
 
 #[test]
-fn hopenresfile_canonical_reopen_reuses_existing_refnum_without_switching_current_file() {
-    // MTb 1993 p. 1-63: already-open HOpenResFile returns the existing
-    // refnum and does not make that file current, even when the reopen
-    // uses a canonicalized path spelling for the same fork.
+fn hopenresfile_canonical_read_reopen_creates_a_new_current_map() {
+    // Apple TN1120 applies the corrected read-reopen rules to canonical paths.
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
     let name_ptr = 0x200410u32;
@@ -5909,8 +5907,9 @@ fn hopenresfile_canonical_reopen_reuses_existing_refnum_without_switching_curren
     let result = disp.dispatch_toolbox(true, 0x01A, &mut cpu, &mut bus);
     assert!(result.is_some());
     assert!(result.unwrap().is_ok());
-    assert_eq!(bus.read_word(sp + 12), shapes_ref);
-    assert_eq!(disp.current_resource_refnum(), sounds_ref);
+    let reopened = bus.read_word(sp + 12);
+    assert_ne!(reopened, shapes_ref);
+    assert_eq!(disp.current_resource_refnum(), reopened);
     assert_eq!(bus.read_word(0x0A60), 0);
     assert_eq!(cpu.read_reg(Register::A7), sp + 12);
 }
@@ -7481,6 +7480,10 @@ fn test_hcreate_res_file_creates_missing_file_and_resource_fork() {
     assert_eq!(bus.read_word(0x0A60), 0);
     assert!(disp.vfs.contains_key("Prefs.RSRC"));
     assert!(disp.vfs_rsrc.contains_key("Prefs.RSRC"));
+    let fork =
+        crate::managers::resource::ResourceFork::parse(disp.vfs_rsrc.get("Prefs.RSRC").unwrap())
+            .expect("HCreateResFile must initialize a resource map");
+    assert!(fork.resources().is_empty());
 
     let pb = 0x300000u32;
     cpu.write_reg(Register::A0, pb);
@@ -7496,6 +7499,62 @@ fn test_hcreate_res_file_creates_missing_file_and_resource_fork() {
     assert_eq!(bus.read_word(pb + 16), 0);
     assert!(bus.read_word(pb + 24) > 0);
     assert_eq!(cpu.read_reg(Register::D0), 0);
+}
+
+#[test]
+fn test_hcreate_res_file_initializes_pbh_created_empty_fork_in_place() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let directory = disp.ensure_vfs_directory("System Folder/Preferences");
+    let key = "System Folder/Preferences/Prefs.RSRC";
+    let pb = 0x300000;
+    let name_ptr = 0x310000;
+    bus.write_pstring(name_ptr, b"Prefs.RSRC");
+    bus.write_long(pb + 18, name_ptr);
+    bus.write_word(pb + 22, 0);
+    bus.write_long(pb + 48, directory);
+    cpu.write_reg(Register::A0, pb);
+    disp.current_trap_word = 0xA208; // PBHCreate
+    disp.dispatch_resource(false, 0x08, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus.read_word(pb + 16), 0);
+    assert!(disp.vfs_rsrc.get(key).unwrap().is_empty());
+
+    // A caller may populate the data fork before initializing its resource map.
+    disp.vfs.insert(key.to_string(), vec![0x11, 0x22, 0x33]);
+    disp.set_vfs_entry_finfo(
+        key,
+        u32::from_be_bytes(*b"DATA"),
+        u32::from_be_bytes(*b"TEST"),
+        0,
+    );
+    let metadata = disp.vfs_file_metadata(key).unwrap();
+    bus.write_pstring(name_ptr, b"prefs.rsrc");
+    bus.write_long(TEST_SP, name_ptr);
+    bus.write_long(TEST_SP + 4, directory);
+    bus.write_word(TEST_SP + 8, 0);
+    cpu.write_reg(Register::A7, TEST_SP);
+    disp.current_trap_word = 0xA81B;
+    disp.dispatch_toolbox(true, 0x01B, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 10);
+    assert_eq!(bus.read_word(0x0A60), 0);
+    assert_eq!(disp.vfs.get(key).unwrap(), &[0x11, 0x22, 0x33]);
+    let fork = crate::managers::resource::ResourceFork::parse(disp.vfs_rsrc.get(key).unwrap())
+        .expect("the existing empty fork must become an openable resource map");
+    assert!(fork.resources().is_empty());
+    let after = disp.vfs_file_metadata(key).unwrap();
+    assert_eq!(after.file_type, metadata.file_type);
+    assert_eq!(after.creator, metadata.creator);
+    assert_eq!(after.finder_flags, metadata.finder_flags);
+    assert_eq!(after.file_id, metadata.file_id);
+    assert_eq!(after.parent_dir_id, metadata.parent_dir_id);
+    assert_eq!(after.created_date, metadata.created_date);
+    assert!(!disp
+        .vfs_rsrc
+        .contains_key("System Folder/Preferences/prefs.rsrc"));
 }
 
 #[test]
@@ -20070,25 +20129,99 @@ fn controlstripdispatch_unknown_selector_returns_paramerr_and_consumes_encoded_a
 
 // CursorDeviceDispatch ($AADB) — selector in D0, Pascal args on stack.
 #[test]
-fn cursordevicenextdevice_consumes_pointer_arg_and_clears_result() {
+fn cursordevicenextdevice_enumerates_the_physical_mouse_and_ends_the_chain() {
     let (mut disp, mut cpu, mut bus) = setup();
     let sp = TEST_SP;
-    let device_slot = sp + 0x40;
+    let slot = sp + 0x40;
+    disp.input_state.set_mouse_state((100, 200), true);
+    bus.write_long(slot, 0);
+    for first in [true, false] {
+        cpu.write_reg(Register::A7, sp);
+        cpu.write_reg(Register::D0, 11);
+        bus.write_long(sp, slot);
+        bus.write_word(sp + 4, 0xBEEF);
+        assert!(disp
+            .dispatch_toolbox(true, 0x2DB, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), sp + 4);
+        assert_eq!(cpu.read_reg(Register::D0), 0);
+        assert_eq!(bus.read_word(sp + 4), 0);
+        if first {
+            let device = bus.read_long(slot);
+            assert_ne!(device, 0);
+            assert_eq!(bus.read_long(device), 0);
+            assert_eq!(bus.read_byte(device + 24), 1);
+            assert_eq!(bus.read_byte(device + 25), 1);
+            let data = bus.read_long(device + 4);
+            assert_eq!(bus.read_long(data + 8), 200 << 16);
+            assert_eq!(bus.read_long(data + 12), 100 << 16);
+            assert_eq!(bus.read_long(data + 16), (100 << 16) | 200);
+            assert_eq!(bus.read_byte(data + 21), 1);
+            assert_eq!(bus.read_long(data + 22), 72);
+        } else {
+            assert_eq!(bus.read_long(slot), 0);
+        }
+    }
+}
 
+#[test]
+fn cursordevice_moves_decode_pascal_arguments_and_preserve_other_record_fields() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let sp = TEST_SP;
+    let slot = sp + 0x40;
+    bus.write_long(slot, 0);
+    bus.write_long(sp, slot);
     cpu.write_reg(Register::A7, sp);
-    cpu.write_reg(Register::D0, 0x0000_000B);
-    bus.write_long(sp, device_slot);
-    bus.write_word(sp + 4, 0xBEEF);
-    bus.write_long(device_slot, 0x1111_2222);
-
-    let result = disp.dispatch_toolbox(true, 0x2DB, &mut cpu, &mut bus);
-    assert!(result.is_some());
-    assert!(result.unwrap().is_ok());
-
-    assert_eq!(cpu.read_reg(Register::D0), 0);
-    assert_eq!(cpu.read_reg(Register::A7), sp + 4);
-    assert_eq!(bus.read_word(sp + 4), 0);
-    assert_eq!(bus.read_long(device_slot), 0);
+    cpu.write_reg(Register::D0, 11);
+    assert!(disp
+        .dispatch_toolbox(true, 0x2DB, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok());
+    let device = bus.read_long(slot);
+    let data = bus.read_long(device + 4);
+    bus.write_long(device + 8, 0x12345678);
+    bus.write_word(data + 26, 0xABCD);
+    for (selector, x, y, expected) in [
+        (1, 300i32, -20i32, (-20i16, 300i16)),
+        (0, -40, 5, (-15, 260)),
+    ] {
+        bus.write_long(sp, y as u32);
+        bus.write_long(sp + 4, x as u32);
+        bus.write_long(sp + 8, device);
+        bus.write_word(sp + 12, 0xBEEF);
+        cpu.write_reg(Register::A7, sp);
+        cpu.write_reg(Register::D0, selector);
+        assert!(disp
+            .dispatch_toolbox(true, 0x2DB, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), sp + 12);
+        assert_eq!(bus.read_word(sp + 12), 0);
+        let (v, h) = expected;
+        assert_eq!(disp.input_state.mouse_position(), expected);
+        for global in [addr::M_TEMP, addr::MOUSE_LOC, addr::MOUSE_LOC2] {
+            assert_eq!(
+                bus.read_long(global),
+                (u32::from(v as u16) << 16) | u32::from(h as u16)
+            );
+        }
+        assert_eq!(bus.read_long(data + 8), ((h as i32) << 16) as u32);
+        assert_eq!(bus.read_long(data + 12), ((v as i32) << 16) as u32);
+        assert_eq!(bus.read_byte(data + 20), u8::from(selector == 1));
+        assert_eq!(bus.read_long(device + 8), 0x12345678);
+        assert_eq!(bus.read_word(data + 26), 0xABCD);
+    }
+    let before = bus.read_long(addr::MOUSE_LOC2);
+    cpu.write_reg(Register::A7, sp);
+    cpu.write_reg(Register::D0, 1);
+    bus.write_long(sp + 8, 0);
+    assert!(disp
+        .dispatch_toolbox(true, 0x2DB, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok());
+    assert_eq!(bus.read_word(sp + 12), (-50i16) as u16);
+    assert_eq!(bus.read_long(addr::MOUSE_LOC2), before);
 }
 
 #[test]
@@ -21777,6 +21910,8 @@ fn classic_smc_movie_fixture() -> (TrapDispatcher, MacMemoryBus, u32, u32) {
     bus.write_long(pixmap, pixels);
     bus.write_word(pixmap + 4, 0x8000 | 32);
     bus.write_word(pixmap + 32, 32);
+    bus.write_word(pixmap + 10, 4);
+    bus.write_word(pixmap + 12, 8);
     let mut state = super::MovieState::new(0, -1, 0, (0, 0, 4, 8), 3, 60);
     state.gworld_port = port;
     // Two solid blocks, then preserve the left block and replace the right.
@@ -21995,4 +22130,173 @@ fn movie_from_file_missing_lazy_payload_reports_error_without_empty_movie() {
     assert_eq!(bus.read_word(0x300204), 0);
     assert_eq!(bus.read_byte(0x300208), 0xCC);
     assert_eq!(bus.read_byte(0x300310), 0xCC);
+}
+
+#[test]
+fn classic_file_graphics_importer_pascal_lifecycle_draws_original_pixels() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let (spec, out, rect, port, handle, pixmap, pixels) = (
+        0x300000, 0x300080, 0x300090, 0x300100, 0x300200, 0x300300, 0x310000,
+    );
+    let image = image::RgbImage::from_raw(2, 1, vec![240, 16, 8, 8, 32, 224]).unwrap();
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    disp.vfs.insert("test.png".into(), encoded.into_inner());
+    write_test_fsspec(&mut bus, spec, 0, 2, b"test.png");
+    bus.write_word(port + 6, 0xC000);
+    bus.write_long(port + 2, handle);
+    bus.write_long(handle, pixmap);
+    bus.write_long(pixmap, pixels);
+    bus.write_word(pixmap + 4, 0x8000 | 16);
+    bus.write_word(pixmap + 10, 2);
+    bus.write_word(pixmap + 12, 4);
+    bus.write_word(pixmap + 32, 32);
+    disp.set_current_port_state(&mut bus, &mut cpu, port, None);
+    bus.write_long(TEST_SP, out);
+    bus.write_long(TEST_SP + 4, spec);
+    bus.write_word(TEST_SP + 8, 0xBAD);
+    cpu.write_reg(Register::A7, TEST_SP);
+    cpu.write_reg(Register::D0, 0x0008_006E);
+    disp.dispatch_toolbox(true, 0x2A3, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+    assert_eq!(bus.read_word(TEST_SP + 8), 0);
+    let instance = bus.read_long(out);
+    assert_ne!(instance, 0);
+    for (selector, size) in [(0x000E, 4), (0x000F, 0)] {
+        bus.write_long(TEST_SP, (size << 16) | selector);
+        bus.write_long(TEST_SP + 4, rect);
+        bus.write_long(TEST_SP + 4 + size, instance);
+        cpu.write_reg(Register::A7, TEST_SP);
+        cpu.write_reg(Register::D0, 0);
+        disp.dispatch_toolbox(true, 0x02A, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8 + size);
+        assert_eq!(bus.read_long(TEST_SP + 8 + size), 0);
+    }
+    assert_eq!(bus.read_long(rect), 0);
+    assert_eq!(bus.read_word(rect + 4), 1);
+    assert_eq!(bus.read_word(rect + 6), 2);
+    assert_eq!(bus.read_long(pixels), 0x00F01008);
+    assert_eq!(bus.read_long(pixels + 4), 0x000820E0);
+    assert_eq!(bus.read_long(pixels + 8), 0); // no adjacent-pixel write
+    bus.write_long(TEST_SP, instance);
+    cpu.write_reg(Register::A7, TEST_SP);
+    cpu.write_reg(Register::D0, 8);
+    disp.dispatch_toolbox(true, 0x02A, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert!(!disp.classic_graphics_importers.contains_key(&instance));
+}
+
+#[test]
+fn classic_file_graphics_importer_missing_and_corrupt_files_leave_no_instance() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let (spec, out) = (0x300000, 0x300080);
+    write_test_fsspec(&mut bus, spec, 0, 2, b"test.jpg");
+    for (data, expected) in [(None, -43i16), (Some(vec![0xff, 0xd8, 0xff, 0xe0]), -8969)] {
+        if let Some(data) = data {
+            disp.vfs.insert("test.jpg".into(), data);
+        }
+        bus.write_long(out, 0xDEADBEEF);
+        bus.write_long(TEST_SP, out);
+        bus.write_long(TEST_SP + 4, spec);
+        cpu.write_reg(Register::A7, TEST_SP);
+        cpu.write_reg(Register::D0, 0x0008_006E);
+        disp.dispatch_toolbox(true, 0x2A3, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(TEST_SP + 8) as i16, expected);
+        assert_eq!(bus.read_long(out), 0);
+        assert!(disp.classic_graphics_importers.is_empty());
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+    }
+}
+
+#[test]
+fn classic_file_graphics_importer_bounds_and_gworld_are_instance_local() {
+    let (mut disp, _, mut bus) = setup();
+    let (spec, out, rect, port) = (0x300000, 0x300080, 0x300090, 0x300100);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 1))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    disp.vfs.insert("test.png".into(), encoded.into_inner());
+    write_test_fsspec(&mut bus, spec, 0, 2, b"test.png");
+    assert_eq!(disp.classic_open_graphics_importer(&mut bus, spec, out), 0);
+    let first = bus.read_long(out);
+    assert_eq!(disp.classic_open_graphics_importer(&mut bus, spec, out), 0);
+    let second = bus.read_long(out);
+    assert_ne!(first, second);
+    for (index, value) in [1, 2, 3, 6].into_iter().enumerate() {
+        bus.write_word(rect + index as u32 * 2, value);
+    }
+    bus.write_long(TEST_SP + 4, rect);
+    assert_eq!(
+        disp.classic_graphics_importer_call(&mut bus, first, 0x14, 4, TEST_SP),
+        0
+    );
+    for (instance, expected) in [(first, [1, 2, 3, 6]), (second, [0, 0, 1, 2])] {
+        assert_eq!(
+            disp.classic_graphics_importer_call(&mut bus, instance, 0x15, 4, TEST_SP),
+            0
+        );
+        assert_eq!(
+            (0..4)
+                .map(|i| bus.read_word(rect + i * 2))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    // Natural dimensions remain unchanged by a destination bounds change.
+    assert_eq!(
+        disp.classic_graphics_importer_call(&mut bus, first, 0x0E, 4, TEST_SP),
+        0
+    );
+    assert_eq!(bus.read_long(rect + 4), 0x00010002);
+    bus.write_long(TEST_SP + 4, 0x1234); // device may be NIL or a device handle
+    bus.write_long(TEST_SP + 8, port);
+    assert_eq!(
+        disp.classic_graphics_importer_call(&mut bus, first, 0x10, 8, TEST_SP),
+        0
+    );
+    bus.write_long(TEST_SP + 4, out);
+    bus.write_long(TEST_SP + 8, out + 4);
+    assert_eq!(
+        disp.classic_graphics_importer_call(&mut bus, first, 0x11, 8, TEST_SP),
+        0
+    );
+    assert_eq!(bus.read_long(out), 0x1234);
+    assert_eq!(bus.read_long(out + 4), port);
+    assert_eq!(
+        disp.classic_graphics_importer_call(&mut bus, first, 0x19, 4, TEST_SP),
+        -3000
+    );
+    assert_eq!(
+        disp.classic_graphics_importer_call(&mut bus, first, 0x0F, 4, TEST_SP),
+        -3000
+    );
+}
+
+#[test]
+fn classic_file_graphics_importer_rejects_transparency_instead_of_flattening_it() {
+    let (mut disp, _, mut bus) = setup();
+    let (spec, out) = (0x300000, 0x300080);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(1, 1, vec![255, 0, 0, 0]).unwrap())
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    disp.vfs.insert("test.png".into(), encoded.into_inner());
+    write_test_fsspec(&mut bus, spec, 0, 2, b"test.png");
+    bus.write_long(out, 0xBAD);
+    assert_eq!(
+        disp.classic_open_graphics_importer(&mut bus, spec, out),
+        -8961
+    );
+    assert_eq!(bus.read_long(out), 0);
+    assert!(disp.classic_graphics_importers.is_empty());
 }

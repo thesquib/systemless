@@ -86,6 +86,22 @@ pub(super) fn dispatch_quickdraw_import(
             }
             Some(PpcImportAction::Return(destination))
         }
+        PpcImportDispatcherTarget::GetQDGlobalsBlack => {
+            // Quickdraw.h: Pattern *GetQDGlobalsBlack(Pattern *black).
+            // QDGlobals.black is sixteen bytes before thePort.
+            let destination = cpu.gpr[3];
+            if destination == 0 || !ppc_memory_can_write_bytes(memory, destination, 8) {
+                return Some(PpcImportAction::Return(0));
+            }
+            let black = toolbox_startup
+                .init_graf_global_ptr
+                .checked_sub(16)
+                .and_then(|address| ppc_memory_read_bytes(memory, address, 8))
+                // Before InitGraf, use its standard solid black pattern.
+                .unwrap_or_else(|| vec![0xff; 8]);
+            let _ = memory.write_bytes(destination, &black);
+            Some(PpcImportAction::Return(destination))
+        }
         PpcImportDispatcherTarget::GetQDGlobalsWhite => {
             // Quickdraw.h: Pattern *GetQDGlobalsWhite(Pattern *white).
             // QDGlobals.white is the eight bytes immediately before thePort.
@@ -557,6 +573,10 @@ pub(super) fn dispatch_quickdraw_import(
             }
             Some(PpcImportAction::ReturnPreserve)
         }
+        PpcImportDispatcherTarget::HSL2RGB => {
+            ppc_hsl2rgb(memory, cpu.gpr[3], cpu.gpr[4]);
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::RGB2HSL => {
             ppc_rgb2hsl(memory, cpu.gpr[3], cpu.gpr[4]);
             Some(PpcImportAction::ReturnPreserve)
@@ -948,26 +968,46 @@ pub(super) fn dispatch_quickdraw_import(
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::EraseRect => {
+            let is_color = memory
+                .read_u16_be(current_gworld.wrapping_add(6))
+                .is_some_and(|version| version & 0xc000 == 0xc000);
+            let pixpat = if is_color {
+                memory
+                    .read_u32_be(current_gworld.wrapping_add(PPC_CGRAF_PORT_BK_PIXPAT_OFFSET))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let mut pattern = toolbox_startup.quickdraw_back_pattern;
+            if !is_color {
+                let _ = memory.read_bytes_into(current_gworld.wrapping_add(32), &mut pattern);
+            }
             if ppc_hle_trace_enabled() {
                 eprintln!(
-                    "[PPC-TRACE] EraseRect tick={} port=${:08X} rect=${:08X} bounds={:?} back=({:04X},{:04X},{:04X})",
-                    tick_count,
-                    current_gworld,
-                    cpu.gpr[3],
-                    ppc_read_rect(memory, cpu.gpr[3]),
-                    quickdraw_back_color.red,
-                    quickdraw_back_color.green,
-                    quickdraw_back_color.blue,
+                    "[PPC-TRACE] EraseRect tick={} port=${:08X} rect=${:08X} bounds={:?} bkPixPat=${:08X}",
+                    tick_count, current_gworld, cpu.gpr[3],
+                    ppc_read_rect(memory, cpu.gpr[3]), pixpat,
                 );
             }
             if let Some(rect) = ppc_read_rect(memory, cpu.gpr[3]) {
-                let _ = ppc_paint_rect_bounds(
+                let _ = ppc_erase_rect(
                     memory,
                     gworlds,
                     current_gworld,
                     rect,
-                    *quickdraw_back_color,
-                    None,
+                    pixpat,
+                    pattern,
+                    (
+                        *quickdraw_fore_color,
+                        quickdraw_fore_indices.get(&current_gworld).copied(),
+                    ),
+                    (
+                        *quickdraw_back_color,
+                        toolbox_startup
+                            .quickdraw_back_indices
+                            .get(&current_gworld)
+                            .copied(),
+                    ),
                 );
             }
             Some(PpcImportAction::ReturnPreserve)
@@ -2685,6 +2725,7 @@ pub(super) fn ppc_dispatch_quickdraw_compatibility(
                 screen_clut,
                 color_manager_clut,
             );
+            toolbox_startup.palette_update_modes.remove(&cpu.gpr[3]);
             if toolbox_startup.application_palette == cpu.gpr[3] {
                 toolbox_startup.application_palette = 0;
                 toolbox_startup.application_palette_updates = 0;
@@ -2794,14 +2835,9 @@ pub(super) fn ppc_dispatch_quickdraw_compatibility(
                 current_resource_refnum,
                 cpu.gpr[3] as u16 as i16,
             );
-            if palette != 0 && current_gworld != 0 {
-                let _ = memory.write_u32_be(
-                    current_gworld + PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET,
-                    palette,
-                );
-                let _ =
-                    memory.write_u16_be(current_gworld + PPC_CGRAF_PORT_PALETTE_UPDATES_OFFSET, 1);
-            }
+            // GetNewPalette creates a palette; SetPalette/NSetPalette attach it.
+            // Writing into the current port here would overwrite DialogRecord
+            // items and textH at the same offsets used by ordinary windows.
             PpcImportAction::Return(palette)
         }
         PpcQuickDrawCompatibilityOperation::ScrollRect => {

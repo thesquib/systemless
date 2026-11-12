@@ -1437,7 +1437,7 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
     }
 
     #[test]
-    fn hle_import_runner_copybits_converts_16bpp_to_8bpp() {
+    fn hle_import_runner_copybits_converts_16bpp_to_8bpp_without_stale_palette_indices() {
         let pef = synthetic_pef_with_import(b"CopyBits");
         let mut loaded = load_pef_application(&pef).unwrap();
         let scratch = PPC_HEAP_BASE + 0x12600;
@@ -1451,15 +1451,15 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
             &mut loaded.memory,
             src_pixmap,
             src_pixels,
-            4,
+            8,
             0,
             0,
             1,
-            2,
+            4,
             16,
         )
         .unwrap();
-        ppc_write_pixmap(&mut loaded.memory, dst_pixmap, dst_pixels, 2, 0, 0, 1, 2, 8).unwrap();
+        ppc_write_pixmap(&mut loaded.memory, dst_pixmap, dst_pixels, 4, 0, 0, 1, 4, 8).unwrap();
         for index in 0..256u32 {
             let spec = PPC_MAIN_CTABLE + 8 + index * 8;
             loaded.memory.write_u16_be(spec, index as u16).unwrap();
@@ -1475,9 +1475,12 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
             .memory
             .write_u16_be(PPC_MAIN_CTABLE + 8 + 17 * 8 + 6, 0xffff)
             .unwrap();
-        loaded.memory.write_u16_be(src_pixels, 0x7c00).unwrap();
-        loaded.memory.write_u16_be(src_pixels + 2, 0x001f).unwrap();
-        ppc_write_rect(&mut loaded.memory, rect, 0, 0, 1, 2).unwrap();
+        // Repeated colors include RGB555's unused high bit. Every copy must
+        // still resolve against its own current palette snapshot.
+        for (index, pixel) in [0x7c00u16, 0xfc00, 0x001f, 0x801f].into_iter().enumerate() {
+            loaded.memory.write_u16_be(src_pixels + index as u32 * 2, pixel).unwrap();
+        }
+        ppc_write_rect(&mut loaded.memory, rect, 0, 0, 1, 4).unwrap();
         loaded.cpu.gpr[3] = src_pixmap;
         loaded.cpu.gpr[4] = dst_pixmap;
         loaded.cpu.gpr[5] = rect;
@@ -1489,7 +1492,21 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
         assert_eq!(probe.handled_import_count, 1);
         assert_eq!(probe.unsupported_import_index, None);
         assert_eq!(loaded.memory.read_u8(dst_pixels), Some(42));
-        assert_eq!(loaded.memory.read_u8(dst_pixels + 1), Some(17));
+        assert_eq!(loaded.memory.read_u8(dst_pixels + 1), Some(42));
+        assert_eq!(loaded.memory.read_u8(dst_pixels + 2), Some(17));
+        assert_eq!(loaded.memory.read_u8(dst_pixels + 3), Some(17));
+
+        for (index, component, value) in [(42, 2, 0), (17, 6, 0), (71, 2, 0xffff), (99, 6, 0xffff)] {
+            loaded.memory.write_u16_be(PPC_MAIN_CTABLE + 8 + index * 8 + component, value).unwrap();
+        }
+        loaded.cpu.pc = loaded.entry_pc;
+        loaded.cpu.lr = PPC_HALT_PC;
+        let probe = loaded.run_with_hle_imports(64);
+        assert_eq!(probe.handled_import_count, 1);
+        assert_eq!(probe.unsupported_import_index, None);
+        for (offset, expected) in [71u8, 71, 99, 99].into_iter().enumerate() {
+            assert_eq!(loaded.memory.read_u8(dst_pixels + offset as u32), Some(expected));
+        }
     }
 
     #[test]
@@ -2114,6 +2131,51 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
     }
 
     #[test]
+    fn copybits_preserves_zero_seed_8bpp_offscreen_indices() {
+        let pef = synthetic_pef_with_import(b"CopyBits");
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let base = PPC_HEAP_BASE + 0x16000;
+        loaded.memory.add_region(base, vec![0; 0x2000]);
+        let source = base;
+        let destination = base + 0x40;
+        let source_pixels = base + 0x80;
+        let destination_pixels = base + 0x90;
+        let rect = base + 0xa0;
+        let source_handle = base + 0xb0;
+        let destination_handle = base + 0xb4;
+        let source_table = base + 0x100;
+        let destination_table = base + 0xa00;
+        let mut colors = [[0; 3]; 256];
+        colors[0] = [0xffff; 3];
+        colors[178] = [0x6666, 0x5454, 0x3636];
+        let table = ppc_color_table_bytes(0, &colors).unwrap();
+        for (pixmap, pixels, handle, address) in [
+            (source, source_pixels, source_handle, source_table),
+            (destination, destination_pixels, destination_handle, destination_table),
+        ] {
+            ppc_write_pixmap(&mut loaded.memory, pixmap, pixels, 4, 0, 0, 1, 4, 8).unwrap();
+            loaded.memory.write_u32_be(pixmap + 42, handle).unwrap();
+            loaded.memory.write_u32_be(handle, address).unwrap();
+            loaded.memory.write_bytes(address, &table).unwrap();
+        }
+        // The current screen retains its unrelated system palette. Matching
+        // offscreen tables must preserve even duplicate-black pixel indices.
+        loaded.memory.write_bytes(source_pixels, &[178, 96, 160, 255]).unwrap();
+        ppc_write_rect(&mut loaded.memory, rect, 0, 0, 1, 4).unwrap();
+        loaded.cpu.gpr[3] = source;
+        loaded.cpu.gpr[4] = destination;
+        loaded.cpu.gpr[5] = rect;
+        loaded.cpu.gpr[6] = rect;
+        loaded.cpu.gpr[7] = 0;
+        let probe = loaded.run_with_hle_imports(64);
+        assert_eq!(probe.handled_import_count, 1);
+        assert_eq!(probe.unsupported_import_index, None);
+        let mut actual = [0; 4];
+        loaded.memory.read_bytes_into(destination_pixels, &mut actual).unwrap();
+        assert_eq!(actual, [178, 96, 160, 255]);
+    }
+
+    #[test]
     fn hle_import_runner_copybits_4bpp_preserves_matching_image_table_indices() {
         let pef = synthetic_pef_with_import(b"CopyBits");
         let mut loaded = load_pef_application(&pef).unwrap();
@@ -2212,6 +2274,23 @@ fn gpu_native_deep_masks_match_all_depths_boolean_modes_aliases_and_stores() {
         assert_eq!(probe.handled_import_count, 1);
         assert_eq!(probe.unsupported_import_index, None);
         assert_eq!(loaded.memory.read_u8(dst_pixels), Some(0xad));
+
+        // Resource palettes may have zero seeds. Content equality still
+        // proves the same index space, even with a different current device.
+        for (source_seed, destination_seed) in [(0, 0), (0, 5), (4, 0)] {
+            loaded.memory.write_u32_be(src_ctable, source_seed).unwrap();
+            loaded.memory.write_u32_be(dst_ctable, destination_seed).unwrap();
+            loaded.memory.write_u8(dst_pixels, 0xa0).unwrap();
+            loaded.cpu.pc = loaded.entry_pc;
+            loaded.cpu.gpr[3] = src_pixmap;
+            loaded.cpu.gpr[4] = dst_pixmap;
+            loaded.cpu.gpr[5] = rect;
+            loaded.cpu.gpr[6] = rect;
+            loaded.cpu.gpr[7] = 0;
+            let probe = loaded.run_with_hle_imports(64);
+            assert_eq!(probe.handled_import_count, 1);
+            assert_eq!(loaded.memory.read_u8(dst_pixels), Some(0xad));
+        }
 
         // A reused seed is insufficient when the ordinary image tables no
         // longer describe the same colors.

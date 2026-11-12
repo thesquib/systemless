@@ -6,6 +6,7 @@ pub(super) struct PpcControlDispatchContext<'a> {
     pub(super) binding: &'a PpcImportBinding,
     pub(super) cpu: &'a mut PpcCpu,
     pub(super) memory: &'a mut PpcSectionMem,
+    pub(super) window_list: &'a SharedProcessWindowList,
     pub(super) process_memory_manager: &'a mut ProcessNativeMemoryManager,
     pub(super) heap_cursor: &'a mut u32,
     pub(super) heap_limit: u32,
@@ -29,6 +30,7 @@ pub(super) fn dispatch_control_import(
         binding,
         cpu,
         memory,
+        window_list,
         process_memory_manager,
         heap_cursor,
         heap_limit,
@@ -52,6 +54,7 @@ pub(super) fn dispatch_control_import(
                 // Dialog controls are represented by the live DITL, whose
                 // renderer also translates dialog-local item coordinates.
                 let _ = ppc_draw_dialog(
+                    window_list,
                     memory,
                     handles,
                     controls,
@@ -158,6 +161,7 @@ pub(super) fn dispatch_control_import(
                     control_handle,
                 ) {
                     let _ = ppc_draw_dialog(
+                        window_list,
                         memory,
                         handles,
                         controls,
@@ -3053,6 +3057,29 @@ pub(super) fn ppc_blit_theme_bitmap_masked(
     bitmap: &ThemeBitmap,
     transparent: Option<Rgb8>,
 ) -> bool {
+    ppc_blit_theme_bitmap_excluding_rect(
+        memory,
+        gworlds,
+        port,
+        top,
+        left,
+        bitmap,
+        transparent,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ppc_blit_theme_bitmap_excluding_rect(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    port: u32,
+    top: i16,
+    left: i16,
+    bitmap: &ThemeBitmap,
+    transparent: Option<Rgb8>,
+    excluded: Option<(i16, i16, i16, i16)>,
+) -> bool {
     let Some(surface) = ppc_live_quickdraw_surface(memory, gworlds, port) else {
         return false;
     };
@@ -3085,6 +3112,14 @@ pub(super) fn ppc_blit_theme_bitmap_masked(
             }
             let port_h = i32::from(left) + x as i32;
             let port_v = i32::from(top) + y as i32;
+            if excluded.is_some_and(|(t, l, b, r)| {
+                i32::from(t) <= port_v
+                    && port_v < i32::from(b)
+                    && i32::from(l) <= port_h
+                    && port_h < i32::from(r)
+            }) {
+                continue;
+            }
             let point = surface.local_point((port_h, port_v));
             let port_h = point.0 + i32::from(surface.left);
             let port_v = point.1 + i32::from(surface.top);

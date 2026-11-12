@@ -369,6 +369,17 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
         PpcImportDispatcherTarget::CurResFile => Some(PpcImportAction::Return(ppc_i16_result(
             ppc_guest_resource_refnum(memory, *current_resource_refnum),
         ))),
+        PpcImportDispatcherTarget::LMGetCurMap => Some(PpcImportAction::Return(ppc_i16_result(
+            memory.read_u16_be(PPC_CUR_RES_FILE_ADDR).unwrap_or(0) as i16,
+        ))),
+        PpcImportDispatcherTarget::LMSetCurMap => {
+            let guest_refnum = cpu.gpr[3] as u16 as i16;
+            *current_resource_refnum = ppc_internal_resource_refnum(memory, guest_refnum);
+            // Raw low-memory accessors preserve the caller's word, including
+            // zero, rather than expanding the internal application alias.
+            let _ = memory.write_u16_be(PPC_CUR_RES_FILE_ADDR, guest_refnum as u16);
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::UseResFile => {
             let refnum = ppc_internal_resource_refnum(memory, cpu.gpr[3] as u16 as i16);
             ppc_set_current_resource_refnum(
@@ -442,11 +453,20 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 current_resource_refnum,
                 last_resource_error,
                 default_dir_id,
+                *application_working_directory_ref_num,
+                working_directories,
+                vfs_volumes,
             ) as u16 as u32))
         }
         PpcImportDispatcherTarget::ResError => Some(PpcImportAction::Return(ppc_i16_result(
             *last_resource_error,
         ))),
+        PpcImportDispatcherTarget::LMSetResErr => {
+            // LowMem.h declares a signed word setter. The import boundary
+            // publishes this value to the shared process ResErr word.
+            *last_resource_error = cpu.gpr[3] as i16;
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::GetVol => {
             Some(PpcImportAction::Return(ppc_i16_result(ppc_get_vol(
                 cpu,
@@ -836,6 +856,7 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 vfs_files,
                 vfs_resource_files,
                 default_dir_id,
+                working_directories,
             ))))
         }
         PpcImportDispatcherTarget::PBGetFCBInfo => Some(PpcImportAction::Return(ppc_i16_result(
@@ -888,6 +909,22 @@ pub(super) fn dispatch_file_import(context: PpcFileDispatchContext<'_>) -> Optio
                 mount_flags,
             ))))
         }
+        PpcImportDispatcherTarget::FileCompatibility(
+            PpcFileCompatibilityOperation::PbDirCreateSync,
+        ) => Some(PpcImportAction::Return(ppc_i16_result(
+            dispatch_file_manager::ppc_pb_dir_create(
+                cpu.gpr[3],
+                memory,
+                vfs_directories,
+                next_vfs_dir_id,
+                vfs_files,
+                vfs_resource_files,
+                vfs_volumes,
+                default_dir_id,
+                *application_working_directory_ref_num,
+                working_directories,
+            ),
+        ))),
         PpcImportDispatcherTarget::FileCompatibility(operation) => {
             Some(ppc_dispatch_file_compatibility(
                 operation,
@@ -1489,8 +1526,9 @@ pub(super) fn ppc_dispatch_file_compatibility(
         PpcFileCompatibilityOperation::PbHGetVolParmsSync => PpcImportAction::Return(
             ppc_i16_result(ppc_complete_pb(memory, cpu.gpr[3], PPC_NO_ERR)),
         ),
-        PpcFileCompatibilityOperation::PbCatSearchSync
-        | PpcFileCompatibilityOperation::PbDirCreateSync => PpcImportAction::Return(
+        // Directory creation is dispatched above with the mutable catalog.
+        PpcFileCompatibilityOperation::PbDirCreateSync => unreachable!("directory creation dispatch"),
+        PpcFileCompatibilityOperation::PbCatSearchSync => PpcImportAction::Return(
             ppc_i16_result(ppc_complete_pb(memory, cpu.gpr[3], PPC_FNF_ERR)),
         ),
         PpcFileCompatibilityOperation::OpenDf

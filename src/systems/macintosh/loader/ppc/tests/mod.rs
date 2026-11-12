@@ -952,3 +952,8 @@ mod highlight_preferences;
 mod usb;
 
 mod theme_button;
+
+mod outline_glyph_spans;
+
+#[path = "gdevice_changed.rs"]
+mod gdevice_changed;

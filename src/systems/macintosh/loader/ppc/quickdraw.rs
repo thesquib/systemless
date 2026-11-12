@@ -1331,6 +1331,7 @@ fn ppc_fill_rows_with_pixpat(
         }
     }
     let mut wrote = false;
+    let mut copy_row = Vec::new();
     for (row_idx, endpoints) in rows.iter().enumerate() {
         let y = top.saturating_add(row_idx as i16);
         if y < surf_top || y >= surf_bottom {
@@ -1342,6 +1343,42 @@ fn ppc_fill_rows_with_pixpat(
             let seg_right = interval[1].min(surf_right);
             if seg_right <= seg_left {
                 continue;
+            }
+            // The sampler is already detached from guest memory. In copy mode,
+            // publish one contiguous interval instead of notifying memory and
+            // presentation once per pixel. Keep the scalar path for packed
+            // pixels, Boolean modes, invalid strides and partially mapped rows.
+            if mode & 7 == 0 && matches!(front_buffer.depth, 8 | 16) {
+                let lanes = front_buffer.depth / 8;
+                let pixel_addr = |x: i16| {
+                    let point = (i32::from(x) - i32::from(surf_left), buf_y);
+                    if lanes == 1 {
+                        ppc_front_buffer_8bpp_pixel_addr(front_buffer, point)
+                    } else {
+                        ppc_q3_front_buffer_pixel_addr(front_buffer, point)
+                    }
+                };
+                let count = (i32::from(seg_right) - i32::from(seg_left)) as u32;
+                if let Some(start) = pixel_addr(seg_left) {
+                    if start
+                        .checked_add((count - 1) * lanes)
+                        .is_some_and(|last| pixel_addr(seg_right - 1) == Some(last))
+                    {
+                        copy_row.clear();
+                        for x in seg_left..seg_right {
+                            let pixel = sampler.sample(x, y);
+                            if lanes == 1 {
+                                copy_row.push(pixel as u8);
+                            } else {
+                                copy_row.extend_from_slice(&pixel.to_be_bytes());
+                            }
+                        }
+                        if memory.write_bytes(start, &copy_row).is_some() {
+                            wrote = true;
+                            continue;
+                        }
+                    }
+                }
             }
             for x in seg_left..seg_right {
                 let buf_x = i32::from(x) - i32::from(surf_left);
@@ -1417,6 +1454,51 @@ pub(crate) fn ppc_fill_color_region(
         &sampler,
         8,
     )
+}
+
+/// EraseRect uses the background pattern in patCopy mode, independently of
+/// pen ink/mode. IM: Imaging With QuickDraw, pp. 3-9 and 4-60. Reuse the
+/// PixPat sampler and clipped rows so color tiles and mono patterns share
+/// the same port-coordinate phase, including low-depth destinations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ppc_erase_rect(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    port: u32,
+    rect: (i16, i16, i16, i16),
+    pixpat: u32,
+    pattern: [u8; 8],
+    fore: (PpcRgbColor, Option<u8>),
+    back: (PpcRgbColor, Option<u8>),
+) -> bool {
+    let (top, left, bottom, right) = rect;
+    if bottom <= top || right <= left {
+        return true;
+    }
+    let Some(surface) = ppc_live_quickdraw_surface(memory, gworlds, port) else {
+        return false;
+    };
+    let Some(fore_pixel) = ppc_quickdraw_surface_fore_pixel(memory, surface, fore.0, fore.1) else {
+        return false;
+    };
+    let Some(back_pixel) = ppc_quickdraw_surface_fore_pixel(memory, surface, back.0, back.1) else {
+        return false;
+    };
+    let sampler = if pixpat != 0 {
+        ppc_decode_pixpat_sampler(memory, surface, pixpat, fore_pixel, back_pixel)
+    } else {
+        PpcPixPatSampler {
+            width: 8,
+            height: 8,
+            kind: PpcPixPatKind::Mono {
+                pat1: pattern,
+                fore_pixel,
+                back_pixel,
+            },
+        }
+    };
+    let rows = vec![vec![left, right]; (i32::from(bottom) - i32::from(top)) as usize];
+    ppc_fill_rows_with_pixpat(memory, gworlds, port, top, bottom, rows, &sampler, 8)
 }
 
 pub(crate) fn ppc_fill_color_rect(
@@ -2266,19 +2348,66 @@ pub(crate) fn ppc_begin_outline_text_glyph(
         .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
     let mut vis_rows = regions::PpcRegionRowCache::for_band(vis, band_top, band_bottom);
     let mut clip_rows = regions::PpcRegionRowCache::for_band(clip, band_top, band_bottom);
+    let foreground = if lanes == 1 {
+        [color as u8, 0]
+    } else {
+        color.to_be_bytes()
+    };
+    let mut backgrounds = Vec::new();
+    let mut stored = Vec::new();
+    let left = left.max(0);
+    let right = right.min(fb.width as i32);
     for y in top.max(0)..bottom.min(fb.height as i32) {
-        for x in left.max(0)..right.min(fb.width as i32) {
+        let mut x = left;
+        while x < right {
             if !ppc_cached_point_in_port_regions(surface, (x, y), &mut vis_rows, &mut clip_rows) {
+                x += 1;
                 continue;
             }
-            let address = fb.base_addr + y as u32 * fb.row_bytes + x as u32 * lanes;
-            for lane in 0..lanes {
-                let foreground = (color >> ((lanes - 1 - lane) * 8)) as u8;
-                let Some(background) = memory.read_u8(address + lane) else {
-                    continue;
-                };
+            let start = x;
+            x += 1;
+            while x < right
+                && ppc_cached_point_in_port_regions(surface, (x, y), &mut vis_rows, &mut clip_rows)
+            {
+                x += 1;
+            }
+            let count = (x - start) as usize;
+            let address = fb.base_addr + y as u32 * fb.row_bytes + start as u32 * lanes;
+            backgrounds.resize(count * lanes as usize, 0);
+            if memory.read_bytes_into(address, &mut backgrounds).is_some() {
+                // Keep blank cells too: the later bitmap stores may hit any
+                // byte in this interval. The span API preserves the scalar
+                // coverage and repeated-ink rules while grouping offscreen work.
+                stored.resize(count, 255);
                 if let Some(mut p) = slot.as_mut() {
-                    p.glyph_pixel(address + lane, x as i16, y as i16, foreground, background);
+                    p.glyph_span(
+                        address,
+                        (start as i16, y as i16),
+                        lanes as usize,
+                        &foreground[..lanes as usize],
+                        &backgrounds,
+                        &stored,
+                    );
+                }
+                continue;
+            }
+            // A partially mapped row still registers each readable byte, as
+            // before. Never manufacture a background for an inaccessible lane.
+            for x in start..x {
+                let address = fb.base_addr + y as u32 * fb.row_bytes + x as u32 * lanes;
+                for lane in 0..lanes {
+                    let Some(background) = memory.read_u8(address + lane) else {
+                        continue;
+                    };
+                    if let Some(mut p) = slot.as_mut() {
+                        p.glyph_pixel(
+                            address + lane,
+                            x as i16,
+                            y as i16,
+                            foreground[lane as usize],
+                            background,
+                        );
+                    }
                 }
             }
         }
@@ -4755,9 +4884,12 @@ pub(crate) fn ppc_color_tables_share_index_space(
         let table = handle
             .and_then(|handle| memory.read_u32_be(handle))
             .filter(|table| *table != 0)?;
-        let seed = memory.read_u32_be(table)?;
+        // Compare the indexed colors themselves, including resource tables
+        // with a zero ctSeed. A seed is not evidence against content equality.
+        // Remapping an identical offscreen table through a different current
+        // device would change the pixel indices used by later palette changes.
         let flags = memory.read_u16_be(table.checked_add(4)?)?;
-        if seed == 0 || flags & 0xc000 != 0 {
+        if flags & 0xc000 != 0 {
             return None;
         }
         let entry_count = usize::from(memory.read_u16_be(table.checked_add(6)?)?).checked_add(1)?;
@@ -5329,6 +5461,12 @@ pub(crate) fn ppc_copy_bits(
             Some(storage)
         };
 
+        // The mask snapshot cannot change during this transfer. Decode its
+        // scanline intervals once, rather than allocating them per pixel.
+        let mut mask_rows = regions::PpcRegionRowCache::for_band(
+            mask_storage.as_deref(), copy_top as i16, copy_bottom as i16,
+        );
+
         // Inside Macintosh: Imaging With QuickDraw (1994), pp. 3-112–3-116
         // and 4-27: CopyBits copies bitmap or PixMap pixels between graphics
         // ports and GWorlds, including indexed-color PixMaps. The import
@@ -5518,16 +5656,17 @@ pub(crate) fn ppc_copy_bits(
                 }),
                 (mask_storage.is_some() || transparent).then(|| {
                     crate::quickdraw::gpu::QuickDrawGpuBlitClip {
-                        coverage: mask_storage.as_ref().map(|storage| {
-                            (copy_top..copy_bottom)
-                                .flat_map(|y| {
-                                    (copy_left..copy_right).map(move |x| {
-                                        u8::from(ppc_point_in_region_storage(
-                                            storage, y as i16, x as i16,
-                                        ))
-                                    })
-                                })
-                                .collect()
+                        coverage: mask_storage.as_ref().map(|_| {
+                            let mut coverage = Vec::with_capacity(
+                                (copy_bottom - copy_top) as usize
+                                    * (copy_right - copy_left) as usize,
+                            );
+                            for y in copy_top..copy_bottom {
+                                for x in copy_left..copy_right {
+                                    coverage.push(u8::from(mask_rows.contains(y as i16, x as i16)));
+                                }
+                            }
+                            coverage
                         }),
                         transparent: transparent.then_some([
                             transparent_back_pixel,
@@ -5567,6 +5706,9 @@ pub(crate) fn ppc_copy_bits(
         let gpu_handled = gpu_writes.is_some();
         let mut writes = gpu_writes.unwrap_or_default();
         if !gpu_handled {
+            // This transfer owns one destination palette snapshot. Cache exact
+            // RGB555 conversions locally, with an out-of-range index sentinel.
+            let mut direct_index_cache: Option<Vec<u16>> = None;
             for dst_y in copy_top..copy_bottom {
                 let rel_y = i64::from(dst_y) - i64::from(dst_top);
                 let src_y = i64::from(src_top) + (rel_y * src_height) / dst_height;
@@ -5583,9 +5725,7 @@ pub(crate) fn ppc_copy_bits(
                     else {
                         continue;
                     };
-                    if mask_storage.as_ref().is_some_and(|storage| {
-                        !ppc_point_in_region_storage(storage, dst_y as i16, dst_x as i16)
-                    }) {
+                    if !mask_rows.contains(dst_y as i16, dst_x as i16) {
                         continue;
                     }
                     // The high byte of a classic 32-bit xRGB pixel is padding.
@@ -5663,12 +5803,19 @@ pub(crate) fn ppc_copy_bits(
                     } else if src_bits.depth == 16
                         && ppc_indexed_depth_entry_count(dst_bits.depth).is_some()
                     {
-                        let [red, green, blue] = ppc_rgb555_to_rgb16(src_pixel as u16);
-                        u32::from(ppc_rgb_color_to_index_in_clut(
-                            PpcRgbColor { red, green, blue },
-                            dst_clut.as_ref()?,
-                            ppc_indexed_depth_entry_count(dst_bits.depth)?,
-                        ))
+                        let clut = dst_clut.as_ref()?;
+                        let indices = direct_index_cache
+                            .get_or_insert_with(|| vec![u16::MAX; 1 << 15]);
+                        let slot = &mut indices[(src_pixel & 0x7fff) as usize];
+                        if *slot == u16::MAX {
+                            let [red, green, blue] = ppc_rgb555_to_rgb16(src_pixel as u16);
+                            *slot = u16::from(ppc_rgb_color_to_index_in_clut(
+                                PpcRgbColor { red, green, blue },
+                                clut,
+                                ppc_indexed_depth_entry_count(dst_bits.depth)?,
+                            ));
+                        }
+                        u32::from(*slot)
                     } else if ppc_indexed_depth_entry_count(src_bits.depth).is_some()
                         && ppc_indexed_depth_entry_count(dst_bits.depth).is_some()
                     {

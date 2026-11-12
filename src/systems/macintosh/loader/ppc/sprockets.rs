@@ -1,5 +1,6 @@
 //! DrawSprocket and InputSprocket emulation and trace records.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -22,6 +23,7 @@ pub const PPC_DSP_LARGE_SCREEN_HEIGHT: u32 = 600;
 pub const PPC_DSP_CONTEXT_OPTION_QD3D_ACCEL: u32 = 1 << 0;
 pub const PPC_DSP_DEPTH_MASK_16: u32 = 1 << 4;
 pub const PPC_MAIN_SCREEN_STORAGE_DEPTH: u32 = 16;
+pub const PPC_DSP_DEPTH_MASK_32: u32 = 1 << 5;
 pub const PPC_DSP_ADVERTISED_PAGE_COUNT: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub struct PpcDrawSprocketState {
     pub blanking_window: Option<u32>,
     pub context_state: PpcDspContextPlayState,
     pub context_attributes: PpcDspContextAttributes,
+    pub selected_context: u32,
     pub dirty_grid_size: (u32, u32),
     pub front_buffer_gworld: u32,
     pub back_buffer_gworld: u32,
@@ -103,6 +106,7 @@ pub struct PpcDrawSprocketState {
     pub vbl_proc: Option<u32>,
     pub vbl_refcon: Option<u32>,
     pub(crate) desktop_snapshot: Option<PpcDspDesktopSnapshot>,
+    pub(crate) context_clut: Option<[[u16; 3]; 256]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +114,8 @@ pub(crate) struct PpcDspDesktopSnapshot {
     screen_bytes: Vec<u8>,
     gdevice_bytes: Vec<u8>,
     screen_clut: [[u16; 3]; 256],
+    color_manager_clut: [[u16; 3]; 256],
+    color_table_storage: Vec<(u32, Vec<u8>)>,
     records: Vec<PpcGWorldRecord>,
     pixmaps: Vec<(u32, Vec<u8>)>,
     /// Screen geometry the game reads (main portRect, visRgn, GrayRgn and
@@ -127,6 +133,7 @@ impl Default for PpcDrawSprocketState {
             blanking_window: None,
             context_state: PpcDspContextPlayState::Inactive,
             context_attributes: PpcDspContextAttributes::default(),
+            selected_context: PPC_DSP_CONTEXT,
             dirty_grid_size: (32, 32),
             front_buffer_gworld: PPC_MAIN_GWORLD,
             back_buffer_gworld: PPC_DSP_BACK_GWORLD,
@@ -148,6 +155,7 @@ impl Default for PpcDrawSprocketState {
             vbl_proc: None,
             vbl_refcon: None,
             desktop_snapshot: None,
+            context_clut: None,
         }
     }
 }
@@ -337,6 +345,9 @@ pub struct PpcInputSprocketVirtualElementRecord {
     pub keyboard_binding: Option<PpcInputSprocketKeyboardBinding>,
     pub need_name: String,
     pub need_record: Vec<u8>,
+    /// Horizontal and vertical pointer positions at the last delta read.
+    /// Widened coordinates retain unread movement across a cursor warp.
+    pub mouse_position: Cell<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,6 +395,50 @@ pub const PPC_DSP_CONTEXT_STATE_PAUSED: u32 = 1;
 pub const PPC_DSP_CONTEXT_STATE_INACTIVE: u32 = 2;
 // Keep synthetic device storage outside the guest RAM-backed application partition.
 pub const PPC_DSP_CONTEXT: u32 = 0x4000_0000;
+// Opaque identities for the software modes implemented by framebuffer activation.
+// Keep the original mutable FindBestContext/saved-context reference separate
+// from enumeration, whose mode identities must survive later searches.
+const PPC_DSP_ENUMERATED_CONTEXTS: [(u32, u32, u32, u32); 6] = [
+    (PPC_DSP_CONTEXT + 0x40, 640, 480, 16),
+    (PPC_DSP_CONTEXT + 0x10, 800, 600, 16),
+    (PPC_DSP_CONTEXT + 0x20, 640, 480, 8),
+    (PPC_DSP_CONTEXT + 0x30, 800, 600, 8),
+    (PPC_DSP_CONTEXT + 0x50, 640, 480, 32),
+    (PPC_DSP_CONTEXT + 0x60, 800, 600, 32),
+];
+
+pub(crate) fn ppc_dsp_enumerated_attributes(context: u32) -> Option<PpcDspContextAttributes> {
+    let &(_, width, height, depth) = PPC_DSP_ENUMERATED_CONTEXTS
+        .iter()
+        .find(|&&(reference, _, _, _)| reference == context)?;
+    let attributes = PpcDspContextAttributes {
+        width,
+        height,
+        display_depth: depth,
+        back_buffer_depth: depth,
+        display_best_depth_mask: 1 << depth.trailing_zeros(),
+        back_buffer_best_depth_mask: 1 << depth.trailing_zeros(),
+        ..PpcDspContextAttributes::default()
+    };
+    ppc_dsp_context_request_is_supported(attributes).then_some(attributes)
+}
+
+pub(crate) fn ppc_dsp_attributes_for_context(
+    context: u32,
+    state: &PpcDrawSprocketState,
+) -> Option<PpcDspContextAttributes> {
+    let enumerated = if context == PPC_DSP_CONTEXT {
+        PpcDspContextAttributes::default()
+    } else {
+        ppc_dsp_enumerated_attributes(context)?
+    };
+    Some(if context == state.selected_context {
+        state.context_attributes
+    } else {
+        enumerated
+    })
+}
+
 pub const PPC_DSP_CONTEXT_ATTRIBUTES_SIZE: u32 = 72;
 /// Private, versioned DrawSprocket context blob used for HLE save/restore.
 pub const PPC_DSP_FLAT_CONTEXT_SIZE: u32 = 12 + PPC_DSP_CONTEXT_ATTRIBUTES_SIZE;
@@ -425,7 +480,7 @@ pub const PPC_ISP_ELEMENT_EVENT_SIZE: u32 = 20;
 pub const PPC_ISP_ELEMENT_KIND_BUTTON: u32 = 0x6275_746e;
 pub const PPC_ISP_ELEMENT_KIND_DPAD: u32 = 0x6470_6164;
 pub const PPC_ISP_ELEMENT_KIND_AXIS: u32 = 0x6178_6973;
-pub const PPC_ISP_ELEMENT_KIND_DELTA: u32 = 0x6465_6c74;
+pub const PPC_ISP_ELEMENT_KIND_DELTA: u32 = u32::from_be_bytes(*b"dlta");
 pub const PPC_ISP_AXIS_MIDDLE: u32 = 0x7fff_ffff;
 pub const PPC_ISP_AXIS_LOW: u32 = 0;
 pub const PPC_ISP_AXIS_HIGH: u32 = 0xffff_ffff;
@@ -716,7 +771,7 @@ pub(crate) fn ppc_selected_dsp_context_attributes(
 }
 
 pub(crate) fn ppc_selected_dsp_depth(depth_mask: u32, best_depth: u32, default_depth: u32) -> u32 {
-    if matches!(best_depth, 8 | 16)
+    if matches!(best_depth, 8 | 16 | 32)
         && (depth_mask == 0 || depth_mask & (1 << best_depth.trailing_zeros()) != 0)
     {
         return best_depth;
@@ -725,6 +780,8 @@ pub(crate) fn ppc_selected_dsp_depth(depth_mask: u32, best_depth: u32, default_d
         16
     } else if depth_mask & PPC_DSP_DEPTH_MASK_8 != 0 {
         8
+    } else if depth_mask & PPC_DSP_DEPTH_MASK_32 != 0 {
+        32
     } else {
         default_depth
     }
@@ -759,9 +816,10 @@ pub(crate) fn ppc_dsp_context_request_is_supported(requested: PpcDspContextAttri
 }
 
 pub(crate) fn ppc_dsp_depth_request_is_supported(depth_mask: u32, best_depth: u32) -> bool {
-    const SUPPORTED_DEPTH_MASK: u32 = PPC_DSP_DEPTH_MASK_8 | PPC_DSP_DEPTH_MASK_16;
+    const SUPPORTED_DEPTH_MASK: u32 =
+        PPC_DSP_DEPTH_MASK_8 | PPC_DSP_DEPTH_MASK_16 | PPC_DSP_DEPTH_MASK_32;
     (depth_mask == 0 || depth_mask & SUPPORTED_DEPTH_MASK != 0)
-        && (best_depth == 0 || matches!(best_depth, 8 | 16))
+        && (best_depth == 0 || matches!(best_depth, 8 | 16 | 32))
 }
 
 pub(crate) fn ppc_dsp_back_buffer_depth_request_is_supported(
@@ -790,7 +848,12 @@ pub(crate) fn ppc_record_requested_dsp_context_attributes(
     attributes: u32,
     draw_sprocket: &mut PpcDrawSprocketState,
 ) -> Option<()> {
-    let requested = ppc_read_optional_dsp_context_attributes(memory, attributes)?;
+    let mut requested = ppc_read_optional_dsp_context_attributes(memory, attributes)?;
+    // Apple Game Sprockets Guide, "Choosing a Context": search attributes
+    // are requirements, but reservation features are requests. Fall back
+    // to our supported software buffering without resetting the requested
+    // display dimensions or pixel depths when more pages are desired.
+    requested.page_count = requested.page_count.min(PPC_DSP_MAX_REQUESTED_PAGE_COUNT);
     draw_sprocket.context_attributes = ppc_selected_dsp_context_attributes(requested);
     Some(())
 }
@@ -860,8 +923,12 @@ pub(crate) fn ppc_dsp_context_flatten(
             .write_u32_be(flat + 4, PPC_DSP_FLAT_CONTEXT_VERSION)
             .is_none()
         || memory.write_u32_be(flat + 8, PPC_DSP_DISPLAY_ID).is_none()
-        || ppc_write_dsp_context_attributes(memory, flat + 12, draw_sprocket.context_attributes)
-            .is_none()
+        || ppc_write_dsp_context_attributes(
+            memory,
+            flat + 12,
+            ppc_dsp_attributes_for_context(cpu.gpr[3], draw_sprocket).unwrap(),
+        )
+        .is_none()
     {
         return PPC_PARAM_ERR;
     }
@@ -900,6 +967,7 @@ pub(crate) fn ppc_dsp_context_restore(
         return PPC_PARAM_ERR;
     }
     draw_sprocket.context_attributes = attributes;
+    draw_sprocket.selected_context = PPC_DSP_CONTEXT;
     PPC_NO_ERR
 }
 
@@ -922,7 +990,7 @@ pub(crate) fn ppc_dsp_context_get_buffer(
 }
 
 pub(crate) fn ppc_dsp_context_error(context: u32) -> Option<i16> {
-    if context == PPC_DSP_CONTEXT {
+    if context == PPC_DSP_CONTEXT || ppc_dsp_enumerated_attributes(context).is_some() {
         None
     } else {
         Some(PPC_DSP_CONTEXT_NOT_FOUND_ERR)
@@ -1045,7 +1113,7 @@ pub(crate) fn ppc_dsp_get_first_context(cpu: &PpcCpu, memory: &mut PpcSectionMem
         return PPC_DSP_CONTEXT_NOT_FOUND_ERR;
     }
     if memory
-        .write_u32_be(context_out_ptr, PPC_DSP_CONTEXT)
+        .write_u32_be(context_out_ptr, PPC_DSP_ENUMERATED_CONTEXTS[0].0)
         .is_none()
     {
         return PPC_PARAM_ERR;
@@ -1053,7 +1121,11 @@ pub(crate) fn ppc_dsp_get_first_context(cpu: &PpcCpu, memory: &mut PpcSectionMem
     PPC_NO_ERR
 }
 
-pub(crate) fn ppc_dsp_get_next_context(cpu: &PpcCpu, memory: &mut PpcSectionMem) -> i16 {
+pub(crate) fn ppc_dsp_get_next_context(
+    cpu: &PpcCpu,
+    memory: &mut PpcSectionMem,
+    draw_sprocket: &PpcDrawSprocketState,
+) -> i16 {
     let current_context = cpu.gpr[3];
     let context_out_ptr = cpu.gpr[4];
     if context_out_ptr == 0 || !ppc_memory_can_write_bytes(memory, context_out_ptr, 4) {
@@ -1062,9 +1134,33 @@ pub(crate) fn ppc_dsp_get_next_context(cpu: &PpcCpu, memory: &mut PpcSectionMem)
     if let Some(error) = ppc_dsp_context_error(current_context) {
         return error;
     }
-    // Systemless exposes one faithful software display context, so the first
-    // valid context is also the end of the enumeration described above.
-    PPC_DSP_CONTEXT_NOT_FOUND_ERR
+    // Apple Game Sprockets Legacy Reference, DSpGetNextContext: enumerate
+    // contexts on this display without reserving or activating any of them.
+    // FindBestContext retains its historical mutable reference. Continue from
+    // the corresponding mode when a caller enumerates from that reference.
+    let selected = draw_sprocket.context_attributes;
+    let Some(index) = PPC_DSP_ENUMERATED_CONTEXTS
+        .iter()
+        .position(|&(reference, width, height, depth)| {
+            reference == current_context
+                || (current_context == PPC_DSP_CONTEXT
+                    && (width, height, depth)
+                        == (selected.width, selected.height, selected.display_depth))
+        })
+    else {
+        return PPC_DSP_CONTEXT_NOT_FOUND_ERR;
+    };
+    let next = PPC_DSP_ENUMERATED_CONTEXTS[index + 1..]
+        .iter()
+        .map(|&(reference, _, _, _)| reference)
+        .find(|&reference| ppc_dsp_enumerated_attributes(reference).is_some());
+    let Some(next) = next else {
+        return PPC_DSP_CONTEXT_NOT_FOUND_ERR;
+    };
+    if memory.write_u32_be(context_out_ptr, next).is_none() {
+        return PPC_PARAM_ERR;
+    }
+    PPC_NO_ERR
 }
 
 pub(crate) fn ppc_dsp_process_event(cpu: &PpcCpu, memory: &mut PpcSectionMem) -> i16 {
@@ -1207,6 +1303,7 @@ pub(crate) fn ppc_dsp_find_best_context(
         return PPC_PARAM_ERR;
     }
     draw_sprocket.context_attributes = ppc_selected_dsp_context_attributes(requested);
+    draw_sprocket.selected_context = PPC_DSP_CONTEXT;
     draw_sprocket.started = true;
     PPC_NO_ERR
 }
@@ -1265,7 +1362,11 @@ pub(crate) fn ppc_dsp_get_mouse(
     PPC_NO_ERR
 }
 
-pub(crate) fn ppc_dsp_find_context_from_point(cpu: &PpcCpu, memory: &mut PpcSectionMem) -> i16 {
+pub(crate) fn ppc_dsp_find_context_from_point(
+    cpu: &PpcCpu,
+    memory: &mut PpcSectionMem,
+    draw_sprocket: &PpcDrawSprocketState,
+) -> i16 {
     // Inside Macintosh: Apple Game Sprockets Guide (1996),
     // "DSpFindContextFromPoint". PowerPC passes the four-byte Point value in r3.
     let global_v = (cpu.gpr[3] >> 16) as u16 as i16;
@@ -1281,7 +1382,13 @@ pub(crate) fn ppc_dsp_find_context_from_point(cpu: &PpcCpu, memory: &mut PpcSect
     {
         return PPC_DSP_CONTEXT_NOT_FOUND_ERR;
     }
-    if memory.write_u32_be(out_context, PPC_DSP_CONTEXT).is_none() {
+    if memory
+        .write_u32_be(
+            out_context,
+            draw_sprocket.active_context.unwrap_or(PPC_DSP_CONTEXT),
+        )
+        .is_none()
+    {
         return PPC_PARAM_ERR;
     }
     PPC_NO_ERR
@@ -1498,7 +1605,7 @@ fn ppc_dsp_restore_underlay(
         return false;
     };
     if source.depth != back.depth
-        || !matches!(back.depth, 8 | 16)
+        || !matches!(back.depth, 8 | 16 | 32)
         || source.width != back.width
         || source.height != back.height
     {
@@ -1598,6 +1705,11 @@ pub(crate) fn ppc_dsp_context_reserve(
     {
         return PPC_PARAM_ERR;
     }
+    if cpu.gpr[4] == 0 && draw_sprocket.selected_context != context {
+        draw_sprocket.context_attributes =
+            ppc_dsp_attributes_for_context(context, draw_sprocket).unwrap();
+    }
+    draw_sprocket.selected_context = context;
     // Reserving an inactive context must leave the desktop display mode and
     // its pixels alone. The switch occurs when SetState activates the context.
     draw_sprocket.back_buffer_gworld = if draw_sprocket.context_attributes.page_count == 1 {
@@ -1625,7 +1737,7 @@ pub(crate) fn ppc_configure_dsp_framebuffers(
     ) || attributes.width > ppc_main_screen_width()
         || attributes.height > ppc_main_screen_height()
         || attributes.display_depth != attributes.back_buffer_depth
-        || !matches!(attributes.display_depth, 8 | 16)
+        || !matches!(attributes.display_depth, 8 | 16 | 32)
     {
         return None;
     }
@@ -1654,6 +1766,19 @@ pub(crate) fn ppc_configure_dsp_framebuffers(
             )?;
             // Every PixMap owns a color table handle, direct ones included.
             memory.write_u32_be(record.pixmap + 42, PPC_MAIN_CTABLE_HANDLE)?;
+            if record.port == PPC_DSP_BACK_GWORLD {
+                // The back CGrafPort must expose the same extent as its PixMap.
+                // GetPortBounds and callers reading portRect use this record.
+                ppc_write_rect(
+                    memory, record.port + 16, 0, 0,
+                    attributes.height as i16, attributes.width as i16,
+                )?;
+                let visible = memory.read_u32_be(record.port + PPC_CGRAF_PORT_VIS_RGN_OFFSET)?;
+                ppc_write_rgn_bbox(
+                    memory, visible, 0, 0,
+                    attributes.height as i16, attributes.width as i16,
+                )?;
+            }
         } else {
             // A screen-backed window keeps its local bounds through a display
             // switch. Only its shared pixel format changes while the context
@@ -1719,6 +1844,17 @@ fn ppc_dsp_blank_display(
                 pair.copy_from_slice(&pixel);
             }
         }
+        32 => {
+            let pixel = [
+                0,
+                (blanking_color.red >> 8) as u8,
+                (blanking_color.green >> 8) as u8,
+                (blanking_color.blue >> 8) as u8,
+            ];
+            for value in pixels.chunks_exact_mut(4) {
+                value.copy_from_slice(&pixel);
+            }
+        }
         _ => return None,
     }
     memory.write_bytes(PPC_MAIN_SCREEN_BASE, &pixels)?;
@@ -1729,6 +1865,7 @@ fn ppc_dsp_capture_desktop(
     memory: &mut PpcSectionMem,
     gworlds: &[PpcGWorldRecord],
     screen_clut: &[[u16; 3]; 256],
+    color_manager_clut: &[[u16; 3]; 256],
     screen_bits: Option<u32>,
 ) -> Option<PpcDspDesktopSnapshot> {
     let screen_bytes =
@@ -1754,7 +1891,12 @@ fn ppc_dsp_capture_desktop(
         PPC_MAIN_GWORLD + 16,
         ppc_memory_read_bytes(memory, PPC_MAIN_GWORLD + 16, 8)?,
     )];
-    for rgn in [PPC_MAIN_VIS_RGN_HANDLE, PPC_GRAY_RGN_HANDLE] {
+    screen_geometry.push((
+        PPC_DSP_BACK_GWORLD + 16,
+        ppc_memory_read_bytes(memory, PPC_DSP_BACK_GWORLD + 16, 8)?,
+    ));
+    let back_visible = memory.read_u32_be(PPC_DSP_BACK_GWORLD + PPC_CGRAF_PORT_VIS_RGN_OFFSET)?;
+    for rgn in [PPC_MAIN_VIS_RGN_HANDLE, PPC_GRAY_RGN_HANDLE, back_visible] {
         let ptr = ppc_rgn_ptr(memory, rgn)?;
         let size = u32::from(memory.read_u16_be(ptr)?.max(10));
         screen_geometry.push((ptr, ppc_memory_read_bytes(memory, ptr, size)?));
@@ -1766,6 +1908,17 @@ fn ppc_dsp_capture_desktop(
         screen_bytes,
         gdevice_bytes,
         screen_clut: *screen_clut,
+        color_manager_clut: *color_manager_clut,
+        color_table_storage: vec![
+            (
+                PPC_MAIN_CTABLE_HANDLE,
+                ppc_memory_read_bytes(memory, PPC_MAIN_CTABLE_HANDLE, 4)?,
+            ),
+            (
+                PPC_MAIN_CTABLE,
+                ppc_memory_read_bytes(memory, PPC_MAIN_CTABLE, PPC_MAIN_CTABLE_SIZE)?,
+            ),
+        ],
         records,
         pixmaps,
         screen_geometry,
@@ -1776,6 +1929,7 @@ pub(crate) fn ppc_dsp_restore_desktop(
     memory: &mut PpcSectionMem,
     gworlds: &mut [PpcGWorldRecord],
     screen_clut: &mut [[u16; 3]; 256],
+    color_manager_clut: &mut [[u16; 3]; 256],
     draw_sprocket: &mut PpcDrawSprocketState,
 ) -> bool {
     let Some(snapshot) = draw_sprocket.desktop_snapshot.as_ref() else {
@@ -1813,7 +1967,16 @@ pub(crate) fn ppc_dsp_restore_desktop(
             }
         }
     }
+    for (address, bytes) in &snapshot.color_table_storage {
+        if memory.write_bytes(*address, bytes).is_none() {
+            return false;
+        }
+    }
+    if draw_sprocket.context_attributes.display_depth == 8 {
+        draw_sprocket.context_clut = Some(*screen_clut);
+    }
     *screen_clut = snapshot.screen_clut;
+    *color_manager_clut = snapshot.color_manager_clut;
     draw_sprocket.desktop_snapshot = None;
     true
 }
@@ -1823,6 +1986,7 @@ pub(crate) fn ppc_dsp_context_release(
     memory: &mut PpcSectionMem,
     gworlds: &mut [PpcGWorldRecord],
     screen_clut: &mut [[u16; 3]; 256],
+    color_manager_clut: &mut [[u16; 3]; 256],
     draw_sprocket: &mut PpcDrawSprocketState,
 ) -> i16 {
     let context = cpu.gpr[3];
@@ -1832,7 +1996,13 @@ pub(crate) fn ppc_dsp_context_release(
     if draw_sprocket.reserved_context != Some(context) {
         return PPC_DSP_CONTEXT_NOT_RESERVED_ERR;
     }
-    if !ppc_dsp_restore_desktop(memory, gworlds, screen_clut, draw_sprocket) {
+    if !ppc_dsp_restore_desktop(
+        memory,
+        gworlds,
+        screen_clut,
+        color_manager_clut,
+        draw_sprocket,
+    ) {
         return PPC_PARAM_ERR;
     }
     draw_sprocket.underlay_alt_buffer = 0;
@@ -1850,6 +2020,8 @@ pub(crate) fn ppc_dsp_context_set_state(
     memory: &mut PpcSectionMem,
     gworlds: &mut [PpcGWorldRecord],
     screen_clut: &mut [[u16; 3]; 256],
+    color_manager_clut: &mut [[u16; 3]; 256],
+    next_ct_seed: &mut u32,
     screen_bits: Option<u32>,
     draw_sprocket: &mut PpcDrawSprocketState,
 ) -> i16 {
@@ -1868,12 +2040,27 @@ pub(crate) fn ppc_dsp_context_set_state(
         // adornments return and page flipping stops. Game Sprockets, 2-43.
         PpcDspContextPlayState::Active | PpcDspContextPlayState::Paused => {
             if draw_sprocket.desktop_snapshot.is_none() {
-                let Some(snapshot) =
-                    ppc_dsp_capture_desktop(memory, gworlds, screen_clut, screen_bits)
-                else {
+                let Some(snapshot) = ppc_dsp_capture_desktop(
+                    memory,
+                    gworlds,
+                    screen_clut,
+                    color_manager_clut,
+                    screen_bits,
+                ) else {
                     return PPC_PARAM_ERR;
                 };
                 draw_sprocket.desktop_snapshot = Some(snapshot);
+                if draw_sprocket.context_attributes.display_depth == 8
+                    && (!ppc_memory_can_write_bytes(memory, PPC_MAIN_CTABLE_HANDLE, 4)
+                        || !ppc_memory_can_write_bytes(
+                            memory,
+                            PPC_MAIN_CTABLE,
+                            PPC_MAIN_CTABLE_SIZE,
+                        ))
+                {
+                    draw_sprocket.desktop_snapshot = None;
+                    return PPC_PARAM_ERR;
+                }
                 if ppc_configure_dsp_framebuffers(
                     memory,
                     gworlds,
@@ -1889,8 +2076,37 @@ pub(crate) fn ppc_dsp_context_set_state(
                     )
                     .is_none()
                 {
-                    let _ = ppc_dsp_restore_desktop(memory, gworlds, screen_clut, draw_sprocket);
+                    let _ = ppc_dsp_restore_desktop(
+                        memory,
+                        gworlds,
+                        screen_clut,
+                        color_manager_clut,
+                        draw_sprocket,
+                    );
                     return PPC_PARAM_ERR;
+                }
+                if draw_sprocket.context_attributes.display_depth == 8 {
+                    let colors = draw_sprocket.context_clut.unwrap_or(*screen_clut);
+                    if ppc_seed_main_color_table(memory).is_none()
+                        || !ppc_dsp_publish_clut(
+                            memory,
+                            screen_clut,
+                            color_manager_clut,
+                            next_ct_seed,
+                            0,
+                            &colors,
+                        )
+                    {
+                        let _ = ppc_dsp_restore_desktop(
+                            memory,
+                            gworlds,
+                            screen_clut,
+                            color_manager_clut,
+                            draw_sprocket,
+                        );
+                        return PPC_PARAM_ERR;
+                    }
+                    draw_sprocket.context_clut = Some(colors);
                 }
             }
             draw_sprocket.started = true;
@@ -1899,7 +2115,13 @@ pub(crate) fn ppc_dsp_context_set_state(
             draw_sprocket.context_state = state;
         }
         PpcDspContextPlayState::Inactive => {
-            if !ppc_dsp_restore_desktop(memory, gworlds, screen_clut, draw_sprocket) {
+            if !ppc_dsp_restore_desktop(
+                memory,
+                gworlds,
+                screen_clut,
+                color_manager_clut,
+                draw_sprocket,
+            ) {
                 return PPC_PARAM_ERR;
             }
             draw_sprocket.started = true;
@@ -2030,7 +2252,7 @@ pub(crate) fn ppc_dsp_present_back_buffer(
     if back.width != front.width
         || back.height != front.height
         || back.depth != front.depth
-        || !matches!(back.depth, 8 | 16)
+        || !matches!(back.depth, 8 | 16 | 32)
     {
         return false;
     }
@@ -2077,48 +2299,115 @@ pub(crate) fn ppc_dsp_present_back_buffer(
     true
 }
 
+/// Publish only the requested RGB components and a fresh seed. Device value
+/// flags and unrelated entries survive; all writes are preflighted atomically.
+fn ppc_dsp_publish_clut(
+    memory: &mut PpcSectionMem,
+    screen_clut: &mut [[u16; 3]; 256],
+    color_manager_clut: &mut [[u16; 3]; 256],
+    next_ct_seed: &mut u32,
+    start: usize,
+    colors: &[[u16; 3]],
+) -> bool {
+    if colors.is_empty() {
+        return true;
+    }
+    let Some(handle) = ppc_gdevice_ctable_handle(memory, PPC_MAIN_GDEVICE) else {
+        return false;
+    };
+    let Some(table) = memory.read_u32_be(handle).filter(|p| *p != 0) else {
+        return false;
+    };
+    let Some(last) = table.checked_add(6).and_then(|p| memory.read_u16_be(p)) else {
+        return false;
+    };
+    if start + colors.len() > usize::from(last) + 1 {
+        return false;
+    }
+    let seed = (*next_ct_seed).max(1024);
+    let mut writes = vec![(table, seed.to_be_bytes().to_vec())];
+    for (offset, color) in colors.iter().enumerate() {
+        let Some(address) = table.checked_add(10 + (start + offset) as u32 * 8) else {
+            return false;
+        };
+        writes.push((
+            address,
+            color.iter().flat_map(|v| v.to_be_bytes()).collect(),
+        ));
+    }
+    let ranges: Vec<_> = writes
+        .iter()
+        .map(|(address, bytes)| (*address, bytes.as_slice()))
+        .collect();
+    if !memory.try_write_ranges_atomic(&ranges) {
+        return false;
+    }
+    for (offset, color) in colors.iter().copied().enumerate() {
+        screen_clut[start + offset] = color;
+        color_manager_clut[start + offset] = color;
+    }
+    *next_ct_seed = seed.wrapping_add(1).max(1024);
+    true
+}
+
 pub(crate) fn ppc_dsp_context_set_clut_entries(
     cpu: &PpcCpu,
     memory: &mut PpcSectionMem,
     screen_clut: &mut [[u16; 3]; 256],
+    color_manager_clut: &mut [[u16; 3]; 256],
+    next_ct_seed: &mut u32,
+    draw_sprocket: &mut PpcDrawSprocketState,
 ) -> i16 {
     if let Some(error) = ppc_dsp_context_error(cpu.gpr[3]) {
         return error;
     }
     let entries_ptr = cpu.gpr[4];
-    let starting_entry = usize::from(cpu.gpr[5] as u16);
-    let entry_count = usize::from(cpu.gpr[6] as u16);
-    let Some(end_entry) = starting_entry.checked_add(entry_count) else {
-        return PPC_PARAM_ERR;
-    };
-    if end_entry > screen_clut.len() {
+    let start = usize::from(cpu.gpr[5] as u16);
+    let count = usize::from(cpu.gpr[6] as u16);
+    if start + count > 256 {
         return PPC_PARAM_ERR;
     }
-    let Some(byte_count) = entry_count.checked_mul(8) else {
+    if count == 0 {
+        return PPC_NO_ERR;
+    }
+    if entries_ptr == 0 || !ppc_memory_can_read_bytes(memory, entries_ptr, count as u32 * 8) {
         return PPC_PARAM_ERR;
+    }
+    // Apple Game Sprockets Guide (1996), 2-70: a starting index plus an
+    // entry count. Stage the entire ColorSpec array before any aliased write.
+    let mut colors = Vec::with_capacity(count);
+    for offset in 0..count {
+        let entry = entries_ptr + offset as u32 * 8;
+        let (Some(red), Some(green), Some(blue)) = (
+            memory.read_u16_be(entry + 2),
+            memory.read_u16_be(entry + 4),
+            memory.read_u16_be(entry + 6),
+        ) else {
+            return PPC_PARAM_ERR;
+        };
+        colors.push([red, green, blue]);
+    }
+    let owns_display = draw_sprocket.desktop_snapshot.is_some()
+        && draw_sprocket.context_attributes.display_depth == 8;
+    let mut context_clut = if owns_display {
+        *screen_clut
+    } else {
+        draw_sprocket.context_clut.unwrap_or(*screen_clut)
     };
-    if byte_count != 0
-        && (entries_ptr == 0 || !ppc_memory_can_read_bytes(memory, entries_ptr, byte_count as u32))
+    if owns_display
+        && !ppc_dsp_publish_clut(
+            memory,
+            screen_clut,
+            color_manager_clut,
+            next_ct_seed,
+            start,
+            &colors,
+        )
     {
         return PPC_PARAM_ERR;
     }
-
-    // Inside Macintosh: Apple Game Sprockets Guide (1996),
-    // DSpContext_SetCLUTEntries, p. 2-70: inEntries is an array of ColorSpec
-    // records replacing a zero-based contiguous range of the context's CLUT.
-    for offset in 0..entry_count {
-        let entry_ptr = entries_ptr + (offset as u32) * 8;
-        let Some(red) = memory.read_u16_be(entry_ptr + 2) else {
-            return PPC_PARAM_ERR;
-        };
-        let Some(green) = memory.read_u16_be(entry_ptr + 4) else {
-            return PPC_PARAM_ERR;
-        };
-        let Some(blue) = memory.read_u16_be(entry_ptr + 6) else {
-            return PPC_PARAM_ERR;
-        };
-        screen_clut[starting_entry + offset] = [red, green, blue];
-    }
+    context_clut[start..start + count].copy_from_slice(&colors);
+    draw_sprocket.context_clut = Some(context_clut);
     PPC_NO_ERR
 }
 
@@ -2126,41 +2415,39 @@ pub(crate) fn ppc_dsp_context_get_clut_entries(
     cpu: &PpcCpu,
     memory: &mut PpcSectionMem,
     screen_clut: &[[u16; 3]; 256],
+    draw_sprocket: &PpcDrawSprocketState,
 ) -> i16 {
-    // Apple Game Sprockets Guide (1996), Summary of DrawSprocket:
-    // OSStatus DSpContext_GetCLUTEntries(DSpContextReference, ColorSpec *, UInt16, UInt16).
     if let Some(error) = ppc_dsp_context_error(cpu.gpr[3]) {
         return error;
     }
     let entries_ptr = cpu.gpr[4];
-    let starting_entry = usize::from(cpu.gpr[5] as u16);
-    let entry_count = usize::from(cpu.gpr[6] as u16);
-    let Some(end_entry) = starting_entry.checked_add(entry_count) else {
-        return PPC_PARAM_ERR;
-    };
-    if end_entry > screen_clut.len() {
+    let start = usize::from(cpu.gpr[5] as u16);
+    let count = usize::from(cpu.gpr[6] as u16);
+    if start + count > 256 {
         return PPC_PARAM_ERR;
     }
-    let Some(byte_count) = entry_count.checked_mul(8) else {
+    if count == 0 {
+        return PPC_NO_ERR;
+    }
+    if entries_ptr == 0 || !ppc_memory_can_write_bytes(memory, entries_ptr, count as u32 * 8) {
         return PPC_PARAM_ERR;
-    };
-    if byte_count != 0
-        && (entries_ptr == 0 || !ppc_memory_can_write_bytes(memory, entries_ptr, byte_count as u32))
+    }
+    let colors = if draw_sprocket.desktop_snapshot.is_some()
+        && draw_sprocket.context_attributes.display_depth == 8
     {
-        return PPC_PARAM_ERR;
-    }
-    for offset in 0..entry_count {
-        let entry_ptr = entries_ptr + (offset as u32) * 8;
-        let [red, green, blue] = screen_clut[starting_entry + offset];
-        if memory
-            .write_u16_be(entry_ptr, (starting_entry + offset) as u16)
-            .is_none()
-            || memory.write_u16_be(entry_ptr + 2, red).is_none()
-            || memory.write_u16_be(entry_ptr + 4, green).is_none()
-            || memory.write_u16_be(entry_ptr + 6, blue).is_none()
-        {
-            return PPC_PARAM_ERR;
+        screen_clut
+    } else {
+        draw_sprocket.context_clut.as_ref().unwrap_or(screen_clut)
+    };
+    let mut bytes = Vec::with_capacity(count * 8);
+    for (offset, color) in colors[start..start + count].iter().enumerate() {
+        bytes.extend_from_slice(&((start + offset) as u16).to_be_bytes());
+        for component in color {
+            bytes.extend_from_slice(&component.to_be_bytes());
         }
+    }
+    if memory.write_bytes(entries_ptr, &bytes).is_none() {
+        return PPC_PARAM_ERR;
     }
     PPC_NO_ERR
 }
@@ -2335,6 +2622,7 @@ pub(crate) fn ppc_isp_element_new_virtual_from_needs(
     heap_limit: u32,
     input_sprocket: &mut PpcInputSprocketState,
     virtual_elements: &mut Vec<PpcInputSprocketVirtualElementRecord>,
+    input: PpcInputSnapshot,
 ) -> i16 {
     let count = cpu.gpr[3];
     let needs_ptr = cpu.gpr[4];
@@ -2438,6 +2726,7 @@ pub(crate) fn ppc_isp_element_new_virtual_from_needs(
             keyboard_binding: draft.keyboard_binding,
             need_name: draft.need_name,
             need_record: draft.need_record,
+            mouse_position: Cell::new((i32::from(input.mouse_h), i32::from(input.mouse_v))),
         });
     }
 
@@ -2649,7 +2938,10 @@ pub(crate) fn ppc_isp_element_list_get_next_event(
         else {
             continue;
         };
-        if current_state == previous_state {
+        let is_delta = virtual_elements.iter().any(|record| {
+            record.element == element && record.kind == PPC_ISP_ELEMENT_KIND_DELTA
+        });
+        if if is_delta { current_state == 0 } else { current_state == previous_state } {
             continue;
         }
 
@@ -2815,6 +3107,9 @@ pub(crate) fn ppc_isp_virtual_element_simple_state(
     let record = virtual_elements
         .iter()
         .find(|record| record.element == element)?;
+    if record.kind == PPC_ISP_ELEMENT_KIND_DELTA {
+        return Some(ppc_isp_virtual_mouse_delta(record, input, input_sprocket));
+    }
     Some(ppc_isp_input_simple_state_with_binding(
         record.kind,
         record.default_state,
@@ -3087,28 +3382,38 @@ pub(crate) fn ppc_isp_input_simple_state_with_binding(
                 state
             }
         }
-        PPC_ISP_ELEMENT_KIND_DELTA => {
-            if !input_sprocket.mouse_active {
-                return fallback_state;
-            }
-            ppc_isp_mouse_delta_fixed(input, action_binding) as u32
-        }
+        // Stateful virtual delta elements are read through their owned record.
+        PPC_ISP_ELEMENT_KIND_DELTA => fallback_state,
         _ => fallback_state,
     }
 }
 
-pub(crate) fn ppc_isp_mouse_delta_fixed(
+pub(crate) fn ppc_isp_virtual_mouse_delta(
+    record: &PpcInputSprocketVirtualElementRecord,
     input: PpcInputSnapshot,
-    action_binding: PpcInputSprocketActionBinding,
-) -> i32 {
-    let center_h = (ppc_main_screen_width() / 2) as i32;
-    let center_v = (ppc_main_screen_height() / 2) as i32;
-    let pixel_delta = if action_binding == PpcInputSprocketActionBinding::DeltaPitch {
-        center_v.saturating_sub(i32::from(input.mouse_v))
+    input_sprocket: PpcInputSprocketState,
+) -> u32 {
+    let h = i32::from(input.mouse_h);
+    let v = i32::from(input.mouse_v);
+    let previous = record.mouse_position.replace((h, v));
+    if !input_sprocket.initialized || input_sprocket.suspended || !input_sprocket.mouse_active {
+        return record.default_state;
+    }
+    let pixels = if record.action_binding == PpcInputSprocketActionBinding::DeltaPitch {
+        previous.1.saturating_sub(v)
     } else {
-        i32::from(input.mouse_h).saturating_sub(center_h)
+        h.saturating_sub(previous.0)
     };
-    pixel_delta.saturating_mul(0x0001_0000)
+    pixels.saturating_mul(0x0001_0000) as u32
+}
+
+pub(crate) fn ppc_isp_reset_virtual_mouse_positions(
+    records: &[PpcInputSprocketVirtualElementRecord],
+    input: PpcInputSnapshot,
+) {
+    for record in records {
+        record.mouse_position.set((i32::from(input.mouse_h), i32::from(input.mouse_v)));
+    }
 }
 
 pub(crate) fn ppc_isp_button_pressed(
@@ -3890,6 +4195,11 @@ pub(crate) fn ppc_isp_element_state_value(
     };
     if let Some(state) = device_state {
         return Some(state);
+    }
+    if let Some(record) = virtual_elements.iter().find(|record| {
+        record.element == element && record.kind == PPC_ISP_ELEMENT_KIND_DELTA
+    }) {
+        return Some(ppc_isp_virtual_mouse_delta(record, input, *input_sprocket));
     }
     let (Some(kind), Some(fallback_state)) = (
         memory.read_u32_be(element),
