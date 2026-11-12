@@ -1130,6 +1130,7 @@ pub(super) fn dispatch_dialog_import(
                 // TESetSelect highlights the new selection immediately.
                 if ppc_window_is_visible(memory, params.dialog_ptr()) {
                     let _ = ppc_draw_dialog(
+                        window_list,
                         memory,
                         handles,
                         controls,
@@ -2138,6 +2139,7 @@ fn ppc_dispatch_dialog_compatibility(
                     last_resource_error,
                 );
                 let _ = ppc_draw_dialog(
+                    window_list,
                     memory,
                     handles,
                     controls,
