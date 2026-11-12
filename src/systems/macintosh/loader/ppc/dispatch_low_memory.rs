@@ -8,10 +8,16 @@ pub enum PpcLowMemoryAccessor {
     GetRom85,
     GetDoubleTime,
     GetFsFcbLen,
+    GetFcbSPtr,
     GetGzMoveHnd,
     GetGzRootHnd,
     GetScrHRes,
     GetScrVRes,
+    /// LMGetMenuHook: the MenuHook callback at $0A30.
+    GetMenuHook,
+    /// LMGetMBarHook and LMSetMBarHook: the callback at $0A2C.
+    GetMBarHook,
+    SetMBarHook,
     GetTheMenu,
     GetTopMapHndl,
     /// LMSetCursorNew: the CrsrNew byte at $08CE.
@@ -63,14 +69,20 @@ pub(super) fn dispatch_low_memory_import(
                     );
                 }
                 PpcLowMemoryAccessor::GetDoubleTime
+                | PpcLowMemoryAccessor::GetFcbSPtr
                 | PpcLowMemoryAccessor::GetGzMoveHnd
                 | PpcLowMemoryAccessor::GetGzRootHnd
-                | PpcLowMemoryAccessor::GetTopMapHndl => {
+                | PpcLowMemoryAccessor::GetTopMapHndl
+                | PpcLowMemoryAccessor::GetMenuHook
+                | PpcLowMemoryAccessor::GetMBarHook => {
                     let address = match accessor {
                         PpcLowMemoryAccessor::GetDoubleTime => addr::DOUBLE_TIME,
+                        PpcLowMemoryAccessor::GetFcbSPtr => addr::FCB_S_PTR,
                         PpcLowMemoryAccessor::GetGzMoveHnd => addr::GZ_MOVE_HND,
                         PpcLowMemoryAccessor::GetGzRootHnd => addr::GZ_ROOT_HND,
                         PpcLowMemoryAccessor::GetTopMapHndl => addr::TOP_MAP_HNDL,
+                        PpcLowMemoryAccessor::GetMenuHook => 0x0a30,
+                        PpcLowMemoryAccessor::GetMBarHook => 0x0a2c,
                         _ => unreachable!(),
                     };
                     return Some(
@@ -98,6 +110,7 @@ pub(super) fn dispatch_low_memory_import(
                             }),
                     );
                 }
+                PpcLowMemoryAccessor::SetMBarHook => memory.write_u32_be(0x0a2c, cpu.gpr[3]),
                 PpcLowMemoryAccessor::SetCursorNew => {
                     memory.write_u8(addr::CRSR_NEW, cpu.gpr[3] as u8)
                 }

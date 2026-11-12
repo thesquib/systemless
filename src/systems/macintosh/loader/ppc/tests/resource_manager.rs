@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn system_wctb_lookup_preserves_open_map_precedence_and_get1_scope() {
+    use PpcImportDispatcherTarget::{Get1Resource, GetResource};
+
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(b"GetResource")).unwrap();
+    let res_type = u32::from_be_bytes(*b"wctb");
+    let lookup = |loaded: &mut PpcLoadedApp, target, id: u16| {
+        loaded.cpu.gpr[3] = res_type;
+        loaded.cpu.gpr[4] = u32::from(id);
+        run_test_import(loaded, target);
+        loaded.cpu.gpr[3]
+    };
+
+    assert_eq!(lookup(&mut loaded, Get1Resource, 0), 0);
+    assert_eq!(lookup(&mut loaded, GetResource, 1), 0);
+    let fallback = lookup(&mut loaded, GetResource, 0);
+    assert_ne!(fallback, 0);
+    let bytes = ppc_handle_bytes(&mut loaded.memory, &test_handle_records!(loaded), fallback)
+        .expect("materialized WinCTab");
+    assert_eq!(bytes.len(), 112);
+    assert_eq!(&bytes[..16], &[0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 255, 255, 255, 255, 255, 255]);
+    assert_eq!(lookup(&mut loaded, GetResource, 0), fallback);
+    assert_eq!(lookup(&mut loaded, Get1Resource, 0), 0);
+
+    let mut actual = bytes;
+    actual[10..12].copy_from_slice(&0x1234u16.to_be_bytes());
+    loaded.process_file_system.extend_vfs_resources([PpcVfsResourceRecord {
+        ref_num: 7,
+        path: "OpenFile".to_string(),
+        res_type,
+        res_id: 0,
+        name: Vec::new(),
+        data: actual.clone().into(),
+        raw_data: None,
+        raw_attrs: None,
+        attrs: 0,
+        handle: 0,
+    }]);
+    let real = lookup(&mut loaded, GetResource, 0);
+    assert_ne!(real, 0);
+    assert_ne!(real, fallback);
+    assert_eq!(
+        ppc_handle_bytes(&mut loaded.memory, &test_handle_records!(loaded), real),
+        Some(actual)
+    );
+    assert_eq!(lookup(&mut loaded, Get1Resource, 0), 0);
+    loaded.set_current_resource_refnum(7);
+    assert_eq!(lookup(&mut loaded, Get1Resource, 0), real);
+}
+
+#[test]
 fn get_intl_resource_supplies_roman_numeric_format_from_system_file() {
     let mut loaded = load_pef_application(&synthetic_pef_with_import(b"GetIntlResource")).unwrap();
     loaded.cpu.gpr[3] = 0;
@@ -433,9 +483,9 @@ fn launched_application_resource_reference_is_usable_by_file_manager() {
 #[test]
 fn hle_import_runner_lm_get_cur_map_reads_shared_signed_reference_without_error_changes() {
     assert_eq!(dispatcher_target_for_import("InterfaceLib", "LMGetCurMap"),
-        PpcImportDispatcherTarget::CurResFile);
+        PpcImportDispatcherTarget::LMGetCurMap);
     assert_eq!(dispatcher_target_for_import("CarbonLib", "LMGetCurMap"),
-        PpcImportDispatcherTarget::CurResFile);
+        PpcImportDispatcherTarget::LMGetCurMap);
     assert_eq!(dispatcher_target_for_import("OtherLibrary", "LMGetCurMap"),
         PpcImportDispatcherTarget::Unsupported);
     for reference in [7i16, -1, i16::MIN] {
@@ -469,6 +519,40 @@ fn hle_import_runner_classic_resource_and_print_error_accessors_preserve_signed_
         assert_eq!(probe.unsupported_import_index, None);
         assert_eq!(printing.cpu.gpr[3], error as i32 as u32);
         assert_eq!(printing.toolbox_startup.printing_error, error);
+    }
+}
+
+#[test]
+fn lm_set_res_err_updates_the_shared_signed_word() {
+    use crate::memory::globals::addr::RES_ERR;
+
+    for library in ["InterfaceLib", "CarbonLib"] {
+        assert_eq!(
+            dispatcher_target_for_import(library, "LMSetResErr"),
+            PpcImportDispatcherTarget::LMSetResErr
+        );
+    }
+    assert_eq!(
+        dispatcher_target_for_import("OtherLibrary", "LMSetResErr"),
+        PpcImportDispatcherTarget::Unsupported
+    );
+
+    for error in [0i16, -192, i16::MIN, i16::MAX] {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(b"LMSetResErr")).unwrap();
+        assert_eq!(
+            loaded.imports[0].dispatcher_target,
+            PpcImportDispatcherTarget::LMSetResErr
+        );
+        loaded.set_test_resource_error(-1);
+        loaded.memory.write_u16_be(RES_ERR + 2, 0x2468).unwrap();
+        let argument = 0xabcd0000 | u32::from(error as u16);
+        loaded.cpu.gpr[3] = argument;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::LMSetResErr);
+        assert_eq!(loaded.cpu.gpr[3], argument);
+        assert_eq!(loaded.memory.read_u16_be(RES_ERR), Some(error as u16));
+        assert_eq!(loaded.memory.read_u16_be(RES_ERR + 2), Some(0x2468));
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::ResError);
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(error));
     }
 }
 
@@ -650,4 +734,179 @@ fn resource_materialization_applies_changed_attributes_only_when_loading_data() 
         assert_eq!(mem_error, PPC_NO_ERR);
         assert_eq!(res_error, PPC_NO_ERR);
     });
+}
+
+#[test]
+fn lm_set_cur_map_preserves_raw_signed_word_and_resource_error() {
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "LMSetCurMap"),
+        PpcImportDispatcherTarget::LMSetCurMap
+    );
+    for library in ["CarbonLib", "OtherLibrary"] {
+        assert_eq!(
+            dispatcher_target_for_import(library, "LMSetCurMap"),
+            PpcImportDispatcherTarget::Unsupported
+        );
+    }
+    for reference in [0i16, 7, -1, i16::MIN, i16::MAX, 42] {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(b"LMSetCurMap")).unwrap();
+        assert_eq!(
+            loaded.imports[0].dispatcher_target,
+            PpcImportDispatcherTarget::LMSetCurMap
+        );
+        loaded
+            .memory
+            .write_u16_be(crate::memory::globals::addr::CUR_APREF_NUM, 42)
+            .unwrap();
+        loaded
+            .memory
+            .write_u16_be(PPC_CUR_RES_FILE_ADDR - 2, 0x1357)
+            .unwrap();
+        loaded
+            .memory
+            .write_u16_be(PPC_CUR_RES_FILE_ADDR + 2, 0x2468)
+            .unwrap();
+        loaded.set_test_resource_error(-192);
+        let argument = 0xabcd0000 | u32::from(reference as u16);
+        loaded.cpu.gpr[3] = argument;
+        loaded.cpu.gpr[4] = 0x12345678;
+        let stack = loaded.cpu.gpr[1];
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::LMSetCurMap);
+        assert_eq!(loaded.cpu.gpr[3], argument);
+        assert_eq!(loaded.cpu.gpr[4], 0x12345678);
+        assert_eq!(loaded.cpu.gpr[1], stack);
+        assert_eq!(
+            loaded.memory.read_u16_be(PPC_CUR_RES_FILE_ADDR),
+            Some(reference as u16)
+        );
+        assert_eq!(
+            loaded.memory.read_u16_be(PPC_CUR_RES_FILE_ADDR - 2),
+            Some(0x1357)
+        );
+        assert_eq!(
+            loaded.memory.read_u16_be(PPC_CUR_RES_FILE_ADDR + 2),
+            Some(0x2468)
+        );
+        assert_eq!(
+            *loaded.process_file_system.current_resource_file,
+            if reference == 42 { 0 } else { reference }
+        );
+        assert_eq!(loaded.test_resource_error(), -192);
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::LMGetCurMap);
+        assert_eq!(loaded.cpu.gpr[3], reference as i32 as u32);
+        assert_eq!(loaded.test_resource_error(), -192);
+    }
+}
+
+#[test]
+fn lowercase_named_resource_imports_decode_c_names_and_preserve_scope() {
+    for (symbol, current_only) in [("getnamedresource", false), ("get1namedresource", true)] {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(symbol.as_bytes())).unwrap();
+        let name_ptr = PPC_DATA_BASE + 0x1000;
+        loaded.memory.add_region(name_ptr, b"sPLASH\0untouched".to_vec());
+        let res_type = u32::from_be_bytes(*b"DATA");
+        loaded.process_file_system.extend_vfs_resources([7, 9].map(|ref_num| {
+            PpcVfsResourceRecord {
+                ref_num,
+                path: format!("Map{ref_num}"),
+                res_type,
+                res_id: ref_num,
+                name: b"Splash".to_vec(),
+                data: vec![ref_num as u8].into(),
+                raw_data: None,
+                raw_attrs: None,
+                attrs: 0,
+                handle: 0,
+            }
+        }));
+        for (current, expected) in [(9, Some(9)), (11, (!current_only).then_some(7))] {
+            loaded.set_current_resource_refnum(current);
+            loaded.cpu.pc = loaded.entry_pc;
+            loaded.cpu.lr = PPC_HALT_PC;
+            loaded.cpu.gpr[3] = res_type;
+            loaded.cpu.gpr[4] = name_ptr;
+            let probe = loaded.run_with_hle_imports(64);
+            assert_eq!(probe.unsupported_import_index, None, "{symbol}");
+            let handle = loaded.cpu.gpr[3];
+            if let Some(byte) = expected {
+                assert_eq!(loaded.test_resource_error(), PPC_NO_ERR);
+                assert_eq!(
+                    ppc_handle_bytes(&mut loaded.memory, &test_handle_records!(loaded), handle),
+                    Some(vec![byte])
+                );
+            } else {
+                assert_eq!(handle, 0);
+                assert_eq!(loaded.test_resource_error(), PPC_RES_NOT_FOUND_ERR);
+            }
+            for (offset, byte) in b"sPLASH\0untouched".iter().enumerate() {
+                assert_eq!(loaded.memory.read_u8(name_ptr + offset as u32), Some(*byte));
+            }
+        }
+    }
+}
+
+#[test]
+fn lowercase_named_resource_imports_reject_unreadable_or_unterminated_names() {
+    for symbol in [b"getnamedresource".as_slice(), b"get1namedresource"] {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(symbol)).unwrap();
+        let name_ptr = PPC_DATA_BASE + 0x1000;
+        loaded.memory.add_region(name_ptr, vec![b'A'; 256]);
+        for address in [u32::MAX, name_ptr] {
+            loaded.cpu.pc = loaded.entry_pc;
+            loaded.cpu.lr = PPC_HALT_PC;
+            loaded.cpu.gpr[3] = u32::from_be_bytes(*b"DATA");
+            loaded.cpu.gpr[4] = address;
+            let probe = loaded.run_with_hle_imports(64);
+            assert_eq!(probe.unsupported_import_index, None);
+            assert_eq!(loaded.cpu.gpr[3], 0);
+            assert_eq!(loaded.test_resource_error(), PPC_PARAM_ERR);
+        }
+    }
+}
+
+#[test]
+fn lowercase_getresinfo_writes_a_c_name_and_prevalidates_outputs() {
+    for capacity in [256, 4] {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(b"getresinfo")).unwrap();
+        let id_ptr = PPC_DATA_BASE + 0x1000;
+        let type_ptr = id_ptr + 0x100;
+        let name_ptr = id_ptr + 0x200;
+        loaded.memory.add_region(id_ptr, vec![0xa1; 2]);
+        loaded.memory.add_region(type_ptr, vec![0xa2; 4]);
+        loaded.memory.add_region(name_ptr, vec![0xa3; capacity]);
+        let handle = PPC_HEAP_BASE;
+        let res_type = u32::from_be_bytes(*b"DATA");
+        loaded.process_file_system.extend_vfs_resources([PpcVfsResourceRecord {
+            ref_num: 7,
+            path: "Current".to_string(),
+            res_type,
+            res_id: 123,
+            name: b"caf\x8e".to_vec(),
+            data: vec![1].into(),
+            raw_data: None,
+            raw_attrs: None,
+            attrs: 0,
+            handle,
+        }]);
+        loaded.cpu.gpr[3] = handle;
+        loaded.cpu.gpr[4] = id_ptr;
+        loaded.cpu.gpr[5] = type_ptr;
+        loaded.cpu.gpr[6] = name_ptr;
+        let probe = loaded.run_with_hle_imports(64);
+        assert_eq!(probe.unsupported_import_index, None);
+        if capacity == 256 {
+            assert_eq!(loaded.test_resource_error(), PPC_NO_ERR);
+            assert_eq!(loaded.memory.read_u16_be(id_ptr), Some(123));
+            assert_eq!(loaded.memory.read_u32_be(type_ptr), Some(res_type));
+            for (offset, byte) in b"caf\x8e\0".iter().enumerate() {
+                assert_eq!(loaded.memory.read_u8(name_ptr + offset as u32), Some(*byte));
+            }
+            assert_eq!(loaded.memory.read_u8(name_ptr + 5), Some(0xa3));
+        } else {
+            assert_eq!(loaded.test_resource_error(), PPC_PARAM_ERR);
+            assert_eq!(loaded.memory.read_u16_be(id_ptr), Some(0xa1a1));
+            assert_eq!(loaded.memory.read_u32_be(type_ptr), Some(0xa2a2a2a2));
+            assert_eq!(loaded.memory.read_u32_be(name_ptr), Some(0xa3a3a3a3));
+        }
+    }
 }

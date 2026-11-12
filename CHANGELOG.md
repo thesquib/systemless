@@ -1,5 +1,238 @@
 # Changelog
 
+## [0.119.0](https://github.com/benletchford/systemless/compare/v0.118.0...v0.119.0) (2026-11-12)
+
+
+### Features
+
+* adopt platinum and graphite website themes ([#6180](https://github.com/benletchford/systemless/issues/6180)) ([fd210ec](https://github.com/benletchford/systemless/commit/fd210ece21f162d8ea7b3d067ff554fe99e13640))
+* **catalogue:** add the original Mario’s Game Gallery demo ([79dd39f](https://github.com/benletchford/systemless/commit/79dd39f3d197abb6beb07b8a9b0f52796e3c12d3))
+* **catalogue:** add the original PowerMonger period demo ([36b71fc](https://github.com/benletchford/systemless/commit/36b71fcc415d58fd87f746b2d12067bfa397444f))
+* **catalogue:** add the original RoboWar freeware package ([16c1af2](https://github.com/benletchford/systemless/commit/16c1af27566cfb9dba6c9f5b2e41ca38d4b93a24))
+* **catalogue:** approve PowerMonger browser play ([7b3bf74](https://github.com/benletchford/systemless/commit/7b3bf74096dc86bca4b1cba27e418244cce21b08))
+* replace Systemless branding with classic CRT mascot ([#6175](https://github.com/benletchford/systemless/issues/6175)) ([008cede](https://github.com/benletchford/systemless/commit/008cede2114baefe227c54916f8107b4578fb801))
+
+
+### Bug Fixes
+
+* align DrawSprocket back buffer bounds during mode switches ([0ecbcdd](https://github.com/benletchford/systemless/commit/0ecbcdd7e623fe94829299ad4202de119964b1ed))
+
+## [0.118.0](https://github.com/benletchford/systemless/compare/v0.117.0...v0.118.0) (2026-11-12)
+
+
+### Features
+
+* **catalogue:** add the original Pajama Sam 2 demo ([04a2ca9](https://github.com/benletchford/systemless/commit/04a2ca946b9b101c30f673e14f8eb4c06f6c26e4))
+* **catalogue:** add the original Pajama Sam demo ([2364e35](https://github.com/benletchford/systemless/commit/2364e3560ef1aa17352830c0ca6fd2cda00cc2ab))
+* **catalogue:** add the original Sky Shadow sample ([099ba8b](https://github.com/benletchford/systemless/commit/099ba8bd2cfc01c1e5180b001cd0efb7485b3f2e))
+* **catalogue:** add the Terminal Velocity demo ([5ae5b22](https://github.com/benletchford/systemless/commit/5ae5b226cac79466af734ee26741cb4d0c11f2cd))
+
+
+### Bug Fixes
+
+* **archives:** distinguish StuffIt archives from ordinary text ([95e6c51](https://github.com/benletchford/systemless/commit/95e6c51b32cb9c503886f22659cd4e23f17d6d68))
+* **catalogue:** restore the Terminal Velocity game menu ([e240f61](https://github.com/benletchford/systemless/commit/e240f61f325ee25f8c85cb4c36cadb39e793646c))
+* create directories through PowerPC PBDirCreateSync ([7638a37](https://github.com/benletchford/systemless/commit/7638a379bc3e16ff7a2bc915d37f725a8efa47b5))
+* enumerate supported DrawSprocket contexts consistently ([606b0b2](https://github.com/benletchford/systemless/commit/606b0b2a6530ba8a9f7f3cef7fc08571862fd08e))
+* expose classic PowerPC menu hook accessors ([8476daf](https://github.com/benletchford/systemless/commit/8476daf7d2f1049e50d440f06d8fec0bea165cfb))
+* **web:** correct Ferazel fades and reduce browser gameplay overhead ([c2188fb](https://github.com/benletchford/systemless/commit/c2188fbcddd0bbacd352294bdccdaa93fbd90ed9))
+
+## [0.117.0](https://github.com/benletchford/systemless/compare/v0.116.0...v0.117.0) (2026-11-12)
+
+
+### Features
+
+* **catalogue:** add the original Battle-Girl demo ([f8e61dc](https://github.com/benletchford/systemless/commit/f8e61dc8b8e6d4275f458f72e329b092197e1de1))
+* **catalogue:** add the original Out of This World demo ([db85061](https://github.com/benletchford/systemless/commit/db850615f30780142b34278a974f9f1690105a72))
+* **catalogue:** add the original ShadowWraith demo ([f981cca](https://github.com/benletchford/systemless/commit/f981cca56ae320a36f094f4bffafef9aa2e13797))
+* **catalogue:** enable verified Out of This World browser play ([f46a4ed](https://github.com/benletchford/systemless/commit/f46a4ed042ddc41359b86db54dcc651bceeecbd2))
+
+
+### Bug Fixes
+
+* **catalogue:** correct ShadowWraith startup and browser status ([6b20604](https://github.com/benletchford/systemless/commit/6b206045452da8fbd9707ea6548c008e9ab2a730))
+
+## [0.116.0](https://github.com/benletchford/systemless/compare/v0.115.0...v0.116.0) (2026-11-11)
+
+
+### Features
+
+* add the original Deadlock demo ([6d99d38](https://github.com/benletchford/systemless/commit/6d99d38163f36287517aec8a4584a4e1783f849d))
+* add the original Tristan demo ([1349bf4](https://github.com/benletchford/systemless/commit/1349bf445e384a16a1bd486dd96f092948596cec))
+* **catalogue:** add Championship Manager 99/00 demo ([f8c2361](https://github.com/benletchford/systemless/commit/f8c23613f4e91c6f08067ea8cc18522df51809c7))
+* **catalogue:** add Crystal Crazy demo ([8ddc502](https://github.com/benletchford/systemless/commit/8ddc5029a00584b29f0f8ed633af1864d3c0d9d6))
+* **catalogue:** add Hoyle Board and Card Games demos ([effb70c](https://github.com/benletchford/systemless/commit/effb70c733ff94c3e7afb8e5598e6e1aba3bfce8))
+* **catalogue:** add King of Dragon Pass demo ([012a1d2](https://github.com/benletchford/systemless/commit/012a1d29e1b3273a4f50f8d5444504a684a21dac))
+* **catalogue:** add The Incredible Machine 3.0 demo ([ae64af4](https://github.com/benletchford/systemless/commit/ae64af4066bb55396dc59408be7ccdcf36f913fa))
+* **catalogue:** add the original Chaos Overlords demo ([ae2f538](https://github.com/benletchford/systemless/commit/ae2f538c2909c00bb0851b917a03e5e3533e4b19))
+* **catalogue:** add the original Rebel Assault II demo ([e230afd](https://github.com/benletchford/systemless/commit/e230afdcda25167f62a89b56432f49688c564766))
+* **catalogue:** add the original Trophy Bass demo ([7bcdc83](https://github.com/benletchford/systemless/commit/7bcdc830a093d94ec21893db2489f93b50df788c))
+* **catalogue:** add the original You Don’t Know Jack demo ([0e80c4b](https://github.com/benletchford/systemless/commit/0e80c4be2a51c78c00f0ce9a27ee9af7fa22e486))
+* **catalogue:** enable Freddi Fish and Putt-Putt Saves the Zoo ([c790ba2](https://github.com/benletchford/systemless/commit/c790ba27655e647331713832489064533180151e))
+* **catalogue:** enable Settlers II demo browser play ([8752c7e](https://github.com/benletchford/systemless/commit/8752c7e037736d5f1a8f6679e38660ea6f5b2410))
+* **catalogue:** enable tictactom browser play ([fc5ca2a](https://github.com/benletchford/systemless/commit/fc5ca2a75201c12d61e4110b34bbe4bf7072d6f2))
+* **catalogue:** stage five native-tested games ([d36bbda](https://github.com/benletchford/systemless/commit/d36bbda204095c40c5597a080cded17d0f0a6d81))
+* **catalogue:** stage Freddi Fish and Putt-Putt Saves the Zoo demos ([5b4df21](https://github.com/benletchford/systemless/commit/5b4df21f9dfaf5fae23bae6b85f42c0d4948a9f6))
+* **catalogue:** stage the original Avernum 2 demo ([fe0b82e](https://github.com/benletchford/systemless/commit/fe0b82e60cb68bcc9f46a94e2835dce6c1f3ebf0))
+* **catalogue:** stage the original Avernum 3 demo ([9a4b236](https://github.com/benletchford/systemless/commit/9a4b236170c5cb75a73e5164bcf5cf636a554eb6))
+* **catalogue:** stage the original Avernum demo ([6713c46](https://github.com/benletchford/systemless/commit/6713c46d885a77b58c4d6e48c240edeab3a1000e))
+* **catalogue:** stage the original Nethergate demo ([6e156b4](https://github.com/benletchford/systemless/commit/6e156b432ffabdbd1193319502c7fc924e8c1d2c))
+* **catalogue:** stage the original Settlers II demo ([5eb8fde](https://github.com/benletchford/systemless/commit/5eb8fdef8f198cf14cc3905319b3a8334eef48a2))
+* **catalogue:** stage three original Humongous adventure demos ([e182d5a](https://github.com/benletchford/systemless/commit/e182d5a9e34ec4d0be53ebee40dc74e5a3df8c9f))
+
+
+### Bug Fixes
+
+* expand checksummed STi3 folder marker archives ([ed9e1ff](https://github.com/benletchford/systemless/commit/ed9e1ff2383caf1e4fa4ab39fa48062fe9a47ea7))
+* expand STi2 demo installers without losing component variants ([c5f7760](https://github.com/benletchford/systemless/commit/c5f7760fa970648625365ad450303ea31501690b))
+* honor Resource Manager reopen permissions and current maps ([2cd3d97](https://github.com/benletchford/systemless/commit/2cd3d97e32fa036247d9e53ee8ddc8b0a406e53a))
+* implement the PowerPC LMSetResErr accessor ([44b8a33](https://github.com/benletchford/systemless/commit/44b8a333424380f42cf9dd3c4f13ca89e8e4f591))
+* **mac:** canonicalize PowerPC directory file specs ([df64535](https://github.com/benletchford/systemless/commit/df645359c1f82bb5aebada10079b82477f85bfe9))
+* **mac:** correct Ferazel palettes and reduce gameplay overhead ([6363b91](https://github.com/benletchford/systemless/commit/6363b91ee149c33adf4f03a2288ab44c3f4d34c0))
+* **ppc:** implement the black QuickDraw globals accessor ([4174b9e](https://github.com/benletchford/systemless/commit/4174b9e95150b54e53d73e69ac8b7326f1fe2976))
+* **ppc:** respect signed BlockMove sizes ([bd72ec1](https://github.com/benletchford/systemless/commit/bd72ec18a4970ba159394f21986521c21a7c7b68))
+* preserve dialog fields when creating PowerPC palettes ([4dd4f9e](https://github.com/benletchford/systemless/commit/4dd4f9e156cc24a44fb44da63739623af72fd297))
+* support classic PowerPC startup resource lookups ([4c69cf4](https://github.com/benletchford/systemless/commit/4c69cf4d9169ca51a191db4ba74c654885a40c28))
+* support PowerPC palette update modes ([d21a603](https://github.com/benletchford/systemless/commit/d21a603a94b43af4d8cc4fb9085acf552f62e127))
+
+
+### Performance Improvements
+
+* **mac:** reuse sparse lookup gaps across adjacent pages ([54fd86a](https://github.com/benletchford/systemless/commit/54fd86a87dd5fe4d3a2fc30b170b7cee59d38000))
+
+## [0.115.0](https://github.com/benletchford/systemless/compare/v0.114.0...v0.115.0) (2026-11-10)
+
+
+### Features
+
+* add original Air Combat and Afterlife demos ([7c318f4](https://github.com/benletchford/systemless/commit/7c318f4aea2ad9e2090893b7abb9dfddaa7307b9))
+* add the original Crystal Caliburn demo ([9eac354](https://github.com/benletchford/systemless/commit/9eac354bc624c396a5cdcd1d074d1dc03d84410d))
+* **catalogue:** add Geneforge demo intake ([9e21215](https://github.com/benletchford/systemless/commit/9e21215fabb5ef37f4203ead4d95e053c3cb78c5))
+* **catalogue:** add the original Ares demo ([0eaa887](https://github.com/benletchford/systemless/commit/0eaa887623417249c80b89c7f128dc6b7e308906))
+* **catalogue:** enable Ares browser play ([e078464](https://github.com/benletchford/systemless/commit/e0784645064bdfee3cb7f1c5d5de8177e310e02b))
+* enable Crystal Caliburn demo browser play ([3751790](https://github.com/benletchford/systemless/commit/37517900e3398b5be398ac45b3d8b22271014e94))
+
+
+### Bug Fixes
+
+* decode expanded VISE packed catalog records ([5b5df15](https://github.com/benletchford/systemless/commit/5b5df152e00ac016c71bab323682340e2a7824e7))
+* decode unflagged UTF-8 ZIP filenames ([aa42fa6](https://github.com/benletchford/systemless/commit/aa42fa695ffa4cd782c166673c00466e5562c2d8))
+* initialize alternate dialog backgrounds ([07f5045](https://github.com/benletchford/systemless/commit/07f5045d751eb3d201944b3cc1535a7bbb9fbd24))
+* **input:** recognize and consume InputSprocket mouse deltas ([d09fc36](https://github.com/benletchford/systemless/commit/d09fc36f0c345a3ea7a284eb3c330796e87eb492))
+* preserve AppleDouble forks in ZIP archives ([37b24bd](https://github.com/benletchford/systemless/commit/37b24bdca8f5642b8f756408c8f6d08ca53a59b3))
+* **quickdraw:** publish opened PowerPC ports to application globals ([57ea183](https://github.com/benletchford/systemless/commit/57ea1838399c6c6cd6aebba927feaf432266b2da))
+
+## [0.114.0](https://github.com/benletchford/systemless/compare/v0.113.0...v0.114.0) (2026-11-10)
+
+
+### Features
+
+* add the original The Dig demo to the catalogue ([84ceec6](https://github.com/benletchford/systemless/commit/84ceec6222c8b40afa9b125cf176209fcba8c783))
+* add the original X-Wing demo to the catalogue ([248849a](https://github.com/benletchford/systemless/commit/248849a0174db42fdcfe3f0ec4977b6e2cce7902))
+* enable The Dig demo browser play ([8edb9cc](https://github.com/benletchford/systemless/commit/8edb9cc818d8a13076e9421e31cbf1fd8c2306d5))
+* enable X-Wing demo browser play ([b585fdd](https://github.com/benletchford/systemless/commit/b585fdd41d6c93017f4b6bfb3f5f17d69412810f))
+
+
+### Bug Fixes
+
+* repaint exposed content when selecting windows ([fb4b507](https://github.com/benletchford/systemless/commit/fb4b50710d0eb49fa6ca41dd8a4549c0bd146bdd))
+
+## [0.113.0](https://github.com/benletchford/systemless/compare/v0.112.0...v0.113.0) (2026-11-10)
+
+
+### Features
+
+* add original Lode Runner 2 demo intake ([f0a48f4](https://github.com/benletchford/systemless/commit/f0a48f4d99d15b8a32bf46c3ab024d80b7cf1387))
+* add original Shadow Warrior demo intake ([e05855d](https://github.com/benletchford/systemless/commit/e05855d9d7c428bbe46ab7dee985c6c092f9fe10))
+* add Pararena promotional demo intake ([5758737](https://github.com/benletchford/systemless/commit/57587375255ca06ea853ecde51f5d48615482c7b))
+* add Prime Target beta demo intake ([99fcfd1](https://github.com/benletchford/systemless/commit/99fcfd1661217622173cea9b7869bf939c271149))
+* add Quake promotional preview intake ([8ae270f](https://github.com/benletchford/systemless/commit/8ae270f0134fa283a6af8a1da421ed5c4f8d0fdf))
+* add Reckless Drivin', Myth II and Heroes III intakes ([9d234ab](https://github.com/benletchford/systemless/commit/9d234abd8b61500588e316235a1c5b8ac9a7f4cd))
+* **catalogue:** add the original Oxyd distribution ([0d1c10f](https://github.com/benletchford/systemless/commit/0d1c10f7789b08acbfb9e3c7db9d6bef6bab42f9))
+* **catalogue:** add the original Per.Oxyd distribution ([9833ec9](https://github.com/benletchford/systemless/commit/9833ec9b51c927a2fd1352e7c75fc9e92e28c963))
+* enable Lode Runner 2 browser play ([af94426](https://github.com/benletchford/systemless/commit/af944264d6244bf17ce498f43b302c9bdc92152c))
+* enable Quake browser play ([870d3b2](https://github.com/benletchford/systemless/commit/870d3b22b352d4e587fc86cb17c867266d9b9749))
+
+
+### Bug Fixes
+
+* convert InputSprocket absolute timestamps to microseconds ([e577768](https://github.com/benletchford/systemless/commit/e5777685189d3f1f2160c915b559dfef250128e1))
+* expose Driver Services time base information ([c7c0fe8](https://github.com/benletchford/systemless/commit/c7c0fe82c3b5e75e0668a018f82e88e17c3d1356))
+* initialize empty forks in HCreateResFile ([66793fd](https://github.com/benletchford/systemless/commit/66793fd9444b6573600743acd97e2f5e0cbd5bee))
+* preserve caller dialog record boundaries ([c960f3b](https://github.com/benletchford/systemless/commit/c960f3b13eb41fbf4366280c2bf9171d54d4d826))
+* preserve DrawSprocket mode during buffering fallback ([7b019ad](https://github.com/benletchford/systemless/commit/7b019ada408f55bf3818932bb7354bf13aa46ebd))
+* publish coherent graphics ports after window removal ([c670f53](https://github.com/benletchford/systemless/commit/c670f53bfe34ab5c1ffd23fa02a8f9e71835c517))
+* **quickdraw:** refresh changed native graphics devices ([00eb78b](https://github.com/benletchford/systemless/commit/00eb78bacb3ef2b65649bb3e0af7fcfa28a89a44))
+* **quicktime:** align native PowerPC windows ([8d1e1d0](https://github.com/benletchford/systemless/commit/8d1e1d0e9e42fdbd847455bac9adf676a6df1a78))
+* **quicktime:** create and drive classic movie controllers ([c532bf6](https://github.com/benletchford/systemless/commit/c532bf6c1dc47d56358e73fc9a22e39ee50fd687))
+* report current input modifiers in PPC null events ([a6bc298](https://github.com/benletchford/systemless/commit/a6bc298708b132691c3f6027f41261a953347203))
+* request window palettes for classic movie controllers ([4b909b3](https://github.com/benletchford/systemless/commit/4b909b3db8a3ef6734cfdfc73f706b24ca53639f))
+* resolve working directories in PPC resource opens ([52b75be](https://github.com/benletchford/systemless/commit/52b75be67cdcd3249fb2228cb5235eb58aa82734))
+* support 68k QuickTime file graphics importers ([cd32463](https://github.com/benletchford/systemless/commit/cd32463bacdf2d63cf6f9bf3abd16590c72d6f90))
+* support C-string Resource Manager reads ([e0b5566](https://github.com/benletchford/systemless/commit/e0b55663dfcba2611f8e7544a674c0d8d2ccb372))
+* support legacy scalar Sound Manager version queries ([202c39f](https://github.com/benletchford/systemless/commit/202c39f631444dd8a5326f76383da592e023a45f))
+
+
+### Performance Improvements
+
+* avoid native handle snapshots during movie polling ([a5d415d](https://github.com/benletchford/systemless/commit/a5d415d4eeb5fd14b2d90c720e34b8ad8f562e0c))
+* batch PowerPC color pattern fills by row ([dfd0e6b](https://github.com/benletchford/systemless/commit/dfd0e6bde6419a68d51343aef68b27175045ce96))
+* batch PowerPC outline glyph registration ([2e0dec5](https://github.com/benletchford/systemless/commit/2e0dec5de72285ffbbe2c6740ca633d4f9d86956))
+
+## [0.112.0](https://github.com/benletchford/systemless/compare/v0.111.0...v0.112.0) (2026-11-08)
+
+
+### Features
+
+* add Achi browser play and Bo-Rad intake ([a05fe7a](https://github.com/benletchford/systemless/commit/a05fe7a4d6939ed8c7b23578a3d20d89aace8e6e))
+* add Dunjin 4.4 intake with browser pacing hold ([3c71c82](https://github.com/benletchford/systemless/commit/3c71c82e9b3ed1c5be925ec8b200f1f5158040af))
+* add Fungus browser play and record public game checks ([3c52cb3](https://github.com/benletchford/systemless/commit/3c52cb37f4f580d0e6b332b53c9788a4a270eb04))
+* add HangMan browser play ([e0ff417](https://github.com/benletchford/systemless/commit/e0ff4175bad6787150b1a4f28a9356a51db37f1c))
+* add Jotto II browser play and GPL source ([777c619](https://github.com/benletchford/systemless/commit/777c6191bea22e7ba4305a4e1b85ed05e0f532e3))
+* add King Albert II browser play ([55657c5](https://github.com/benletchford/systemless/commit/55657c5e2848c73349ae12a7a1800453d1850c69))
+* add Nubb and Bo-Rad browser play ([debae0f](https://github.com/benletchford/systemless/commit/debae0f31868f24893e36a89f80f45aee1637f3a))
+* add Pair Picker browser play ([2fe0e5e](https://github.com/benletchford/systemless/commit/2fe0e5e59e8942bf698529c5e2922302cb92344e))
+* add Par Pyramid and YA-Mancala browser play ([ec9db61](https://github.com/benletchford/systemless/commit/ec9db61d7ed41ffd8173eb76476da2d0107c1114))
+* add Poker browser play ([0dbf056](https://github.com/benletchford/systemless/commit/0dbf056072534016759a79570a757fa3afde32c5))
+* add qualified Battalion browser play ([904275b](https://github.com/benletchford/systemless/commit/904275b336539661d4566140fccb5643c464d12b))
+* add qualified Bill the Demon browser play ([48fe090](https://github.com/benletchford/systemless/commit/48fe0906e15ba9f139a9ca12ab5f27436b1b19b9))
+* add qualified Bonk browser play ([1d64bbf](https://github.com/benletchford/systemless/commit/1d64bbf9b89b444d2e11522b027f083bee5d0fc1))
+* add qualified Brick Attack browser play ([38dd032](https://github.com/benletchford/systemless/commit/38dd032b69e7b3ca1562474d5f45a6a7e3117f9a))
+* add qualified Domain and Fractal Hearts browser play ([ddc57ac](https://github.com/benletchford/systemless/commit/ddc57acf861907cbaae8d4306eda61422204ebe8))
+* add qualified MacGnuGo browser play ([99cc743](https://github.com/benletchford/systemless/commit/99cc7439195dd2730cce82a8a010252c5527f166))
+* add qualified Morpion browser play ([8357cbe](https://github.com/benletchford/systemless/commit/8357cbe5603e2f58c592d216b90e544f6fdd6c91))
+* add qualified Vampire Chess and MaciGame browser play ([971ad59](https://github.com/benletchford/systemless/commit/971ad59d45b1f2151f7e122c085809de1eff0ab4))
+* add Seismic Duck browser play ([f243c00](https://github.com/benletchford/systemless/commit/f243c003f501aaba16603daee337bbce31c67ce3))
+* add SideMinder browser play ([b5dfb40](https://github.com/benletchford/systemless/commit/b5dfb40c64b9ba9869416d39e3c5d81cf088134b))
+* add Super Othello browser play ([531c0af](https://github.com/benletchford/systemless/commit/531c0af47bd388b611d9459a42722e21b6e9cec2))
+* enable Abbalone browser play ([b4f8865](https://github.com/benletchford/systemless/commit/b4f88657720a740d08c09eaba0c19a18b9c66eec))
+* enable Dunjin browser play ([3ec502c](https://github.com/benletchford/systemless/commit/3ec502cbf1b64035a9346ac76179c0b6c10a8dfc))
+
+
+### Bug Fixes
+
+* honor compressed resource stream terminators ([91ec581](https://github.com/benletchford/systemless/commit/91ec581d2fc7656686c633d19b9e99ce740fd92f))
+* honor PEF section preferred addresses ([79d256e](https://github.com/benletchford/systemless/commit/79d256e11c088ab671aeb487b1b5b2ab294d5084))
+* honor PowerPC background patterns in EraseRect ([e2930db](https://github.com/benletchford/systemless/commit/e2930db7f674dae3b1f467db66c92c655aa84e4b))
+* implement PowerPC HSL2RGB colour conversion ([a9b6c8d](https://github.com/benletchford/systemless/commit/a9b6c8d77892805bd65c92833644ce96b700a0fb))
+* implement PowerPC raw current resource map accessors ([5654afa](https://github.com/benletchford/systemless/commit/5654afa73f251276c7bfd9a2207d80f315b73cb2))
+* implement the 68K theme color query ([a755c9d](https://github.com/benletchford/systemless/commit/a755c9d327e29f3d538ea3a8d8dfa59e82897e97))
+* implement the PowerPC CopyPixMap import ([c535e20](https://github.com/benletchford/systemless/commit/c535e205601128fbd7509b21bd0a098f6660b9a5))
+* keep DrawSprocket device palettes coherent ([846bece](https://github.com/benletchford/systemless/commit/846bece9d5ee3bfe26e8a25007d0192b5628b3f0))
+* map complex regions in the 68K QuickDraw trap ([b912638](https://github.com/benletchford/systemless/commit/b912638f7bdd236bb2a03d9aa67e340981e427b0))
+* move dragged regions with their tracking outlines ([4a8ef30](https://github.com/benletchford/systemless/commit/4a8ef30ab35a9341ac0ecb63897736378e483f4a))
+* preserve literal HFS slashes in Compact Pro names ([c2798af](https://github.com/benletchford/systemless/commit/c2798af545969c528af02bfad7a0e8eb74f6c067))
+* share physical cursor device state across architectures ([938894e](https://github.com/benletchford/systemless/commit/938894e1db404943012dedbcab730a33230247e6))
+* wait for synchronous PowerPC sound playback ([151ba1e](https://github.com/benletchford/systemless/commit/151ba1ea36e7382709f66a75fa4173711dc77667))
+
+
+### Performance Improvements
+
+* bound TextEdit repaint work for caret and tail input ([05e3319](https://github.com/benletchford/systemless/commit/05e33193467a716e767c313a6834e8f79cbbae7a))
+* copy complete pixels into RGBA presentation buffers ([3fe927b](https://github.com/benletchford/systemless/commit/3fe927b1c9af614a64cfb32d48cbc3e1de08c700))
+* prove idle cycles around main-device queries ([d9d1164](https://github.com/benletchford/systemless/commit/d9d1164642a0fa7f541b235412c7b0d9afaa3366))
+* reuse exact color and row data during redraws ([578dcb2](https://github.com/benletchford/systemless/commit/578dcb22f39de2097f0f749c53bf19a505ce0dd3))
+
 ## [0.111.0](https://github.com/benletchford/systemless/compare/v0.110.1...v0.111.0) (2026-11-07)
 
 

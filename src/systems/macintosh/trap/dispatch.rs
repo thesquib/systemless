@@ -1393,9 +1393,8 @@ pub struct TrapDispatcher {
     standalone_memory_manager: SharedProcessMemoryManager,
     /// Movie Toolbox handles returned by NewMovieFromFile/NewMovie-style traps.
     pub(crate) movie_states: FastHashMap<u32, MovieState>,
-    /// Maps a movie-controller component instance to the Movie it drives, set
-    /// by MCNewAttachedController so MCDoAction can start the right movie.
-    pub(crate) movie_by_controller: FastHashMap<u32, u32>,
+    /// Classic movie-controller state, shared by Toolbox and component calls.
+    pub(crate) movie_controllers: FastHashMap<u32, ClassicMovieController>,
     /// Movie Toolbox current error value for GetMoviesError.
     pub(crate) movie_error: i16,
     /// Movie Toolbox sticky error value for GetMoviesStickyError.
@@ -1524,6 +1523,8 @@ pub struct TrapDispatcher {
     pub(crate) synthetic_component_instances: FastHashSet<u32>,
     /// Next opaque ComponentInstance value returned by OpenComponent.
     pub(crate) next_synthetic_component_instance: u32,
+    pub(crate) classic_graphics_importers:
+        FastHashMap<u32, super::toolbox::graphics_importer::ClassicGraphicsImporter>,
     /// Saved old structure/content regions keyed by window pointer.
     /// SaveOld snapshots this state and DrawNew consumes it.
     pub(crate) saved_draw_old_regions: FastHashMap<u32, DrawOldState>,
@@ -2397,8 +2398,27 @@ pub struct TrapDispatcher {
 
 pub(crate) type ResourceFileMap = ProcessResourceFileMap;
 
-/// Synthetic Movie Toolbox state for Movie handles returned by
-/// NewMovieFromFile/NewMovie-style traps.
+/// State owned by a classic movie-controller component instance.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClassicMovieController {
+    pub movie: u32,
+    pub bounds: (i16, i16, i16, i16),
+    pub port: u32,
+    pub creation_flags: u32,
+    pub control_flags: u32,
+    pub keys_enabled: bool,
+    pub palette: Option<ClassicMovieControllerPalette>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClassicMovieControllerPalette {
+    pub handle: u32,
+    pub window: u32,
+    pub movie: u32,
+    pub previous: Option<(u32, i16)>,
+}
+
+/// Movie Toolbox state for NewMovieFromFile/NewMovie handles.
 #[derive(Clone, Debug)]
 pub(crate) struct MovieState {
     pub box_rect: (i16, i16, i16, i16),
@@ -3849,7 +3869,7 @@ impl TrapDispatcher {
             process_memory_manager: None,
             standalone_memory_manager: SharedProcessMemoryManager::default(),
             movie_states: HashMap::default(),
-            movie_by_controller: HashMap::default(),
+            movie_controllers: HashMap::default(),
             movie_error: 0,
             movie_sticky_error: 0,
             dialogs_drawn_by_app: std::collections::HashSet::default(),
@@ -3888,6 +3908,7 @@ impl TrapDispatcher {
             cooperative_thread_scheduler: 0,
             synthetic_component_instances: HashSet::default(),
             next_synthetic_component_instance: 0x00C1_0001,
+            classic_graphics_importers: HashMap::default(),
             saved_draw_old_regions: HashMap::default(),
             fired_oapp_handler: false,
             system_str_cache: HashMap::default(),
@@ -6784,13 +6805,48 @@ impl TrapDispatcher {
         wants_write: bool,
     ) -> u16 {
         let rsrc_data = self.vfs_rsrc.get(vfs_key).unwrap().clone();
+        let fork = ResourceFork::parse(&rsrc_data);
+        let mut map = fork
+            .as_ref()
+            .map(|fork| fork.map().to_vec())
+            .unwrap_or_else(|| {
+                // Empty resource forks are supported by the archive-backed VFS.
+                let mut map = vec![0; 30];
+                map[24..26].copy_from_slice(&28u16.to_be_bytes());
+                map[26..28].copy_from_slice(&30u16.to_be_bytes());
+                map[28..30].copy_from_slice(&u16::MAX.to_be_bytes());
+                map
+            });
+        if let Some(fork) = &fork {
+            for resource in fork.resources().values() {
+                let at = resource.reference_offset as usize + 8;
+                map[at..at + 4].fill(0);
+            }
+        }
+        let map_ptr = bus.alloc(map.len() as u32);
+        if map_ptr == 0 {
+            bus.write_word(0x0A60, (-108i16) as u16);
+            return u16::MAX;
+        }
+        let map_handle = bus.alloc(4);
+        if map_handle == 0 {
+            bus.free(map_ptr);
+            bus.write_word(0x0A60, (-108i16) as u16);
+            return u16::MAX;
+        }
         let refnum = match self.allocate_resource_file_fcb(bus, vfs_key, wants_write) {
             Ok(refnum) => refnum,
             Err(error) => {
+                bus.free(map_ptr);
+                bus.free(map_handle);
                 bus.write_word(0x0A60, error as u16);
                 return u16::MAX;
             }
         };
+        bus.write_bytes(map_ptr, &map);
+        bus.write_long(map_ptr + 16, bus.read_long(0x0A50));
+        bus.write_word(map_ptr + 20, refnum);
+        bus.write_long(map_handle, map_ptr);
         // Resource Manager returns the File Manager's access-path reference.
         // Keep raw fork reads, marks and closure on the same path as PBOpenRF.
         // Inside Macintosh: More Macintosh Toolbox (1993), p. 1-58.
@@ -6800,8 +6856,8 @@ impl TrapDispatcher {
         self.vfs.insert(backing_key.clone(), rsrc_data.clone());
         self.open_files.insert(refnum, backing_key);
         self.file_positions.insert(refnum, 0);
-        if let Some(fork) = ResourceFork::parse(&rsrc_data) {
-            self.merge_resources_from_fork(&fork, bus, refnum);
+        if let Some(fork) = &fork {
+            self.merge_resources_from_fork(fork, bus, refnum);
         } else {
             self.register_empty_resource_file(refnum);
         }
@@ -6810,8 +6866,96 @@ impl TrapDispatcher {
             self.write_refnums.insert(refnum);
         }
         self.set_current_resource_refnum(bus, refnum);
+        // TN1120 uses a changed TopMapHndl to distinguish complete success
+        // (a new map) from partial success (reusing an existing map).
+        bus.write_long(0x0A50, map_handle);
+        if let Some(fork) = &fork {
+            for resource in fork.resources().values() {
+                let ptr = self
+                    .resources
+                    .as_ref()
+                    .and_then(|resources| resources.files.get(&refnum))
+                    .and_then(|file| file.loaded.get(&(resource.res_type, resource.id)))
+                    .copied()
+                    .unwrap_or(0);
+                if ptr != 0 {
+                    let handle = self.get_or_create_resource_handle_in_file(
+                        bus,
+                        resource.res_type,
+                        resource.id,
+                        ptr,
+                        refnum,
+                    );
+                    bus.write_long(map_ptr + resource.reference_offset as u32 + 8, handle);
+                }
+            }
+        }
         bus.write_word(0x0A60, 0);
         refnum
+    }
+
+    fn unlink_resource_file_map(bus: &mut MacMemoryBus, refnum: u16) {
+        let mut link = 0x0A50;
+        let mut handle = bus.read_long(link);
+        let mut seen: HashSet<u32> = HashSet::default();
+        while handle != 0 && seen.insert(handle) {
+            let map = bus.read_long(handle);
+            if map == 0 {
+                break;
+            }
+            let next = bus.read_long(map + 16);
+            if bus.read_word(map + 20) == refnum {
+                bus.write_long(link, next);
+                bus.free(map);
+                bus.free(handle);
+                break;
+            }
+            link = map + 16;
+            handle = next;
+        }
+    }
+
+    /// Apply the single-process reopen rules corrected by Apple TN1120 (1998).
+    /// Read requests create a separate map. Write requests can reuse a map,
+    /// retaining its existing permissions. Both outcomes make the map current.
+    pub(crate) fn open_resource_file_with_permission(
+        &mut self,
+        bus: &mut MacMemoryBus,
+        vfs_key: &str,
+        permission: i16,
+    ) -> u16 {
+        let existing = self.resources.as_ref().and_then(|resources| {
+            resources
+                .names
+                .iter()
+                .filter_map(|(&refnum, name)| (name == vfs_key).then_some(refnum))
+                .min_by_key(|refnum| (!self.write_refnums.contains(refnum), *refnum))
+        });
+        let requested_write = matches!(permission, 2 | 3);
+        if requested_write {
+            if let Some(refnum) = existing {
+                // Partial success must not upgrade a read-only access path.
+                self.set_current_resource_refnum(bus, refnum);
+                bus.write_word(0x0A60, 0);
+                return refnum;
+            }
+            if self.vfs_path_is_read_only(vfs_key) {
+                bus.write_word(0x0A60, (-44i16) as u16);
+                return u16::MAX;
+            }
+            if self.locked_files.contains(vfs_key) {
+                bus.write_word(0x0A60, (-45i16) as u16);
+                return u16::MAX;
+            }
+        }
+        // fsCurPerm grants read/write only on the first open when available.
+        // A subsequent fsCurPerm open has the same fresh-map behavior as fsRdPerm.
+        let writable = requested_write
+            || (permission == 0
+                && existing.is_none()
+                && !self.vfs_path_is_read_only(vfs_key)
+                && !self.locked_files.contains(vfs_key));
+        self.open_resource_file_from_vfs_key(bus, vfs_key, writable)
     }
 
     /// Keep the boot System file below the application in resource searches.
@@ -6914,6 +7058,7 @@ impl TrapDispatcher {
                     *current_file = surviving_classic_current as i16;
                 });
         }
+        Self::unlink_resource_file_map(bus, refnum);
         self.clear_resource_file_backing_data(refnum);
         self.clear_resource_file_handle_index(refnum);
         self.with_resource_manager_mut(|resource_manager| {
@@ -7260,6 +7405,18 @@ impl TrapDispatcher {
             return Some(ptr);
         }
 
+        let body = Self::system_wctb_default_body();
+        let ptr = bus.alloc(body.len() as u32);
+        if ptr == 0 {
+            return None;
+        }
+        bus.write_bytes(ptr, &body);
+        self.system_wctb_cache.insert(res_id, ptr);
+        Some(ptr)
+    }
+
+    /// The standard WinCTab body shared by the classic and native loaders.
+    pub(crate) fn system_wctb_default_body() -> Vec<u8> {
         const COLORS: [(u16, u16, u16, u16); 13] = [
             (0, 0xFFFF, 0xFFFF, 0xFFFF),  // wContentColor
             (1, 0x0000, 0x0000, 0x0000),  // wFrameColor
@@ -7276,19 +7433,15 @@ impl TrapDispatcher {
             (12, 0x3333, 0x3333, 0x6666), // wTingeDark
         ];
 
-        let ptr = bus.alloc(8 + COLORS.len() as u32 * 8);
-        bus.write_long(ptr, 0); // wCSeed is reserved.
-        bus.write_word(ptr + 4, 0); // wCReserved is reserved.
-        bus.write_word(ptr + 6, COLORS.len() as u16 - 1);
-        for (index, &(part, red, green, blue)) in COLORS.iter().enumerate() {
-            let entry = ptr + 8 + index as u32 * 8;
-            bus.write_word(entry, part);
-            bus.write_word(entry + 2, red);
-            bus.write_word(entry + 4, green);
-            bus.write_word(entry + 6, blue);
+        // WinCTab seed and reserved fields are both zero.
+        let mut body = vec![0; 6];
+        body.extend_from_slice(&(COLORS.len() as u16 - 1).to_be_bytes());
+        for (part, red, green, blue) in COLORS {
+            for word in [part, red, green, blue] {
+                body.extend_from_slice(&word.to_be_bytes());
+            }
         }
-        self.system_wctb_cache.insert(res_id, ptr);
-        Some(ptr)
+        body
     }
 
     /// Allocate (and cache) a callable resource shim for the standard ROM

@@ -133,6 +133,8 @@ fn ppc_resource_name_eq(left: &[u8], right: &[u8]) -> bool {
         })
 }
 
+const SYSTEM_WCTB_PATH: &str = "__system__/wctb";
+
 pub(crate) fn ppc_get_resource(
     cpu: &mut PpcCpu,
     process_memory_manager: &mut ProcessNativeMemoryManager,
@@ -158,32 +160,40 @@ pub(crate) fn ppc_get_resource(
     ) {
         Some(index) => index,
         None => {
-            let fond_name = crate::quickdraw::fonts::FONT_NAMES
-                .iter()
-                .find(|(id, _)| *id == res_id)
-                .map(|(_, name)| crate::mac_roman::encode_mac_roman_lossy(name));
             let mut name = Vec::new();
-            let system_resource = if !current_only && res_type == u32::from_be_bytes(*b"STR ") {
-                crate::trap::TrapDispatcher::system_str_default_body(res_id).map(|body| body.to_vec())
-            } else if !current_only && res_type == u32::from_be_bytes(*b"FOND") && fond_name.is_some() {
-                // Built-in fonts have no resource file, but the real System's fonts have FONDs.
-                name = fond_name.unwrap_or_default();
-                Some(super::dispatch_resources::ppc_synthetic_fond_bytes(res_id))
-            } else if !current_only && res_type == u32::from_be_bytes(*b"itl0") && res_id == 0 {
-                // The Roman system script supplies numeric-format resource 0.
-                // Intl0Rec layout: Inside Macintosh: Text (1993), B-22–B-24.
-                Some(vec![
-                    b'.', b',', b';', b'$', 0, 0, 0xF0, 0, 0, b'/', 0xFF,
-                    0x60, b' ', b'A', b'M', 0, b' ', b'P', b'M', 0, b':',
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                ])
-            } else {
+            let system_resource = if current_only {
                 None
+            } else {
+                match (res_type.to_be_bytes(), res_id) {
+                    ([b'S', b'T', b'R', b' '], _) => TrapDispatcher::system_str_default_body(res_id)
+                        .map(|body| ("__system__/STR ", body.to_vec())),
+                    ([b'i', b't', b'l', b'0'], 0) => {
+                        // Roman numeric format, Inside Macintosh: Text (1993), B-22–B-24.
+                        Some(("__system__/itl0", vec![
+                            b'.', b',', b';', b'$', 0, 0, 0xF0, 0, 0, b'/', 0xFF,
+                            0x60, b' ', b'A', b'M', 0, b' ', b'P', b'M', 0, b':',
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ]))
+                    }
+                    ([b'w', b'c', b't', b'b'], 0) => {
+                        Some((SYSTEM_WCTB_PATH, TrapDispatcher::system_wctb_default_body()))
+                    }
+                    ([b'F', b'O', b'N', b'D'], _) => {
+                        // Built-in fonts have no resource file, but the real System's fonts have FONDs.
+                        crate::quickdraw::fonts::FONT_NAMES.iter().find(|(id, _)| *id == res_id).map(
+                            |(_, font_name)| {
+                                name = crate::mac_roman::encode_mac_roman_lossy(font_name);
+                                ("__system__/FOND", super::dispatch_resources::ppc_synthetic_fond_bytes(res_id))
+                            },
+                        )
+                    }
+                    _ => None,
+                }
             };
-            if let Some(data) = system_resource {
+            if let Some((path, data)) = system_resource {
                 vfs_resources.push(PpcVfsResourceRecord {
                     ref_num: 0,
-                    path: format!("__system__/{}", ppc_res_type_text(res_type)),
+                    path: path.to_string(),
                     res_type,
                     res_id,
                     name,
@@ -254,11 +264,19 @@ pub(crate) fn ppc_get_named_resource(
     vfs_resources: &mut [PpcVfsResourceRecord],
     current_resource_refnum: i16,
     current_only: bool,
+    c_string: bool,
     load_data: bool,
     last_resource_error: &mut i16,
 ) -> u32 {
     let res_type = cpu.gpr[3];
-    let Some(name) = ppc_read_pstring_bytes(memory, cpu.gpr[4]) else {
+    // Resources.h declares lowercase named-resource glue with const char*;
+    // the uppercase entry points retain their Pascal-string contract.
+    let name = if c_string {
+        ppc_read_bounded_c_string(memory, cpu.gpr[4])
+    } else {
+        ppc_read_pstring_bytes(memory, cpu.gpr[4])
+    };
+    let Some(name) = name else {
         *last_resource_error = PPC_PARAM_ERR;
         return 0;
     };
@@ -570,6 +588,7 @@ pub(crate) fn ppc_get_res_info(
     memory: &mut PpcSectionMem,
     vfs_resources: &[PpcVfsResourceRecord],
     last_resource_error: &mut i16,
+    c_string: bool,
 ) {
     let handle = cpu.gpr[3];
     let id_ptr = cpu.gpr[4];
@@ -593,7 +612,15 @@ pub(crate) fn ppc_get_res_info(
         let _ = memory.write_u32_be(type_ptr, record.res_type);
     }
     if name_ptr != 0 {
-        let _ = ppc_write_pstring_bytes(memory, name_ptr, &record.name);
+        if c_string {
+            // C and Pascal outputs both need name.len().min(255) + 1 bytes.
+            // All outputs have been validated before the first write above.
+            let name = &record.name[..record.name.len().min(255)];
+            let _ = memory.write_bytes(name_ptr, name);
+            let _ = memory.write_u8(name_ptr + name.len() as u32, 0);
+        } else {
+            let _ = ppc_write_pstring_bytes(memory, name_ptr, &record.name);
+        }
     }
     *last_resource_error = PPC_NO_ERR;
 }
@@ -815,16 +842,25 @@ pub(crate) fn ppc_vfs_resource_index(
     res_id: i16,
     current_only: bool,
 ) -> Option<usize> {
+    let matches_id = |record: &PpcVfsResourceRecord| {
+        record.res_type == res_type && record.res_id == res_id
+    };
     let current_match = vfs_resources.iter().position(|record| {
         record.ref_num == current_resource_refnum
-            && record.res_type == res_type
-            && record.res_id == res_id
+            && record.path != SYSTEM_WCTB_PATH
+            && matches_id(record)
     });
     if current_only || current_match.is_some() {
         return current_match;
     }
     ppc_resource_chain_position(vfs_resources, current_resource_refnum, |record| {
-        record.res_type == res_type && record.res_id == res_id
+        record.path != SYSTEM_WCTB_PATH && matches_id(record)
+    }).or_else(|| {
+        // A cached System fallback cannot shadow an actual open resource or
+        // become visible to Get1Resource through the application refnum alias.
+        vfs_resources.iter().position(|record| {
+            record.path == SYSTEM_WCTB_PATH && matches_id(record)
+        })
     })
 }
 

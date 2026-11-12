@@ -1457,6 +1457,122 @@ fn reject_filter_suite_without_host(
     contents.reject_without_host(runner)
 }
 
+#[derive(Default)]
+struct ZipAppleDouble {
+    resource_fork: Vec<u8>,
+    finder_info: Option<([u8; 4], [u8; 4], u16)>,
+}
+
+// AppleDouble v2 (RFC 1740, Appendix B): resource fork entry 2 and
+// Finder information entry 9 accompany, rather than replace, the data file.
+fn parse_zip_appledouble(bytes: &[u8]) -> Result<ZipAppleDouble, String> {
+    if bytes.len() < 26 || bytes[..4] != [0, 5, 22, 7] {
+        return Err("Invalid AppleDouble header".to_string());
+    }
+    if bytes[4..8] != [0, 2, 0, 0] {
+        return Err("Unsupported AppleDouble version".to_string());
+    }
+    let count = u16::from_be_bytes(bytes[24..26].try_into().unwrap()) as usize;
+    let table_end = 26 + count * 12;
+    if table_end > bytes.len() {
+        return Err("Truncated AppleDouble entry table".to_string());
+    }
+    let mut metadata = ZipAppleDouble::default();
+    let mut resource_seen = false;
+    let mut spans = Vec::new();
+    for descriptor in bytes[26..table_end].chunks_exact(12) {
+        let id = u32::from_be_bytes(descriptor[..4].try_into().unwrap());
+        let offset = u32::from_be_bytes(descriptor[4..8].try_into().unwrap()) as usize;
+        let size = u32::from_be_bytes(descriptor[8..12].try_into().unwrap()) as usize;
+        let end = offset
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "AppleDouble entry outside header file".to_string())?;
+        if size != 0 {
+            if offset < table_end {
+                return Err("AppleDouble entry overlaps its table".to_string());
+            }
+            spans.push((offset, end));
+        }
+        let value = &bytes[offset..end];
+        match id {
+            1 => return Err("AppleDouble header contains a data fork".to_string()),
+            2 => {
+                if resource_seen {
+                    return Err("Duplicate AppleDouble resource fork".to_string());
+                }
+                resource_seen = true;
+                metadata.resource_fork = value.to_vec();
+            }
+            9 => {
+                if metadata.finder_info.is_some() || value.len() < 32 {
+                    return Err("Invalid AppleDouble Finder information".to_string());
+                }
+                metadata.finder_info = Some((
+                    value[..4].try_into().unwrap(),
+                    value[4..8].try_into().unwrap(),
+                    u16::from_be_bytes(value[8..10].try_into().unwrap()),
+                ));
+            }
+            _ => {}
+        }
+    }
+    spans.sort_unstable();
+    if spans.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err("Overlapping AppleDouble entries".to_string());
+    }
+    Ok(metadata)
+}
+
+fn zip_appledouble_target(path: &str) -> Option<String> {
+    let path = path.strip_prefix("__MACOSX/").unwrap_or(path);
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let name = name.strip_prefix("._")?;
+    if matches!(name, "" | "." | "..") {
+        return None;
+    }
+    Some(if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    })
+}
+
+fn zip_path_parents(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(path.rsplit_once('/').map(|(parent, _)| parent), |parent| {
+        parent.rsplit_once('/').map(|(parent, _)| parent)
+    })
+}
+
+fn read_zip_member<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    path: &str,
+    prefix: &[u8],
+) -> Result<Vec<u8>, String> {
+    let declared_size = entry.size();
+    let entry_size = usize::try_from(declared_size)
+        .map_err(|_| format!("ZIP entry is too large for this platform: {path}"))?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(entry_size)
+        .map_err(|err| format!("Failed to allocate memory for ZIP entry {path}: {err}"))?;
+    data.extend_from_slice(prefix);
+    entry
+        .take(
+            declared_size
+                .saturating_sub(prefix.len() as u64)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut data)
+        .map_err(|err| format!("Failed to decompress ZIP entry {path}: {err}"))?;
+    if data.len() as u64 != declared_size {
+        return Err(format!(
+            "ZIP entry size mismatch for {path}: declared {declared_size}, decoded {}",
+            data.len()
+        ));
+    }
+    Ok(data)
+}
+
 fn collect_zip_payload(file_data: &[u8]) -> Result<Payload, String> {
     let reader = Cursor::new(file_data);
     let mut archive = zip::ZipArchive::new(reader)
@@ -1466,17 +1582,13 @@ fn collect_zip_payload(file_data: &[u8]) -> Result<Payload, String> {
             "ZIP archive exceeds the {MAX_ZIP_ENTRIES} entry limit"
         ));
     }
-    let mut payload = Payload {
-        dirs: Vec::new(),
-        files: Vec::new(),
-        volumes: Vec::new(),
-        installer_roots: Vec::new(),
-        skipped_disk_image_errors: Vec::new(),
-    };
+    let mut members = Vec::new();
+    let mut targets = std::collections::HashSet::new();
+    let mut file_targets = std::collections::HashSet::new();
     let mut total_uncompressed_bytes = 0u64;
-
+    // Validate every name and the complete size budget before reading metadata.
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|err| format!("Failed to read ZIP entry {index}: {err}"))?;
         if entry.encrypted() {
@@ -1489,75 +1601,138 @@ fn collect_zip_payload(file_data: &[u8]) -> Result<Payload, String> {
         if path.is_empty() {
             continue;
         }
-        if entry.is_dir() {
-            payload.dirs.push(path.trim_end_matches('/').to_string());
+        let directory = entry.is_dir();
+        if !directory {
+            if entry.size() > MAX_ZIP_ENTRY_BYTES {
+                return Err(format!(
+                    "ZIP entry exceeds the {MAX_ZIP_ENTRY_BYTES} byte extraction limit: {path}"
+                ));
+            }
+            total_uncompressed_bytes = total_uncompressed_bytes
+                .checked_add(entry.size())
+                .ok_or_else(|| "ZIP uncompressed size overflow".to_string())?;
+            if total_uncompressed_bytes > MAX_ZIP_TOTAL_BYTES {
+                return Err(format!(
+                    "ZIP archive exceeds the {MAX_ZIP_TOTAL_BYTES} byte extraction limit"
+                ));
+            }
+            file_targets.insert(path.clone());
+        }
+        targets.insert(path.clone());
+        targets.extend(zip_path_parents(&path).map(str::to_string));
+        members.push((index, path, directory));
+    }
+    let mut metadata = std::collections::HashMap::new();
+    let mut consumed = std::collections::HashSet::new();
+    let mut metadata_dirs = std::collections::HashSet::new();
+    // Separate pass makes both adjacent and __MACOSX headers order-independent.
+    // Orphan headers and ordinary similarly named files remain ordinary members.
+    for (index, path, directory) in &members {
+        if *directory {
             continue;
         }
-
-        if entry.size() > MAX_ZIP_ENTRY_BYTES {
+        let Some(target) = zip_appledouble_target(path).filter(|target| targets.contains(target))
+        else {
+            continue;
+        };
+        let mut entry = archive
+            .by_index(*index)
+            .map_err(|err| format!("ZIP entry {path}: {err}"))?;
+        if entry.size() < 4 {
+            continue;
+        }
+        let mut magic = [0; 4];
+        entry
+            .read_exact(&mut magic)
+            .map_err(|err| format!("ZIP entry {path}: {err}"))?;
+        if magic != [0, 5, 22, 7] {
+            continue;
+        }
+        let bytes = read_zip_member(&mut entry, path, &magic)?;
+        let header = parse_zip_appledouble(&bytes).map_err(|err| format!("{path}: {err}"))?;
+        if !file_targets.contains(&target) && !header.resource_fork.is_empty() {
             return Err(format!(
-                "ZIP entry exceeds the {} byte extraction limit: {path}",
-                MAX_ZIP_ENTRY_BYTES
+                "Unsupported AppleDouble directory resource fork: {path}"
             ));
         }
-        total_uncompressed_bytes = total_uncompressed_bytes
-            .checked_add(entry.size())
-            .ok_or_else(|| "ZIP uncompressed size overflow".to_string())?;
-        if total_uncompressed_bytes > MAX_ZIP_TOTAL_BYTES {
-            return Err(format!(
-                "ZIP archive exceeds the {} byte extraction limit",
-                MAX_ZIP_TOTAL_BYTES
-            ));
+        if metadata.insert(target.clone(), header).is_some() {
+            return Err(format!("Duplicate AppleDouble metadata for {target}"));
         }
-
-        let declared_size = entry.size();
-        let entry_size = usize::try_from(declared_size)
-            .map_err(|_| format!("ZIP entry is too large for this platform: {path}"))?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(entry_size)
-            .map_err(|_| format!("Failed to allocate memory for ZIP entry: {path}"))?;
-        (&mut entry)
-            .take(declared_size.saturating_add(1))
-            .read_to_end(&mut data)
-            .map_err(|err| format!("Failed to decompress ZIP entry {path}: {err}"))?;
-        if data.len() as u64 != declared_size {
-            return Err(format!(
-                "ZIP entry size mismatch for {path}: declared {declared_size}, decoded {}",
-                data.len()
-            ));
+        consumed.insert(*index);
+        metadata_dirs.extend(zip_path_parents(path).map(str::to_string));
+    }
+    if members
+        .iter()
+        .any(|(index, path, _)| consumed.contains(index) && metadata.contains_key(path))
+    {
+        return Err("AppleDouble metadata targets another metadata header".to_string());
+    }
+    let mut retained_dirs = std::collections::HashSet::new();
+    for (index, path, directory) in &members {
+        if !consumed.contains(index) && (!directory || !metadata_dirs.contains(path)) {
+            retained_dirs.extend(zip_path_parents(path).map(str::to_string));
         }
-
-        if looks_like_macbinary(&data) {
+    }
+    let mut payload = Payload {
+        dirs: Vec::new(),
+        files: Vec::new(),
+        volumes: Vec::new(),
+        installer_roots: Vec::new(),
+        skipped_disk_image_errors: Vec::new(),
+    };
+    for (index, path, directory) in members {
+        if consumed.contains(&index) {
+            continue;
+        }
+        if directory {
+            if !metadata_dirs.contains(&path) || retained_dirs.contains(&path) {
+                payload.dirs.push(path);
+            }
+            continue;
+        }
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("ZIP entry {path}: {err}"))?;
+        let data = read_zip_member(&mut entry, &path, &[])?;
+        if let Some(header) = metadata.remove(&path) {
+            let (file_type, creator, flags) = header.finder_info.unwrap_or((*b"????", *b"????", 0));
+            let nested = payload_from_forks(
+                &path,
+                data,
+                header.resource_fork,
+                file_type,
+                creator,
+                flags,
+                1,
+            )?;
+            merge_payload(&mut payload, nested);
+        } else if looks_like_macbinary(&data) {
             let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
             payload
                 .files
                 .push(parse_macbinary_payload(&data, parent, 1)?);
-            continue;
+        } else {
+            let nested = payload_from_forks(&path, data, Vec::new(), *b"????", *b"????", 0, 1)?;
+            merge_payload(&mut payload, nested);
         }
-
-        let nested = payload_from_forks(&path, data, Vec::new(), *b"????", *b"????", 0, 1)?;
-        payload.installer_roots.extend(nested.installer_roots);
-        payload.dirs.extend(nested.dirs);
-        payload.files.extend(nested.files);
-        payload.volumes.extend(nested.volumes);
-        payload
-            .skipped_disk_image_errors
-            .extend(nested.skipped_disk_image_errors);
     }
-
     expand_split_vise_payloads(payload)
 }
 
 fn safe_zip_entry_path<R: std::io::Read>(
     entry: &zip::read::ZipFile<'_, R>,
 ) -> Result<String, String> {
-    let original = entry.name();
-    if original.contains('\\') {
+    // Legacy Mac ZIP writers sometimes omitted the UTF-8 flag. The ZIP
+    // reader also exposes validated Unicode Path extra fields through name_raw,
+    // so decoding these bytes preserves explicit Unicode metadata as well.
+    let original = std::str::from_utf8(entry.name_raw()).unwrap_or(entry.name());
+    if original.contains(['\\', '\0']) {
         return Err(format!("Unsafe ZIP entry path: {original}"));
     }
-    let enclosed = entry
+    entry
         .enclosed_name()
         .ok_or_else(|| format!("Unsafe ZIP entry path: {original}"))?;
+    let enclosed = std::path::Path::new(original);
     if enclosed.components().any(|component| {
         matches!(
             component,
@@ -2224,7 +2399,33 @@ fn expand_installer_maker_payload(
         installer_roots: vec![name.to_string()],
         skipped_disk_image_errors: Vec::new(),
     };
-    for entry in container.entries {
+    // Installer component variants can have the same HFS path. Retain each
+    // original fork under a separate parent instead of overwriting one in VFS.
+    // This preserves alternatives; it does not guess installer conditions.
+    let key = |path: &str| {
+        crate::trap::dispatch::TrapDispatcher::normalize_vfs_path(path).to_ascii_lowercase()
+    };
+    let mut counts = std::collections::HashMap::new();
+    for entry in &container.entries {
+        *counts.entry(key(&entry.name)).or_insert(0usize) += 1;
+    }
+    let roots: std::collections::HashSet<_> = counts
+        .keys()
+        .filter_map(|path| path.split('/').next())
+        .collect();
+    let mut variants = "Installer Variants".to_string();
+    let mut suffix = 2;
+    while roots.contains(key(&variants).as_str()) {
+        variants = format!("Installer Variants ({suffix})");
+        suffix += 1;
+    }
+    let check_crc = data.starts_with(b"STi2");
+    for (index, entry) in container.entries.into_iter().enumerate() {
+        let relative_name = if counts[&key(&entry.name)] > 1 {
+            format!("{variants}/{}/{name}", index + 1, name = entry.name)
+        } else {
+            entry.name.clone()
+        };
         let rsrc = decode_installer_fork(
             name,
             &entry.name,
@@ -2241,7 +2442,18 @@ fn expand_installer_maker_payload(
             entry.data_packed,
             entry.data_unpacked_len,
         )?;
-        let embedded_name = format!("{}/{}", name, entry.name);
+        if check_crc {
+            for (fork, bytes, expected) in [
+                ("resource", rsrc.as_slice(), entry.rsrc_crc16),
+                ("data", data.as_slice(), entry.data_crc16),
+            ] {
+                crate::game::installer_maker::validate_installer_fork_crc(bytes, expected)
+                    .map_err(|error| {
+                        format!("InstallerMaker {name}/{} {fork} fork: {error}", entry.name)
+                    })?;
+            }
+        }
+        let embedded_name = format!("{name}/{relative_name}");
         if crate::runner::trace_load_enabled() {
             eprintln!(
                 "[LOAD] Expanded InstallerMaker \"{}\" data={} rsrc={}",
@@ -2650,6 +2862,12 @@ fn decode_installer_fork(
             }
             Ok(packed.to_vec())
         }
+        13 => crate::game::installer_maker::decode_installer_method13(packed, unpacked_len)
+            .map_err(|error| {
+                format!(
+                    "InstallerMaker {container_name}/{entry_name} {fork_name} fork: {error}"
+                )
+            }),
         14 => crate::game::installer_maker::decode_installer_method14(packed, unpacked_len)
             .map_err(|error| {
                 format!(
@@ -4225,7 +4443,13 @@ fn is_bonus_content_path(path: &str) -> bool {
 }
 
 fn is_stuffit_archive(bytes: &[u8]) -> bool {
-    bytes.len() >= 80 && (&bytes[0..4] == b"SIT!" || &bytes[0..7] == b"StuffIt")
+    // The product name also begins ordinary ReadMe and registration documents.
+    // SIT-5's banner has a four-byte ending year between these fixed parts.
+    const SIT5_PREFIX: &[u8] = b"StuffIt (c)1997-";
+    const SIT5_SUFFIX: &[u8] = b" Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/\r\n";
+    bytes.len() >= 80
+        && (bytes.starts_with(b"SIT!")
+            || (bytes.starts_with(SIT5_PREFIX) && bytes.get(SIT5_PREFIX.len() + 4..80) == Some(SIT5_SUFFIX)))
 }
 
 fn log_vfs(runner: &FixtureRunner) {
@@ -4279,6 +4503,72 @@ fn read_u32_be(buf: &[u8], offset: &mut usize) -> Result<u32, String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn stuffit_header_detection_preserves_ordinary_document_forks() {
+        let data = b"StuffIt registration document\r".repeat(8);
+        let rsrc = empty_resource_fork_bytes();
+        let payload = payload_from_forks(
+            "Registration",
+            data.clone(),
+            rsrc.clone(),
+            *b"TEXT",
+            *b"ttxt",
+            0x100,
+            2,
+        )
+        .expect("a document mentioning StuffIt is not a nested archive");
+        assert_eq!(payload.files.len(), 1);
+        let file = &payload.files[0];
+        assert_eq!(file.name, "Registration");
+        assert_eq!(file.data, data);
+        assert_eq!(file.rsrc, rsrc);
+        assert_eq!(file.file_type, *b"TEXT");
+        assert_eq!(file.creator, *b"ttxt");
+        assert_eq!(file.finder_flags, 0x100);
+    }
+
+    #[test]
+    fn stuffit_header_detection_expands_archives_and_retains_parse_errors() {
+        let mut archive = SitArchive::new();
+        archive.add_entry(SitEntry {
+            name: "Readme".into(),
+            data_fork: b"original document".to_vec(),
+            resource_fork: Vec::new(),
+            file_type: *b"TEXT",
+            creator: *b"ttxt",
+            is_folder: false,
+            data_method: 0,
+            rsrc_method: 0,
+            data_ulen: 0,
+            rsrc_ulen: 0,
+            finder_flags: 0,
+            creation_date: 0,
+            modification_date: 0,
+            is_compressed: false,
+            format: stuffit::ArchiveFormat::Sit5,
+        });
+        let mut bytes = archive.serialize_compressed().unwrap();
+        let payload = payload_from_forks(
+            "Archive",
+            bytes.clone(),
+            Vec::new(),
+            *b"SIT5",
+            *b"SIT!",
+            0,
+            2,
+        )
+        .expect("a genuine StuffIt 5 archive should expand");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].name, "Readme");
+        assert_eq!(payload.files[0].data, b"original document");
+
+        bytes[82] = 42;
+        let error = payload_from_forks("Archive", bytes, Vec::new(), *b"SIT5", *b"SIT!", 0, 2)
+            .expect_err("a recognized archive with an unsupported version must still fail");
+        assert!(error.contains("UnsupportedVersion(42)"), "{error}");
+    }
+
 
     fn external_vise_test_archive() -> Vec<u8> {
         let mut data = vec![0; 44];
@@ -6201,6 +6491,63 @@ mod tests {
         );
     }
 
+    // Some older Mac ZIP writers stored UTF-8 names without setting bit 11.
+    fn zip_without_utf8_flags(mut bytes: Vec<u8>) -> Vec<u8> {
+        for offset in 0..bytes.len().saturating_sub(10) {
+            let flag_offset = match &bytes[offset..offset + 4] {
+                b"PK\x03\x04" => offset + 6,
+                b"PK\x01\x02" => offset + 8,
+                _ => continue,
+            };
+            bytes[flag_offset + 1] &= !8;
+        }
+        bytes
+    }
+
+    #[test]
+    fn zip_archive_decodes_unflagged_utf8_names_before_matching_appledouble() {
+        let rsrc = make_single_resource_fork_bytes(*b"DATA", 128, b"resource contents");
+        let metadata = make_zip_appledouble(&rsrc, b"rsrc", b"TEST");
+        let bytes = zip_without_utf8_flags(make_zip(&[
+            ("Demo ƒ/Data ƒ/Contents", b"data contents"),
+            ("__MACOSX/Demo ƒ/Data ƒ/._Contents", &metadata),
+        ]));
+        let payload = collect_zip_payload(&bytes).unwrap();
+        assert_eq!(payload.files.len(), 1);
+        let file = &payload.files[0];
+        assert_eq!(file.name, "Demo ƒ/Data ƒ/Contents");
+        assert_eq!(file.data, b"data contents");
+        assert_eq!(file.rsrc, rsrc);
+        assert_eq!(file.file_type, *b"rsrc");
+        assert_eq!(file.creator, *b"TEST");
+    }
+
+    #[test]
+    fn zip_archive_rejects_unsafe_unflagged_utf8_paths() {
+        for path in [
+            "../Demo ƒ/File",
+            "/Demo ƒ/File",
+            "Demo ƒ/../File",
+            "Demo ƒ\\File",
+        ] {
+            let bytes = zip_without_utf8_flags(make_zip(&[(path, b"contents")]));
+            let error = collect_zip_payload(&bytes).expect_err("unsafe UTF-8 path");
+            assert!(error.contains("Unsafe ZIP entry path"), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn zip_archive_keeps_non_utf8_cp437_names() {
+        let mut bytes = zip_without_utf8_flags(make_zip(&[("Demo ƒ/File", b"contents")]));
+        for offset in 0..bytes.len() - 1 {
+            if bytes[offset..offset + 2] == [0xc6, 0x92] {
+                bytes[offset..offset + 2].copy_from_slice(&[0x82, 0xa0]);
+            }
+        }
+        let payload = collect_zip_payload(&bytes).unwrap();
+        assert_eq!(payload.files[0].name, "Demo éá/File");
+    }
+
     #[test]
     fn zip_archive_mounts_macbinary_application_and_companion_files() {
         let app_data = b"self-readable application data";
@@ -6232,6 +6579,189 @@ mod tests {
             .expect("application metadata");
         assert_eq!(metadata.file_type, u32::from_be_bytes(*b"APPL"));
         assert_eq!(metadata.creator, u32::from_be_bytes(*b"TEST"));
+    }
+
+    fn make_zip_appledouble(rsrc: &[u8], file_type: &[u8; 4], creator: &[u8; 4]) -> Vec<u8> {
+        let mut bytes = vec![0; 82];
+        bytes[..4].copy_from_slice(&0x0005_1607u32.to_be_bytes());
+        bytes[4..8].copy_from_slice(&0x0002_0000u32.to_be_bytes());
+        bytes[24..26].copy_from_slice(&2u16.to_be_bytes());
+        bytes[26..30].copy_from_slice(&9u32.to_be_bytes());
+        bytes[30..34].copy_from_slice(&50u32.to_be_bytes());
+        bytes[34..38].copy_from_slice(&32u32.to_be_bytes());
+        bytes[38..42].copy_from_slice(&2u32.to_be_bytes());
+        bytes[42..46].copy_from_slice(&82u32.to_be_bytes());
+        bytes[46..50].copy_from_slice(&(rsrc.len() as u32).to_be_bytes());
+        bytes[50..54].copy_from_slice(file_type);
+        bytes[54..58].copy_from_slice(creator);
+        bytes[58..60].copy_from_slice(&0x2100u16.to_be_bytes());
+        bytes.extend_from_slice(rsrc);
+        bytes
+    }
+
+    #[test]
+    fn zip_archive_restores_appledouble_forks_and_finder_metadata() {
+        let app_rsrc = make_single_resource_fork_bytes(*b"CODE", 0, &[0; 128]);
+        let resource_only = make_single_resource_fork_bytes(*b"TEXT", 128, b"document");
+        let app_metadata = make_zip_appledouble(&app_rsrc, b"APPL", b"TEST");
+        let doc_metadata = make_zip_appledouble(&resource_only, b"TEXT", b"DOCS");
+        let folder_metadata = make_zip_appledouble(&[], b"\0\0\0\0", b"\0\0\0\0");
+        for prefix in ["", "__MACOSX/"] {
+            for metadata_first in [false, true] {
+                let app_path = format!("{prefix}Demo/._Game App");
+                let doc_path = format!("{prefix}Demo/._ResourceOnly");
+                let folder_path = format!("{prefix}._Demo");
+                let mut entries = vec![
+                    ("Demo/Game App", b"application data".as_slice()),
+                    ("Demo/ResourceOnly", b"".as_slice()),
+                    ("Demo/Notes", b"notes".as_slice()),
+                    (app_path.as_str(), app_metadata.as_slice()),
+                    (doc_path.as_str(), doc_metadata.as_slice()),
+                    (folder_path.as_str(), folder_metadata.as_slice()),
+                ];
+                if metadata_first {
+                    entries.reverse();
+                }
+                let archive = make_zip(&entries);
+                let payload = collect_zip_payload(&archive).unwrap();
+                assert_eq!(payload.files.len(), 3);
+                let app = payload
+                    .files
+                    .iter()
+                    .find(|f| f.name == "Demo/Game App")
+                    .unwrap();
+                assert_eq!(app.data, b"application data");
+                assert_eq!(app.rsrc, app_rsrc);
+                assert_eq!(app.file_type, *b"APPL");
+                assert_eq!(app.creator, *b"TEST");
+                assert_eq!(app.finder_flags, 0x2100);
+                let doc = payload
+                    .files
+                    .iter()
+                    .find(|f| f.name == "Demo/ResourceOnly")
+                    .unwrap();
+                assert!(doc.data.is_empty());
+                assert_eq!(doc.rsrc, resource_only);
+                assert_eq!(doc.file_type, *b"TEXT");
+                let mut runner = new_runner();
+                let packed = pack_game_sources_for_web(&[&archive], &[]).unwrap();
+                load_web_pack(&mut runner, &packed).unwrap();
+                assert_eq!(
+                    runner.dispatcher().vfs_rsrc.get("Demo/Game App"),
+                    Some(&app_rsrc)
+                );
+                assert_eq!(
+                    runner.dispatcher().launched_app_path(),
+                    Some("Demo/Game App")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zip_archive_preserves_ordinary_and_orphan_sidecar_names() {
+        let orphan = make_zip_appledouble(b"resource", b"TEXT", b"TEST");
+        let archive = make_zip(&[
+            ("Demo/File", b"content"),
+            ("Demo/._File", b"ordinary similarly named file"),
+            ("__MACOSX/Demo/._Missing", &orphan),
+            ("Demo/._..", &orphan),
+        ]);
+        let payload = collect_zip_payload(&archive).unwrap();
+        assert_eq!(payload.files.len(), 4);
+        for (name, expected) in [
+            ("Demo/._File", b"ordinary similarly named file".as_slice()),
+            ("__MACOSX/Demo/._Missing", orphan.as_slice()),
+            ("Demo/._..", orphan.as_slice()),
+        ] {
+            let file = payload.files.iter().find(|file| file.name == name).unwrap();
+            assert_eq!(file.data, expected);
+            assert!(file.rsrc.is_empty());
+        }
+    }
+
+    #[test]
+    fn zip_archive_hides_only_consumed_metadata_directories() {
+        let metadata = make_zip_appledouble(b"resource", b"TEXT", b"TEST");
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for directory in ["Demo/", "__MACOSX/", "__MACOSX/Demo/", "__MACOSX/Kept/"] {
+            writer.add_directory(directory, options).unwrap();
+        }
+        for (name, data) in [
+            ("Demo/File", b"data".as_slice()),
+            ("__MACOSX/Demo/._File", metadata.as_slice()),
+            ("__MACOSX/Kept/ordinary", b"keep this".as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        let payload = collect_zip_payload(&writer.finish().unwrap().into_inner()).unwrap();
+        assert_eq!(payload.files.len(), 2);
+        assert!(payload.dirs.iter().any(|name| name == "Demo"));
+        assert!(payload.dirs.iter().any(|name| name == "__MACOSX"));
+        assert!(payload.dirs.iter().any(|name| name == "__MACOSX/Kept"));
+        assert!(!payload.dirs.iter().any(|name| name == "__MACOSX/Demo"));
+    }
+
+    #[test]
+    fn zip_archive_rejects_malformed_appledouble_metadata() {
+        let good = make_zip_appledouble(b"resource", b"TEXT", b"TEST");
+        let mut bad_offset = good.clone();
+        bad_offset[30..34].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut short_finder = good.clone();
+        short_finder[34..38].copy_from_slice(&9u32.to_be_bytes());
+        let mut overlap = good.clone();
+        overlap[42..46].copy_from_slice(&50u32.to_be_bytes());
+        let mut duplicate_resource = good.clone();
+        duplicate_resource[26..30].copy_from_slice(&2u32.to_be_bytes());
+        let mut embedded_data = good.clone();
+        embedded_data[26..30].copy_from_slice(&1u32.to_be_bytes());
+        let mut unsupported_version = good.clone();
+        unsupported_version[4..8].copy_from_slice(&0x0003_0000u32.to_be_bytes());
+        for malformed in [
+            good[..25].to_vec(),
+            good[..30].to_vec(),
+            bad_offset,
+            short_finder,
+            overlap,
+            duplicate_resource,
+            embedded_data,
+            unsupported_version,
+        ] {
+            let archive = make_zip(&[("Demo/File", b"data"), ("Demo/._File", &malformed)]);
+            let error = collect_zip_payload(&archive).unwrap_err();
+            assert!(error.contains("AppleDouble"), "{error}");
+        }
+        let archive = make_zip(&[
+            ("Demo/File", b"data"),
+            ("Demo/._File", &good),
+            ("__MACOSX/Demo/._File", &good),
+        ]);
+        let error = collect_zip_payload(&archive).unwrap_err();
+        assert!(error.contains("Duplicate AppleDouble metadata"), "{error}");
+    }
+
+    #[test]
+    fn zip_archive_validates_crc_for_data_and_appledouble_members() {
+        let metadata = make_zip_appledouble(b"resource", b"TEXT", b"TEST");
+        for name in ["Demo/File", "__MACOSX/Demo/._File"] {
+            let mut archive =
+                make_zip(&[("Demo/File", b"data"), ("__MACOSX/Demo/._File", &metadata)]);
+            let offset = archive
+                .windows(4)
+                .enumerate()
+                .find_map(|(offset, magic)| {
+                    (magic == b"PK\x01\x02"
+                        && archive.get(offset + 46..offset + 46 + name.len())
+                            == Some(name.as_bytes()))
+                    .then_some(offset)
+                })
+                .unwrap();
+            archive[offset + 16] ^= 1;
+            let error = collect_zip_payload(&archive).unwrap_err();
+            assert!(error.to_lowercase().contains("checksum"), "{error}");
+        }
     }
 
     #[test]
@@ -6343,6 +6873,95 @@ mod tests {
         assert_eq!(metadata.file_type, u32::from_be_bytes(*b"APPL"));
         assert_eq!(metadata.creator, u32::from_be_bytes(*b"TEST"));
         assert_eq!(metadata.finder_flags, 0x20);
+    }
+
+    #[test]
+    fn web_pack_sti2_retains_component_variants_and_unique_game_paths() {
+        let mut installer = vec![0u8; 22];
+        installer[..4].copy_from_slice(b"STi2");
+        installer[4..6].copy_from_slice(&3u16.to_be_bytes());
+        installer[10..14].copy_from_slice(b"rLau");
+        for (name, data, rsrc, flags) in [
+            ("Component", b"first".as_slice(), b"rs1".as_slice(), 0x20u16),
+            (
+                "component",
+                b"second".as_slice(),
+                b"rs2".as_slice(),
+                0x40u16,
+            ),
+            (
+                "Game",
+                b"game".as_slice(),
+                b"original resources".as_slice(),
+                0x100u16,
+            ),
+        ] {
+            let mut header = [0u8; 112];
+            header[2] = name.len() as u8;
+            header[3..3 + name.len()].copy_from_slice(name.as_bytes());
+            header[66..70].copy_from_slice(b"APPL");
+            header[70..74].copy_from_slice(b"TEST");
+            header[74..76].copy_from_slice(&flags.to_be_bytes());
+            header[84..88].copy_from_slice(&(rsrc.len() as u32).to_be_bytes());
+            header[88..92].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            header[92..96].copy_from_slice(&(rsrc.len() as u32).to_be_bytes());
+            header[96..100].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            header[100..102].copy_from_slice(
+                &crate::game::installer_maker::installer_crc16(rsrc).to_be_bytes(),
+            );
+            header[102..104].copy_from_slice(
+                &crate::game::installer_maker::installer_crc16(data).to_be_bytes(),
+            );
+            let crc = crate::game::installer_maker::installer_crc16(&header[..110]);
+            header[110..112].copy_from_slice(&crc.to_be_bytes());
+            installer.extend_from_slice(&header);
+            installer.extend_from_slice(rsrc);
+            installer.extend_from_slice(data);
+        }
+        let len = installer.len() as u32;
+        installer[6..10].copy_from_slice(&len.to_be_bytes());
+        let source =
+            crate::binhex::make_test_binhex("Installer", *b"APPL", *b"TEST", 0, &installer, &[]);
+        let packed = pack_game_sources_for_web(&[&source], &[]).unwrap();
+        let mut runner = new_runner();
+        let mut loader = WebPackLoader::new(&mut runner, &packed).unwrap().unwrap();
+        while !loader.load_next_chunk(&mut runner, usize::MAX).unwrap() {}
+        drop(loader);
+        let dispatcher = runner.dispatcher_mut();
+        assert_eq!(
+            dispatcher.vfs.get("Installer/Game"),
+            Some(&b"game".to_vec())
+        );
+        assert_eq!(
+            dispatcher.vfs_rsrc.get("Installer/Game"),
+            Some(&b"original resources".to_vec())
+        );
+        for (bytes, rsrc, basename, flags) in [
+            (b"first".as_slice(), b"rs1".as_slice(), "Component", 0x20u16),
+            (
+                b"second".as_slice(),
+                b"rs2".as_slice(),
+                "component",
+                0x40u16,
+            ),
+        ] {
+            let matches: Vec<_> = dispatcher
+                .vfs
+                .iter()
+                .filter(|(_, data)| data.as_slice() == bytes)
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert_eq!(matches.len(), 1);
+            let path = &matches[0];
+            assert_eq!(path.rsplit('/').next(), Some(basename));
+            assert_eq!(dispatcher.vfs_rsrc.get(path), Some(&rsrc.to_vec()));
+            assert_eq!(
+                dispatcher.vfs_file_metadata(path).unwrap().finder_flags,
+                flags
+            );
+        }
+        assert!(!dispatcher.vfs.contains_key("Installer/Component"));
+        assert_eq!(dispatcher.vfs.len(), 3);
     }
 
     #[test]

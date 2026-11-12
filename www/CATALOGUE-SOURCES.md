@@ -1,5 +1,38 @@
 # Candidate source inspection
 
+## Promotional-demo policy review, 10 November 2026
+
+The maintainer explicitly authorized applying the existing promotional-demo
+acceptance policy to qualifying new demos after period publisher/cover-disc
+distribution, complete unmodified packages and absence of an explicit
+redistribution restriction have been checked. Record this as project-policy
+acceptance, not an affirmative publisher licence grant. Explicit restrictions
+and full commercial-game packages remain outside this acceptance.
+
+[Myth II](https://github.com/benletchford/systemless/issues/5920) and
+[Heroes III Complete](https://github.com/benletchford/systemless/issues/5921) now
+meet that policy review. Independent extraction matches every file, fork and
+Finder record (Myth II: 8/16/8; Heroes III: 20/40/20); original notices and bundled
+components are retained. Period distribution sources and archive/version caveats
+are recorded in the entries. The older affirmative-grant holds below are
+historical observations, superseded for these two exact packages by this policy
+acceptance. No publisher-media byte parity or publisher licence grant is claimed.
+
+Their launches remain disabled. Myth II documents only its demo splash and keeps
+[tutorial-loading hold #4132](https://github.com/benletchford/systemless/issues/4132).
+Heroes III's native reward/omitted-confirmation repeats each pass three measured
+checks: 31,500 gold versus 30,000, with no exhausted frames at 2,144 frontend/guest
+ticks. This does not qualify sustained play, battles, save/load, audio fidelity
+or browser pacing.
+
+Reckless Drivin' uses a separate explicit complete-package redistribution grant,
+not this promotional-demo policy; its original unregistered trial remains intact.
+Its native throttle evidence and remaining rendering/browser limitations are in
+[intake #5916](https://github.com/benletchford/systemless/issues/5916).
+No newly live game is claimed by these source intakes.
+
+## Historical source inspections
+
 Inspected on 9 October 2026 using the public demo source linked by earlier Systemless catalogue work. These are research sources, not downloads offered by Systemless. The linked document may omit terms elsewhere in its archive; it is not proof of permission or archive identity.
 
 | Source candidate | Original documentation | Current evidence |
@@ -3058,3 +3091,228 @@ licensee; they do not establish an arbitrary redistributor's permission. Modern
 engine source licensing is not applied to this original demo data. The original
 archive remains unhosted while rights are unresolved, and no catalogue entry,
 launch approval or qualified-live count is claimed. [Intake and audit #5634](https://github.com/benletchford/systemless/issues/5634).
+
+
+## Quake preview — promotional-demo policy acceptance
+
+The historical affirmative-grant hold above is superseded for the unchanged
+1.08.2 promotional preview by the maintainer-authorized demo policy. The
+[December 1997 MacAddict #16 sleeve](https://archive.org/download/macaddict-cd-016/MacAddict%20CD-ROM%20December%201997%2000.jpg)
+explicitly lists Quake. This establishes period cover-disc distribution, not
+exact publisher-media byte parity or an affirmative publisher licence grant.
+
+The complete original 6,853,937-byte SIT retains SHA-256
+`742f2b2b51e81281e04cc17967480ba85c8cd65f8cfa2570382f899be7466535`.
+All seven files, fourteen forks and seven Finder records independently match
+unar extraction. Full Read Me, Online Manual and Troubleshooting documents,
+63 selected text/UI/version resources and retained notice matches were reviewed;
+no explicit redistribution restriction was identified in those notices. All
+original copyrights remain intact. No modern engine licence is substituted.
+
+Fresh native PowerPC runs on runtime code matching master `9d234abd` reach a
+rendered map through ordinary Escape, Return, Return. The startup console
+file-open message persists. A 30-tick right-arrow hold rotates the view relative
+to an equal-duration no-input control; pre-input captures are byte-identical.
+Both runs finish at 768 frontend/guest ticks, zero automatic assertions and zero
+exhausted frames. Actual captures were inspected, and the gameplay image is
+cropped only to its 640x400 content surface. This is bounded native interaction
+evidence, not independent hardware fidelity, full gameplay or browser approval.
+[Source intake #5924](https://github.com/benletchford/systemless/issues/5924)
+keeps launch disabled and leaves [startup investigation #3213](https://github.com/benletchford/systemless/issues/3213) open.
+
+
+## Prime Target beta demo — original promotional intake
+
+[Issue #5927](https://github.com/benletchford/systemless/issues/5927) records the
+complete unchanged 3,964,205-byte original beta demo. Its SHA1
+`a6765e5b74006c76a8c7293a96cb6afc02861e36` matches the independent archive
+listing; all eight files, sixteen forks and eight Finder records match unar.
+The full Readme, 77 selected text/UI/version resources and retained notice
+matches were reviewed without finding an explicit redistribution restriction
+in the inspected notices. Acceptance follows the maintainer-authorized
+promotional-demo policy, not an affirmative publisher licence grant.
+
+The preserved [1997 MacAddict Special Games disc](https://archive.org/details/mac-addict-s-games)
+contains `Games/Game Demos/Prime Target Demo`. Original HFS catalogue and seven
+files were inspected through HTTP 206 ranges with exact Content-Range, length
+and hash receipts. Readme, Shapes and Sounds data match; executable, map and
+resources differ. No exact disc-byte/version parity or whole-disc checksum is
+claimed. The received beta archive retains its three levels and all notices;
+no modern Marathon licence, serial number, unlock or modified package is used.
+
+Fresh default PowerPC runs on runtime code matching master `8ae270f0` reach the
+rendered first level. The documented number 2 key equips a pistol and updates
+the HUD against an equal-duration no-input control with byte-identical
+pre-input captures. Both finish at 1326 frontend/guest ticks, zero automatic
+assertions and zero exhausted frames. A separate Up-arrow movement case is
+identical to its no-input control and is retained as unverified movement.
+Actual captures were inspected; the screenshot is cropped only to the 640x480
+game surface. Overall compatibility stays unknown, and launch remains disabled
+pending controls and browser qualification. Source intake adds no live game.
+
+
+## Lode Runner 2 demo — original promotional intake
+
+[Issue #5934](https://github.com/benletchford/systemless/issues/5934) records the
+complete unchanged 11,032,735-byte original Macintosh demo, SHA-256
+`45276cabeac9e3c4610096ac97e96a4d0f2eccde5f6134161ce1f5ab11a2a2f7`.
+All 22 files, 44 forks and 22 Finder records match independent unar extraction.
+The original HiScores is retained. An independent mirror matches every data
+fork and all 106 application resource payloads, but differs in raw resource-fork
+metadata and adds Config; its current archive hash differs from its listing.
+No whole-archive identity or substituted configuration is claimed.
+
+[Macworld March 1999](https://www.vintageapplemac.com/files/misc/9903.pdf),
+printed page 60 / PDF index 27, explicitly advertises the title’s cover-CD demo;
+the actual scan was inspected. The separately inspected disc catalogue has no
+matching LR2 path, so exact disc/version parity is not claimed. Thirty selected
+text/UI/version resources, retained notice matches and the normal About panel
+were reviewed without finding an explicit redistribution restriction. Acceptance
+follows the maintainer-authorized promotional-demo policy, not an affirmative
+publisher licence grant. No ReadMe/licence file is included in the package.
+
+Fresh native default PowerPC runs using runtime code matching master202c39f6
+reach a rendered level through Single Player → New → Start Game. The read-only
+control panel shows numeric keypad bindings. Pad 3 held for60 ticks then released
+for12 moves the runner against an equal-duration control, with byte-identical
+pre-input captures. Both finish at1608 frontend/guest ticks with two measured
+pixel assertions each and zero exhausted frames. Actual captures inspected;
+the screenshot is cropped only to the 640x480 game content surface. Collection,
+completion, audio fidelity, independent hardware rendering and browser controls/
+pacing remain pending. Overall compatibility stays unknown and launch disabled.
+This source intake adds no qualified-live game.
+
+
+## Shadow Warrior demo — original promotional intake
+
+[Issue #5936](https://github.com/benletchford/systemless/issues/5936) records the
+complete unchanged 11,881,524-byte original Macintosh demo, SHA-256
+`dd81d19709ea8c6c94b0a1f7b5aa6cfaa3c5bf628486618db96ac774dff7a10a`.
+All 17 files, 34 forks and 17 Finder records match independent unar extraction.
+The complete four-level demo retains both Readmes, network launcher, taunts and
+received configuration; no settings or performance suggestions are applied.
+
+The preserved [January 1998 MacAddict 17 disc](https://archive.org/details/macaddict-cd-017)
+contains the original Commercial Demos/Shadow Warrior Demo folder. Original
+HFS catalogue and all 17 selected files were inspected through HTTP 206 ranges
+with exact Content-Range, size and SHA-256 receipts. Sixteen data forks and all
+207 non-folder-icon resource payloads match; raw resource metadata and the
+folder icon differ. Config differs only in PlayerName (WADE ALBRIGH on disc,
+KATO in archive) and Chickens (2 on disc, 0 in archive); neither is rewritten.
+No whole-disc or exact package-byte identity is claimed. Both Readmes
+(3,631/7,445 bytes), 108 selected text/UI/version resources, all retained notice
+matches and 483-file group inventory were reviewed without finding an explicit
+redistribution restriction in inspected notices. Acceptance uses the authorized
+promotional-demo policy, not an affirmative publisher licence grant.
+
+Fresh original/default PowerPC runs use runtime code matching merged e0b55663.
+Normal 256-colour Switch, Space through logos, and Return accept the original
+shareware episode/default skill and reach the first level. Documented Up held
+for 60 ticks then released for 12 changes the view against an equal-duration
+no-input control with byte-identical pre-input captures. Both finish at 1860
+frontend/guest ticks with three measured pixel assertions and zero exhausted
+frames. Actual captures were inspected; the gameplay capture is cropped only
+to the 640x480 game surface. Combat, collection, completion, networking, audio
+fidelity, independent hardware rendering and browser controls/pacing remain
+pending. Compatibility stays unknown and launch disabled; no live increment.
+
+
+### Lode Runner 2 — bounded browser approval
+
+Original/default PowerPC private full-site worker/WebGL tests pass all four
+20-second pacing windows: normal New Game plus Pad 3 movement and separate
+sustained play, with a fresh no-input control. Steady guest ticks/sec range
+59.81–60.76, host frames/sec 60.74–64.16, maximum frame work 40.3 ms and minimum
+audio queue 114.1 ms. Existing thresholds remain unchanged. Archive and both
+main/worker WebAssembly response bodies are pinned, all targets resumed and
+Debugger disabled, with no lifecycle/network errors or concurrent heavy build.
+Actual active/control and sustained captures were inspected.
+
+The 800x600 framebuffer renders at 798x598 CSS pixels; the initial capture-size
+checker failure is retained, and fresh active/control case21 projects checks
+into recorded geometry without changing the game or pacing gates. Private Wasm
+is 16,049,705 bytes, SHA-256
+`0d9626bde05cab1a08d14f04ef131a30056e9d2c55dde78c6558db38cb4e1fbf`.
+Only private local launch flags differed from the promoted1351bbc4 source tree,
+which matches source merge e05855d9 before that private patch. Runtime code
+matches e0b55663. No publisher licence or full-game outcome is inferred.
+
+[Issue #5934](https://github.com/benletchford/systemless/issues/5934) keeps
+released public qualification open. Launch may be enabled in source for the
+next human release. No release, deployment or qualified-live increment follows
+from this private approval. Collection, full levels, persistence, audio fidelity
+and independent hardware rendering remain unverified.
+
+
+### Quake — bounded browser approval
+
+The unchanged Macintosh 1.08.2 preview passes fresh active and no-input private
+PowerPC worker/WebGL browser cases, all four 20-second windows. Normal Single
+Player/New Game and default right-arrow turning, followed by separate sustained
+play, pass unchanged pacing gates: steady guest ticks/sec 59.87–61.37, host
+frames/sec 59.87–63.52, maximum frame work 31.9 ms, minimum audio queue 469.3 ms.
+The stone-ceiling region changes 10,851 pixels with input and zero without it.
+Actual active/control and sustained captures were inspected. Archive and both
+main/worker Wasm response bodies are pinned; all targets resumed and Debugger
+disabled, with no lifecycle/network errors or concurrent heavy build.
+
+The first control exposed an evidence-checker error: its broad world region
+included animated torches, which also change in the native no-input control.
+That failure is retained. The corrected stone-ceiling region is static in both
+native and browser controls and changes with turning; fresh active/control tests
+pass without changing input, game defaults or pacing thresholds.
+
+Private build 1351bbc4 uses runtime code e0b55663. Wasm is 16,049,705 bytes,
+SHA-256 `0d9626bde05cab1a08d14f04ef131a30056e9d2c55dde78c6558db38cb4e1fbf`.
+[Issue #5924](https://github.com/benletchford/systemless/issues/5924) remains open
+for released public qualification. This enables source launch for the next human
+release, with no release/deploy or newly live count. Translation, combat, full
+levels, persistence, audio fidelity and independent hardware rendering remain
+unverified; no publisher licence grant is inferred.
+
+
+### Tristan original demo — source intake
+
+[Issue #5999](https://github.com/benletchford/systemless/issues/5999) records the
+complete original 657,581-byte SIT, independent three-file/six-fork/Finder packing
+parity, and period Macintosh Demo Games CD item23554 proof: all 229 app and 29 sound
+resource payloads match; map metadata differs. The third received PICT screenshot
+is preserved unchanged and was decoded/inspected. All 36 selected uncompressed UI
+notice records and the original 60-second/scoring-disabled notice were reviewed.
+Accepted under the authorized promotional-demo project policy, not a publisher
+licence grant. Original archive SHA-256:
+`278d01a636388a888b76285ebcf27d2a8dcb7e6548e486e7393993eb9704b602`.
+
+Generic runtime [PR #5998](https://github.com/benletchford/systemless/pull/5998)
+removes a false application-damaged alert. Candidate default 68K native paired
+Z-/ tests have identical before/released frames and held-only flipper differences;
+both 1464 frontend/2064 guest ticks, no exhausted frames, actual captures inspected.
+The earlier CmdN-only probe remained at the start prompt and is excluded.
+
+Private browser approval at runtime2d6b4539 plus promoted entry/launch flag passes
+all four20-second windows: active worker maxima36.1/21.4ms, control24.7/29.8ms;
+all unchanged frame/RAF/audio/clock gates pass. Ten held/released flipper state
+checks per case pass. Hosted original archive, both Wasm responses and executing
+worker bytecode pinned; debugger off during pacing, no concurrent builds/native
+runs. Actual active/control/released/final captures inspected. Browser launch is
+approved for the next human release; merge waits for the generic runtime fix.
+Public verification remains pending. No release/deploy operations.
+
+## Deadlock: Planetary Conquest Demo
+
+The unchanged [original installer SIT](https://classicmacdemos.com/deadlock-planetary-conquest)
+is 13,982,503 bytes, SHA-256 `25738bf30fb512d41775bcf5bc4f90ae2b681b04bc23144332941b7271f2a477`.
+[MacAddict 22, June 1998](https://archive.org/details/macaddict-cd-022) contains its
+original installer: data is byte-identical and all 216 resource payloads, names,
+IDs and attributes match. Raw resource-container and wrapper identity are not
+claimed. [Intake #6113](https://github.com/benletchford/systemless/issues/6113)
+records the scoped notice review and project-policy acceptance, including 32
+unread ADCR installer UI records; no affirmative publisher licence is claimed.
+All 81 file instances, 162 forks and 81 Finder records match independent
+extraction through the full production packer, preserving both preference
+variants. [Runtime fix #6112](https://github.com/benletchford/systemless/pull/6112)
+allows the original STi3 installer to expand. On that candidate, normal PPC Quick
+Start and End Turn/Done reach turn 2 with credits 542 and food 96; an omitted-click
+control remains on turn 1. The content-only screenshot comes from the unchanged
+archive's actual production-loader replay. Browser launch remains disabled;
+asset promotion, browser qualification and human release are separate gates.

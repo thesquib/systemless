@@ -7303,7 +7303,7 @@ fn windows_created_wholly_off_screen_get_no_synthesised_chrome() {
     );
     assert!(!disp.windows_placed_offscreen.contains(&on_screen));
 
-    disp.untrack_window(&mut bus, parked);
+    disp.untrack_window(&mut bus, &mut cpu, parked);
     assert!(!disp.windows_placed_offscreen.contains(&parked));
 }
 
@@ -8553,50 +8553,64 @@ fn bringtofront_consumes_windowptr_argument() {
 }
 
 #[test]
-fn bringtofront_repaints_exposed_content_and_preserves_visible_pixels() {
-    let (mut disp, mut cpu, mut bus) = setup();
-    let screen = bus.alloc(800 * 600);
-    bus.write_long(crate::memory::globals::addr::SCREEN_BITS, screen);
-    disp.set_screen_mode_for_test(screen, 800, 800, 600, 8);
-    let target = bus.alloc(256);
-    let front = bus.alloc(256);
-    for (window, top, left, bottom, right) in
-        [(target, 100, 100, 300, 400), (front, 150, 200, 350, 500)]
-    {
-        disp.init_cgraf_window(
-            &mut bus, &mut cpu, window, screen, top, left, bottom, right, "Window", 4, true, false,
-            true, 0,
+fn window_fronting_repaints_exposed_content_and_preserves_visible_pixels() {
+    for trap in [0x120, 0x11F] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let screen = bus.alloc(800 * 600);
+        bus.write_long(crate::memory::globals::addr::SCREEN_BITS, screen);
+        disp.set_screen_mode_for_test(screen, 800, 800, 600, 8);
+        let target = bus.alloc(256);
+        let front = bus.alloc(256);
+        for (window, top, left, bottom, right) in
+            [(target, 100, 100, 300, 400), (front, 150, 200, 350, 500)]
+        {
+            disp.init_cgraf_window(
+                &mut bus, &mut cpu, window, screen, top, left, bottom, right, "Window", 4, true,
+                false, true, 0,
+            );
+        }
+        disp.window_list.replace(vec![front, target]);
+        disp.front_window = front;
+        disp.recalculate_window_vis_regions(&mut bus);
+        disp.set_current_port_state(&mut bus, &mut cpu, front, None);
+        let saved_device = *disp.current_gdevice;
+        let saved_clip = bus.read_long(target + 28);
+        // Window Manager repainting must not inherit the application's clip.
+        super::super::TrapDispatcher::write_region_handle_rect(&mut bus, saved_clip, None);
+        let exposed = screen + 200 * 800 + 220;
+        let already_visible = screen + 120 * 800 + 120;
+        let outside_target = screen + 250 * 800 + 450;
+        for pixel in [exposed, already_visible, outside_target] {
+            bus.write_byte(pixel, 0x7B);
+        }
+        cpu.write_reg(Register::A7, TEST_SP - 4);
+        bus.write_long(TEST_SP - 4, target);
+        dispatch(&mut disp, trap, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_byte(exposed), 0, "erase newly exposed content");
+        assert_eq!(bus.read_byte(already_visible), 0x7B);
+        assert_eq!(bus.read_byte(outside_target), 0x7B);
+        assert_eq!(bus.read_long(target + 28), saved_clip);
+        assert_eq!(*disp.current_port, front);
+        assert_eq!(*disp.current_gdevice, saved_device);
+        assert_eq!(
+            disp.front_window,
+            if trap == 0x120 { front } else { target }
         );
+        assert_eq!(disp.window_list.first(), Some(target));
+        assert!(disp.window_has_pending_update(&bus, target));
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP);
+
+        // Repeating either operation must preserve already exposed application pixels.
+        bus.write_byte(exposed, 0x6C);
+        cpu.write_reg(Register::A7, TEST_SP - 4);
+        bus.write_long(TEST_SP - 4, target);
+        dispatch(&mut disp, trap, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_byte(exposed), 0x6C);
     }
-    disp.window_list.replace(vec![front, target]);
-    disp.front_window = front;
-    disp.recalculate_window_vis_regions(&mut bus);
-    disp.set_current_port_state(&mut bus, &mut cpu, front, None);
-    let saved_device = *disp.current_gdevice;
-    let saved_clip = bus.read_long(target + 28);
-    // Window Manager repainting must not inherit the application's clip.
-    super::super::TrapDispatcher::write_region_handle_rect(&mut bus, saved_clip, None);
-    let exposed = screen + 200 * 800 + 220;
-    let already_visible = screen + 120 * 800 + 120;
-    let outside_target = screen + 250 * 800 + 450;
-    for pixel in [exposed, already_visible, outside_target] {
-        bus.write_byte(pixel, 0x7B);
-    }
-    cpu.write_reg(Register::A7, TEST_SP - 4);
-    bus.write_long(TEST_SP - 4, target);
-    dispatch(&mut disp, 0x120, &mut cpu, &mut bus)
-        .unwrap()
-        .unwrap();
-    assert_eq!(bus.read_byte(exposed), 0, "erase newly exposed content");
-    assert_eq!(bus.read_byte(already_visible), 0x7B);
-    assert_eq!(bus.read_byte(outside_target), 0x7B);
-    assert_eq!(bus.read_long(target + 28), saved_clip);
-    assert_eq!(*disp.current_port, front);
-    assert_eq!(*disp.current_gdevice, saved_device);
-    assert_eq!(disp.front_window, front, "preserve activation");
-    assert_eq!(disp.window_list.first(), Some(target));
-    assert!(disp.window_has_pending_update(&bus, target));
-    assert_eq!(cpu.read_reg(Register::A7), TEST_SP);
 }
 
 #[test]
@@ -9825,5 +9839,93 @@ fn drag_region_geometry_respects_axis_limits_and_slop_reentry() {
         disp.dispatch(opcode, &mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_long(sp + 22), 0x8000_8000);
         assert_eq!(bus.read_word(0x300024), 30);
+    }
+}
+
+#[test]
+fn window_removal_keeps_cached_and_guest_current_port_coherent() {
+    for trap in [0x12D, 0x114] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let (front, next, out) = (0x200040, 0x200140, 0x200300);
+        disp.window_list.replace(vec![front, next]);
+        disp.front_window = front;
+        for base in [front, next] {
+            bus.write_word(base + 16, 10);
+            bus.write_word(base + 18, 10);
+            bus.write_word(base + 20, 50);
+            bus.write_word(base + 22, 100);
+            bus.write_byte(base + 110, 0xFF);
+        }
+        disp.set_current_port_state(&mut bus, &mut cpu, front, None);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, front);
+        dispatch(&mut disp, trap, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(*disp.current_port, next); // existing front-promotion behavior
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, out);
+        disp.dispatch_quickdraw(true, 0x074, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bus.read_long(out),
+            next,
+            "GetPort after removal trap {trap:#x}"
+        );
+        assert_eq!(bus.read_long(crate::memory::globals::addr::THE_PORT), next);
+        let a5 = cpu.read_reg(Register::A5);
+        assert_eq!(bus.read_long(bus.read_long(a5)), next);
+    }
+}
+
+#[test]
+fn window_removal_preserves_a_different_current_port() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    let (front, other) = (0x200040, 0x200140);
+    disp.window_list.replace(vec![front, other]);
+    disp.front_window = front;
+    for base in [front, other] {
+        bus.write_word(base + 16, 10);
+        bus.write_word(base + 18, 10);
+        bus.write_word(base + 20, 50);
+        bus.write_word(base + 22, 100);
+        bus.write_byte(base + 110, 0xFF);
+    }
+    disp.set_current_port_state(&mut bus, &mut cpu, other, None);
+    cpu.write_reg(Register::A7, TEST_SP);
+    bus.write_long(TEST_SP, front);
+    dispatch(&mut disp, 0x114, &mut cpu, &mut bus)
+        .unwrap()
+        .unwrap();
+    assert_eq!(*disp.current_port, other);
+    assert_eq!(bus.read_long(crate::memory::globals::addr::THE_PORT), other);
+    assert_eq!(
+        disp.effective_the_port(&bus, cpu.read_reg(Register::A5)),
+        other
+    );
+}
+
+#[test]
+fn window_removal_clears_current_port_aliases_when_no_windows_remain() {
+    for trap in [0x12D, 0x114] {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let window = 0x200040;
+        disp.window_list.replace(vec![window]);
+        disp.front_window = window;
+        bus.write_word(window + 16, 10);
+        bus.write_word(window + 18, 10);
+        bus.write_word(window + 20, 50);
+        bus.write_word(window + 22, 100);
+        bus.write_byte(window + 110, 0xFF);
+        disp.set_current_port_state(&mut bus, &mut cpu, window, None);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, window);
+        dispatch(&mut disp, trap, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(*disp.current_port, 0);
+        assert_eq!(bus.read_long(crate::memory::globals::addr::THE_PORT), 0);
+        assert_eq!(disp.effective_the_port(&bus, cpu.read_reg(Register::A5)), 0);
     }
 }
