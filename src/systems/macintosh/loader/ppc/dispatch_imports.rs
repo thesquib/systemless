@@ -118,8 +118,59 @@ pub(crate) struct PpcDispatchContext<'a> {
     pub(crate) collections: &'a SharedProcessCollectionManager,
     pub(crate) drag_manager: &'a SharedProcessDragManager,
     pub(crate) input: PpcInputSnapshot,
+    pub(crate) process_input: &'a crate::process_context::SharedProcessInputState,
     pub(crate) event_queue: &'a mut EventQueue,
     pub(crate) draw_sprocket: &'a mut PpcDrawSprocketState,
+}
+
+// These operations use movie/controller state and guest pointers directly, not
+// the ABI handle-record view. Keep the full dispatch and callback paths intact.
+fn movie_poll_uses_no_handle_snapshot(target: &PpcImportDispatcherTarget, cpu: &PpcCpu) -> bool {
+    match target {
+        PpcImportDispatcherTarget::QtMoviesTask | PpcImportDispatcherTarget::QtIsMovieDone => true,
+        PpcImportDispatcherTarget::QuickTimeCompatibility(operation) => match operation {
+            PpcQuickTimeCompatibilityOperation::GetMovieTime
+            | PpcQuickTimeCompatibilityOperation::GetMovieTimeBase
+            | PpcQuickTimeCompatibilityOperation::GetMovieTimeScale
+            | PpcQuickTimeCompatibilityOperation::GetMovieRate
+            | PpcQuickTimeCompatibilityOperation::MCIdle => true,
+            PpcQuickTimeCompatibilityOperation::MCDoAction => cpu.gpr[4] as i16 == 1,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+// These helpers read/write caller-owned Points and Rects. They neither inspect
+// handle records nor observe the legacy GWorld state mirrors.
+fn geometry_uses_only_guest_memory(target: &PpcImportDispatcherTarget) -> bool {
+    matches!(target,
+        PpcImportDispatcherTarget::SetRect
+        | PpcImportDispatcherTarget::Pt2Rect
+        | PpcImportDispatcherTarget::SectRect
+        | PpcImportDispatcherTarget::UnionRect
+        | PpcImportDispatcherTarget::EqualRect
+        | PpcImportDispatcherTarget::EmptyRect
+        | PpcImportDispatcherTarget::SetPt
+        | PpcImportDispatcherTarget::EqualPt
+        | PpcImportDispatcherTarget::AddPt
+        | PpcImportDispatcherTarget::SubPt
+        | PpcImportDispatcherTarget::PtInRect
+        | PpcImportDispatcherTarget::OffsetRect
+        | PpcImportDispatcherTarget::InsetRect
+        | PpcImportDispatcherTarget::MapRect
+        | PpcImportDispatcherTarget::MapPt
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static HANDLE_SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn handle_snapshot_count() -> u64 {
+    HANDLE_SNAPSHOTS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn dispatch_supported_import(
@@ -243,6 +294,7 @@ pub(crate) fn dispatch_supported_import(
         collections,
         drag_manager,
         input,
+        process_input,
         event_queue,
         draw_sprocket,
     } = context;
@@ -268,12 +320,29 @@ pub(crate) fn dispatch_supported_import(
     // The process registry is authoritative. Refresh the legacy vector
     // booleans at each native boundary so rendering/debugging code that still
     // reads them sees any classic-side transition before this import runs.
-    ppc_sync_gworld_pixel_state_mirrors(gworlds, gworld_pixel_states);
+    // Hot input/clock polls likewise only read process state or write the
+    // caller's KeyMap. They cannot observe handles or GWorld mirrors.
+    let no_graphics_snapshot = geometry_uses_only_guest_memory(&binding.dispatcher_target)
+        || matches!(binding.dispatcher_target,
+            PpcImportDispatcherTarget::GetKeys
+            | PpcImportDispatcherTarget::Button
+            | PpcImportDispatcherTarget::TickCount);
+    if !no_graphics_snapshot {
+        ppc_sync_gworld_pixel_state_mirrors(gworlds, gworld_pixel_states);
+    }
 
     // Toolbox helpers use an import-scoped read view for guest ABI decoding.
     // Allocation ownership remains in the process Memory Manager, and the
     // next import observes its canonical records immediately.
-    let handles = &mut process_memory_manager.native_handle_records().to_vec();
+    let handles = &mut if no_graphics_snapshot
+        || movie_poll_uses_no_handle_snapshot(&binding.dispatcher_target, cpu)
+    {
+        Vec::new()
+    } else {
+        #[cfg(test)]
+        HANDLE_SNAPSHOTS.with(|count| count.set(count.get() + 1));
+        process_memory_manager.native_handle_records().to_vec()
+    };
     if is_quickdraw_3d_library(&binding.library_name)
         && !matches!(
             binding.dispatcher_target,
@@ -801,6 +870,7 @@ pub(crate) fn dispatch_supported_import(
 
     if let Some(action) =
         dispatch_sound::dispatch_sound_import(dispatch_sound::PpcSoundDispatchContext {
+            toolbox_startup,
             binding,
             cpu,
             memory,
@@ -980,6 +1050,8 @@ pub(crate) fn dispatch_supported_import(
             draw_sprocket,
             input,
             screen_clut,
+            color_manager_clut,
+            next_ct_seed: &mut toolbox_startup.next_ct_seed,
             screen_bits,
         },
     ) {
@@ -1088,6 +1160,7 @@ pub(crate) fn dispatch_supported_import(
             binding,
             cpu,
             memory,
+            window_list,
             process_memory_manager,
             heap_cursor,
             heap_limit,
@@ -1362,6 +1435,7 @@ pub(crate) fn dispatch_supported_import(
             gworlds,
             current_gworld: *current_gworld,
             screen_clut,
+            process_input,
         })
     {
         return Some(action);
@@ -1723,6 +1797,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::ISpElementGetConfigurationInfo
         | PpcImportDispatcherTarget::ISpElementGetSimpleState
         | PpcImportDispatcherTarget::ISpGetVersion
+        | PpcImportDispatcherTarget::ISpTimeToMicroseconds
         | PpcImportDispatcherTarget::ISpStartup
         | PpcImportDispatcherTarget::ISpShutdown
         | PpcImportDispatcherTarget::ISpInit
@@ -1781,7 +1856,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::SlotVRemove => {
             unreachable!("time and vbl imports return through dispatch_time_import")
         }
-        PpcImportDispatcherTarget::DrawGrowIcon => {
+        PpcImportDispatcherTarget::QtAlignWindow | PpcImportDispatcherTarget::DrawGrowIcon => {
             unreachable!("window imports return through dispatch_window_import")
         }
         PpcImportDispatcherTarget::GetPictInfo
@@ -1845,13 +1920,15 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::PBOpen
         | PpcImportDispatcherTarget::PBHOpenDF
         | PpcImportDispatcherTarget::PBHOpenDeny
+        | PpcImportDispatcherTarget::LMGetCurMap
+        | PpcImportDispatcherTarget::LMSetCurMap
+        | PpcImportDispatcherTarget::LMSetResErr
         | PpcImportDispatcherTarget::CurResFile
         | PpcImportDispatcherTarget::UseResFile
         | PpcImportDispatcherTarget::OpenResFile
         | PpcImportDispatcherTarget::OpenResFileCString
         | PpcImportDispatcherTarget::OpenRFPerm
         | PpcImportDispatcherTarget::HOpenResFile
-        | PpcImportDispatcherTarget::SetResErr
         | PpcImportDispatcherTarget::ResError
         | PpcImportDispatcherTarget::GetVol
         | PpcImportDispatcherTarget::GetWDInfo
@@ -1915,6 +1992,8 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::Get1Resource
         | PpcImportDispatcherTarget::GetNamedResource
         | PpcImportDispatcherTarget::Get1NamedResource
+        | PpcImportDispatcherTarget::GetNamedResourceCString
+        | PpcImportDispatcherTarget::Get1NamedResourceCString
         | PpcImportDispatcherTarget::GetIndResource
         | PpcImportDispatcherTarget::Get1IndResource
         | PpcImportDispatcherTarget::CountResources
@@ -1932,6 +2011,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::GetResAttrs
         | PpcImportDispatcherTarget::SetResAttrs
         | PpcImportDispatcherTarget::GetResInfo
+        | PpcImportDispatcherTarget::GetResInfoCString
         | PpcImportDispatcherTarget::GetResourceSizeOnDisk
         | PpcImportDispatcherTarget::SetResInfo
         | PpcImportDispatcherTarget::HomeResFile
@@ -1956,6 +2036,7 @@ pub(crate) fn dispatch_supported_import(
         }
         PpcImportDispatcherTarget::InitGraf
         | PpcImportDispatcherTarget::GetQDGlobalsScreenBits
+        | PpcImportDispatcherTarget::GetQDGlobalsBlack
         | PpcImportDispatcherTarget::GetQDGlobalsWhite
         | PpcImportDispatcherTarget::GetQDGlobalsGray
         | PpcImportDispatcherTarget::ApplyThemeBackground
@@ -1980,6 +2061,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::PmBackColor
         | PpcImportDispatcherTarget::Color2Index
         | PpcImportDispatcherTarget::Index2Color
+        | PpcImportDispatcherTarget::HSL2RGB
         | PpcImportDispatcherTarget::RGB2HSL
         | PpcImportDispatcherTarget::RGB2HSV
         | PpcImportDispatcherTarget::HSV2RGB
@@ -2203,7 +2285,9 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::InitPalettes
         | PpcImportDispatcherTarget::ActivatePalette
         | PpcImportDispatcherTarget::NSetPalette
-        | PpcImportDispatcherTarget::GetPalette => {
+        | PpcImportDispatcherTarget::GetPalette
+        | PpcImportDispatcherTarget::SetPaletteUpdates
+        | PpcImportDispatcherTarget::GetPaletteUpdates => {
             unreachable!("palette imports return through dispatch_palette_import")
         }
         PpcImportDispatcherTarget::GetPort
@@ -2247,6 +2331,7 @@ pub(crate) fn dispatch_supported_import(
         }
         PpcImportDispatcherTarget::GetGDevice
         | PpcImportDispatcherTarget::SetGDevice
+        | PpcImportDispatcherTarget::GDeviceChanged
         | PpcImportDispatcherTarget::GetDeviceList
         | PpcImportDispatcherTarget::GetMainDevice
         | PpcImportDispatcherTarget::GetMaxDevice
@@ -3447,6 +3532,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::DateToSeconds
         | PpcImportDispatcherTarget::Microseconds
         | PpcImportDispatcherTarget::OtElapsed { .. }
+        | PpcImportDispatcherTarget::GetTimeBaseInfo
         | PpcImportDispatcherTarget::AbsoluteToNanoseconds
         | PpcImportDispatcherTarget::NanosecondsToAbsolute
         | PpcImportDispatcherTarget::AddAbsoluteToAbsolute

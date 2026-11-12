@@ -580,6 +580,7 @@ pub(super) fn dispatch_dialog_import(
                                 continue;
                             }
                             let _ = ppc_draw_dialog_items(
+                                window_list,
                                 memory, handles, controls, gworlds, screen_clut,
                                 vfs_resources, current_resource_refnum, dialog,
                                 Some(eval.item_handle),
@@ -642,7 +643,7 @@ pub(super) fn dispatch_dialog_import(
         PpcImportDispatcherTarget::SetDialogCancelItem => {
             // Macintosh Toolbox Essentials (1992), p. 6-165: the System 7
             // cancel item is Dialog Manager state rather than a public
-            // DialogRecord field. Keep it in the HLE tail of our allocation.
+            // DialogRecord field. Caller records use separate private storage.
             let dialog = cpu.gpr[3];
             let item = cpu.gpr[4] as u16 as i16;
             let result = evaluate_set_dialog_cancel_item_parameters(dialog, item);
@@ -650,7 +651,7 @@ pub(super) fn dispatch_dialog_import(
                 Ok(params) => {
                     if memory
                         .write_u16_be(
-                            params.dialog_ptr() + DIALOG_CANCEL_ITEM_OFFSET,
+                            window_list.dialog_private_address(params.dialog_ptr(), DIALOG_CANCEL_ITEM_OFFSET),
                             params.item_no() as u16,
                         )
                         .is_some()
@@ -673,7 +674,7 @@ pub(super) fn dispatch_dialog_import(
             let os_err = match result {
                 Ok(params) => {
                     let configured = memory
-                        .read_u16_be(params.dialog_ptr() + DIALOG_CANCEL_ITEM_OFFSET)
+                        .read_u16_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_CANCEL_ITEM_OFFSET))
                         .filter(|&item| item != 0)
                         .map(|item| item as i16);
                     let items = ppc_dialog_items_for_dialog(memory, handles, params.dialog_ptr())
@@ -701,7 +702,7 @@ pub(super) fn dispatch_dialog_import(
             let os_err = match evaluate_set_dialog_tracks_cursor_parameters(dialog, tracks) {
                 Ok(_params) => {
                     if dialog != 0 {
-                        let _ = memory.write_u8(dialog + DIALOG_TRACKS_CURSOR_OFFSET, if tracks { 1 } else { 0 });
+                        let _ = memory.write_u8(window_list.dialog_private_address(dialog, DIALOG_TRACKS_CURSOR_OFFSET), if tracks { 1 } else { 0 });
                     }
                     PPC_NO_ERR
                 }
@@ -1044,6 +1045,7 @@ pub(super) fn dispatch_dialog_import(
             let bounds = ppc_dialog_global_bounds(memory, gworlds, dialog);
             let items = ppc_dialog_items_for_dialog(memory, handles, dialog);
             let _ = ppc_draw_dialog(
+                window_list,
                 memory,
                 handles,
                 controls,
@@ -1069,6 +1071,7 @@ pub(super) fn dispatch_dialog_import(
         PpcImportDispatcherTarget::ModalDialog => {
             let filter_result = ppc_finish_modal_filter(cpu, memory, dialog_callback_stack);
             let pass = ppc_modal_dialog(
+                window_list,
                 cpu,
                 process_memory_manager,
                 memory,
@@ -1156,10 +1159,10 @@ pub(super) fn dispatch_dialog_import(
             }
             let mut dialog = gworlds.iter().rev().find_map(|record| {
                 let matches_call = memory
-                    .read_u32_be(record.port + DIALOG_STANDARD_ALERT_OUTPUT_OFFSET)
+                    .read_u32_be(window_list.dialog_private_address(record.port, DIALOG_STANDARD_ALERT_OUTPUT_OFFSET))
                     .unwrap_or(0)
                     == 0
-                    && memory.read_u16_be(record.port + DIALOG_RESOURCE_ID_OFFSET)
+                    && memory.read_u16_be(window_list.dialog_private_address(record.port, DIALOG_RESOURCE_ID_OFFSET))
                         == Some(params.alert_id() as u16);
                 (memory.read_u16_be(record.port + PPC_CWINDOW_WINDOW_KIND_OFFSET) == Some(2)
                     && ppc_window_is_visible(memory, record.port)
@@ -1192,6 +1195,7 @@ pub(super) fn dispatch_dialog_import(
                 *current_gworld = created;
                 *current_gdevice = ppc_gworld_device(gworlds, created).unwrap_or(*current_gdevice);
                 let _ = ppc_draw_dialog(
+                    window_list,
                     memory,
                     handles,
                     controls,
@@ -1208,8 +1212,9 @@ pub(super) fn dispatch_dialog_import(
             *current_gdevice = ppc_gworld_device(gworlds, dialog).unwrap_or(*current_gdevice);
             let caller_registers = PpcCallerRegisters::capture(cpu);
             cpu.gpr[3] = params.filter_proc();
-            cpu.gpr[4] = dialog + DIALOG_ALERT_HIT_OFFSET;
+            cpu.gpr[4] = window_list.dialog_private_address(dialog, DIALOG_ALERT_HIT_OFFSET);
             let pass = ppc_modal_dialog(
+                window_list,
                 cpu,
                 process_memory_manager,
                 memory,
@@ -1248,7 +1253,7 @@ pub(super) fn dispatch_dialog_import(
             };
             if matches!(action, PpcImportAction::ReturnPreserve) {
                 let hit = memory
-                    .read_u16_be(dialog + DIALOG_ALERT_HIT_OFFSET)
+                    .read_u16_be(window_list.dialog_private_address(dialog, DIALOG_ALERT_HIT_OFFSET))
                     .unwrap_or(1);
                 let items_handle = memory
                     .read_u32_be(dialog + DIALOG_ITEMS_OFFSET)
@@ -1332,9 +1337,9 @@ pub(super) fn dispatch_dialog_import(
                 );
             }
             let mut dialog = gworlds.iter().rev().find_map(|record| {
-                let matches_call = memory.read_u32_be(record.port + DIALOG_STANDARD_ALERT_OUTPUT_OFFSET)
+                let matches_call = memory.read_u32_be(window_list.dialog_private_address(record.port, DIALOG_STANDARD_ALERT_OUTPUT_OFFSET))
                     == Some(params.item_hit_out_ptr())
-                    && memory.read_u32_be(record.port + DIALOG_STANDARD_ALERT_STACK_OFFSET)
+                    && memory.read_u32_be(window_list.dialog_private_address(record.port, DIALOG_STANDARD_ALERT_STACK_OFFSET))
                         == Some(cpu.gpr[1]);
                 (memory.read_u16_be(record.port + PPC_CWINDOW_WINDOW_KIND_OFFSET) == Some(2)
                     && ppc_window_is_visible(memory, record.port)
@@ -1367,6 +1372,7 @@ pub(super) fn dispatch_dialog_import(
                 *current_gworld = created;
                 *current_gdevice = ppc_gworld_device(gworlds, created).unwrap_or(*current_gdevice);
                 let _ = ppc_draw_dialog(
+                    window_list,
                     memory,
                     handles,
                     controls,
@@ -1389,8 +1395,9 @@ pub(super) fn dispatch_dialog_import(
                     .read_u32_be(params.alert_param_ptr() + 2)
                     .unwrap_or(0)
             };
-            cpu.gpr[4] = dialog + DIALOG_ALERT_HIT_OFFSET;
+            cpu.gpr[4] = window_list.dialog_private_address(dialog, DIALOG_ALERT_HIT_OFFSET);
             let pass = ppc_modal_dialog(
+                window_list,
                 cpu,
                 process_memory_manager,
                 memory,
@@ -1429,7 +1436,7 @@ pub(super) fn dispatch_dialog_import(
             };
             if matches!(action, PpcImportAction::ReturnPreserve) {
                 let hit = memory
-                    .read_u16_be(dialog + DIALOG_ALERT_HIT_OFFSET)
+                    .read_u16_be(window_list.dialog_private_address(dialog, DIALOG_ALERT_HIT_OFFSET))
                     .unwrap_or(1);
                 let items_handle = memory
                     .read_u32_be(dialog + DIALOG_ITEMS_OFFSET)
@@ -1563,7 +1570,7 @@ fn ppc_release_dialog_storage(
         );
 
         let style_handle = memory
-            .read_u32_be(dialog + PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET)
+            .read_u32_be(window_list.dialog_private_address(dialog, PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET))
             .unwrap_or(0);
         if style_handle != 0 {
             let _ = allocator.dispose_handle(
@@ -1574,7 +1581,7 @@ fn ppc_release_dialog_storage(
                 handles,
                 style_handle,
             );
-            let _ = memory.write_u32_be(dialog + PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET, 0);
+            let _ = memory.write_u32_be(window_list.dialog_private_address(dialog, PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET), 0);
         }
 
         ppc_dispose_window(
@@ -1864,6 +1871,7 @@ fn ppc_dispatch_dialog_compatibility(
                     *current_gdevice =
                         ppc_gworld_device(gworlds, dialog).unwrap_or(*current_gdevice);
                     let _ = ppc_draw_dialog(
+                        window_list,
                         memory,
                         handles,
                         controls,
@@ -2153,6 +2161,7 @@ fn ppc_dispatch_dialog_compatibility(
             let bounds = ppc_dialog_global_bounds(memory, gworlds, dialog);
             let items = ppc_dialog_items_for_dialog(memory, handles, dialog);
             let _ = ppc_draw_dialog(
+                window_list,
                 memory,
                 handles,
                 controls,
@@ -2235,13 +2244,13 @@ fn ppc_dispatch_dialog_compatibility(
             let os_err = match result {
                 Ok(params) => {
                     if memory
-                        .write_u16_be(params.dialog_ptr() + DIALOG_TIMEOUT_BUTTON_OFFSET, params.button_to_press() as u16)
+                        .write_u16_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TIMEOUT_BUTTON_OFFSET), params.button_to_press() as u16)
                         .is_some()
                         && memory
-                            .write_u32_be(params.dialog_ptr() + DIALOG_TIMEOUT_SECONDS_OFFSET, params.seconds_to_wait())
+                            .write_u32_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TIMEOUT_SECONDS_OFFSET), params.seconds_to_wait())
                             .is_some()
                         && memory
-                            .write_u32_be(params.dialog_ptr() + DIALOG_TIMEOUT_START_TICK_OFFSET, tick_count)
+                            .write_u32_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TIMEOUT_START_TICK_OFFSET), tick_count)
                             .is_some()
                     {
                         PPC_NO_ERR
@@ -2271,9 +2280,9 @@ fn ppc_dispatch_dialog_compatibility(
             );
             let os_err = match result {
                 Ok(params) => {
-                    let button = memory.read_u16_be(params.dialog_ptr() + DIALOG_TIMEOUT_BUTTON_OFFSET).unwrap_or(0);
-                    let seconds = memory.read_u32_be(params.dialog_ptr() + DIALOG_TIMEOUT_SECONDS_OFFSET).unwrap_or(0);
-                    let start_tick = memory.read_u32_be(params.dialog_ptr() + DIALOG_TIMEOUT_START_TICK_OFFSET).unwrap_or(0);
+                    let button = memory.read_u16_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TIMEOUT_BUTTON_OFFSET)).unwrap_or(0);
+                    let seconds = memory.read_u32_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TIMEOUT_SECONDS_OFFSET)).unwrap_or(0);
+                    let start_tick = memory.read_u32_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TIMEOUT_START_TICK_OFFSET)).unwrap_or(0);
                     let remaining = evaluate_dialog_timeout_remaining(seconds, start_tick, tick_count);
                     if params.out_button_ptr() != 0 {
                         let _ = memory.write_u16_be(params.out_button_ptr(), button);
@@ -2383,7 +2392,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let sheet = params.sheet_ptr();
-            let _ = memory.write_u32_be(sheet + DIALOG_STANDARD_SHEET_COMMAND_OFFSET, params.result_command());
+            let _ = memory.write_u32_be(window_list.dialog_private_address(sheet, DIALOG_STANDARD_SHEET_COMMAND_OFFSET), params.result_command());
             let items_handle = memory
                 .read_u32_be(sheet + DIALOG_ITEMS_OFFSET)
                 .unwrap_or(0);
@@ -2446,7 +2455,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Ok(p) => p,
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
-            let mask = match memory.read_u16_be(params.dialog_ptr() + DIALOG_MODAL_EVENT_MASK_OFFSET) {
+            let mask = match memory.read_u16_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_MODAL_EVENT_MASK_OFFSET)) {
                 Some(0) | None => DIALOG_DEFAULT_MODAL_EVENT_MASK,
                 Some(m) => m,
             };
@@ -2462,7 +2471,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let _ = memory.write_u16_be(
-                params.dialog_ptr() + DIALOG_MODAL_EVENT_MASK_OFFSET,
+                window_list.dialog_private_address(params.dialog_ptr(), DIALOG_MODAL_EVENT_MASK_OFFSET),
                 params.mask(),
             );
             PpcImportAction::Return(ppc_i16_result(PPC_NO_ERR))
@@ -2523,7 +2532,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let _ = memory.write_u32_be(
-                params.dialog_ptr() + DIALOG_FILTER_PROC_OFFSET,
+                window_list.dialog_private_address(params.dialog_ptr(), DIALOG_FILTER_PROC_OFFSET),
                 params.filter_proc(),
             );
             if ppc_hle_trace_enabled() {
@@ -2588,7 +2597,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let tracks = if params.dialog_ptr() != 0 {
-                memory.read_u8(params.dialog_ptr() + DIALOG_TRACKS_CURSOR_OFFSET).unwrap_or(0)
+                memory.read_u8(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_TRACKS_CURSOR_OFFSET)).unwrap_or(0)
             } else {
                 0
             };
@@ -2602,7 +2611,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(_) => return PpcImportAction::Return(0),
             };
             let tracks = if dialog_ptr != 0 {
-                memory.read_u8(dialog_ptr + DIALOG_TRACKS_CURSOR_OFFSET).unwrap_or(0) != 0
+                memory.read_u8(window_list.dialog_private_address(dialog_ptr, DIALOG_TRACKS_CURSOR_OFFSET)).unwrap_or(0) != 0
             } else {
                 false
             };
@@ -2617,7 +2626,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let filter = memory
-                .read_u32_be(params.dialog_ptr() + DIALOG_FILTER_PROC_OFFSET)
+                .read_u32_be(window_list.dialog_private_address(params.dialog_ptr(), DIALOG_FILTER_PROC_OFFSET))
                 .unwrap_or(0);
             let _ = memory.write_u32_be(params.out_proc_ptr(), filter);
             PpcImportAction::Return(ppc_i16_result(PPC_NO_ERR))
@@ -2630,7 +2639,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let _ = memory.write_u32_be(
-                params.sheet_ptr() + DIALOG_SHEET_PARENT_OFFSET,
+                window_list.dialog_private_address(params.sheet_ptr(), DIALOG_SHEET_PARENT_OFFSET),
                 params.parent_ptr(),
             );
             if params.parent_ptr() != 0 {
@@ -2681,7 +2690,7 @@ fn ppc_dispatch_dialog_compatibility(
                 Err(err) => return PpcImportAction::Return(ppc_i16_result(err)),
             };
             let parent = memory
-                .read_u32_be(params.sheet_ptr() + DIALOG_SHEET_PARENT_OFFSET)
+                .read_u32_be(window_list.dialog_private_address(params.sheet_ptr(), DIALOG_SHEET_PARENT_OFFSET))
                 .unwrap_or(0);
             let _ = memory.write_u32_be(params.out_parent_ptr(), parent);
             PpcImportAction::Return(ppc_i16_result(PPC_NO_ERR))
@@ -3160,6 +3169,9 @@ fn ppc_new_alert_dialog(
             current_resource_refnum,
             last_resource_error,
         ) {
+        if let Some(private_storage) = window_list.take_caller_dialog_private_storage(dialog) {
+            process_memory_manager.release_native_scratch(private_storage);
+        }
         0
     } else {
         dialog
@@ -3171,10 +3183,10 @@ fn ppc_new_alert_dialog(
             default_item as i16,
             cancel_item as i16,
         );
-        let _ = memory.write_u16_be(dialog + DIALOG_RESOURCE_ID_OFFSET, init.alert_id() as u16);
+        let _ = memory.write_u16_be(window_list.dialog_private_address(dialog, DIALOG_RESOURCE_ID_OFFSET), init.alert_id() as u16);
         let _ = memory.write_u16_be(dialog + DIALOG_DEFAULT_ITEM_OFFSET, init.default_item() as u16);
-        let _ = memory.write_u16_be(dialog + DIALOG_ALERT_HIT_OFFSET, init.alert_hit() as u16);
-        let _ = memory.write_u16_be(dialog + DIALOG_CANCEL_ITEM_OFFSET, init.cancel_item() as u16);
+        let _ = memory.write_u16_be(window_list.dialog_private_address(dialog, DIALOG_ALERT_HIT_OFFSET), init.alert_hit() as u16);
+        let _ = memory.write_u16_be(window_list.dialog_private_address(dialog, DIALOG_CANCEL_ITEM_OFFSET), init.cancel_item() as u16);
         let dialog_font = crate::dialog_manager::evaluate_dialog_font(
             memory
                 .read_u16_be(crate::memory::globals::addr::DLG_FONT)
@@ -3185,8 +3197,8 @@ fn ppc_new_alert_dialog(
             dialog_font as u16,
         );
         if standard {
-            let _ = memory.write_u32_be(dialog + DIALOG_STANDARD_ALERT_OUTPUT_OFFSET, cpu.gpr[7]);
-            let _ = memory.write_u32_be(dialog + DIALOG_STANDARD_ALERT_STACK_OFFSET, cpu.gpr[1]);
+            let _ = memory.write_u32_be(window_list.dialog_private_address(dialog, DIALOG_STANDARD_ALERT_OUTPUT_OFFSET), cpu.gpr[7]);
+            let _ = memory.write_u32_be(window_list.dialog_private_address(dialog, DIALOG_STANDARD_ALERT_STACK_OFFSET), cpu.gpr[1]);
         }
         *last_resource_error = PPC_NO_ERR;
     }
@@ -3333,7 +3345,7 @@ fn ppc_get_new_dialog(
                 handles,
                 &bytes,
             );
-            let _ = memory.write_u32_be(dialog + PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET, style_handle);
+            let _ = memory.write_u32_be(window_list.dialog_private_address(dialog, PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET), style_handle);
         }
     }
     let dialog = if dialog != 0
@@ -3356,7 +3368,7 @@ fn ppc_get_new_dialog(
         dialog
     };
     if dialog != 0 {
-        let _ = memory.write_u16_be(dialog + DIALOG_RESOURCE_ID_OFFSET, dialog_id as u16);
+        let _ = memory.write_u16_be(window_list.dialog_private_address(dialog, DIALOG_RESOURCE_ID_OFFSET), dialog_id as u16);
         *last_resource_error = PPC_NO_ERR;
     }
     dialog
@@ -3403,6 +3415,7 @@ fn ppc_new_dialog(
         return 0;
     };
 
+    let mut caller_private_storage = 0;
     let storage = match params.storage_policy() {
         crate::dialog_manager::DialogStoragePolicy::AllocateNew => {
             let storage = process_memory_manager.new_native_ptr(memory, DIALOG_RECORD_SIZE, true);
@@ -3415,8 +3428,17 @@ fn ppc_new_dialog(
             storage
         }
         crate::dialog_manager::DialogStoragePolicy::CallerSupplied(requested) => {
-            if ppc_memory_can_write_bytes(memory, requested, DIALOG_RECORD_SIZE) {
-                let _ = memory.write_bytes(requested, &vec![0; DIALOG_RECORD_SIZE as usize]);
+            let public_size = crate::dialog_manager::DIALOG_PUBLIC_RECORD_SIZE;
+            if ppc_memory_can_write_bytes(memory, requested, public_size) {
+                caller_private_storage = process_memory_manager.new_native_scratch(
+                    memory, DIALOG_RECORD_SIZE - public_size,
+                );
+                ppc_apply_process_native_allocator(process_memory_manager, memory, heap_cursor, last_mem_error);
+                if caller_private_storage == 0 {
+                    *last_mem_error = PPC_MEM_FULL_ERR;
+                    return 0;
+                }
+                let _ = memory.write_bytes(requested, &vec![0; public_size as usize]);
                 requested
             } else {
                 0
@@ -3456,7 +3478,15 @@ fn ppc_new_dialog(
         current_gdevice,
     );
     if dialog == 0 {
+        if caller_private_storage != 0 {
+            allocator.memory_manager.release_native_scratch(caller_private_storage);
+        }
         return 0;
+    }
+    if caller_private_storage != 0 {
+        if let Some(previous) = window_list.set_caller_dialog_private_storage(dialog, caller_private_storage) {
+            allocator.memory_manager.release_native_scratch(previous);
+        }
     }
 
     let title = ppc_read_pstring_bytes(memory, params.title_ptr()).unwrap_or_default();
@@ -3504,6 +3534,9 @@ fn ppc_new_dialog(
             )
             .is_none()
     {
+        if let Some(private_storage) = window_list.take_caller_dialog_private_storage(dialog) {
+            allocator.memory_manager.release_native_scratch(private_storage);
+        }
         *last_mem_error = if title_handle == 0 {
             PPC_MEM_FULL_ERR
         } else {
@@ -3522,7 +3555,7 @@ fn ppc_new_dialog(
         dialog_font as u16,
     );
     let _ = memory.write_u16_be(
-        dialog + DIALOG_MODAL_EVENT_MASK_OFFSET,
+        window_list.dialog_private_address(dialog, DIALOG_MODAL_EVENT_MASK_OFFSET),
         DIALOG_DEFAULT_MODAL_EVENT_MASK,
     );
 
@@ -4503,8 +4536,8 @@ pub(super) fn ppc_frame_front_round_rect(
 }
 
 // Macintosh Toolbox Essentials (1992), pp. 6-161--6-164: ictb text styles.
-// Dialog-owned item color table; kept in the existing private record tail.
-const PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET: u32 = 216;
+// Dialog-owned item color table, addressed through its private storage.
+const PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET: u32 = crate::dialog_manager::DIALOG_ITEM_STYLE_HANDLE_OFFSET;
 
 #[derive(Clone, Copy, Debug)]
 struct PpcDialogItemTextStyle {
@@ -4517,6 +4550,7 @@ struct PpcDialogItemTextStyle {
 }
 
 fn ppc_dialog_item_text_style(
+    window_list: &SharedProcessWindowList,
     memory: &mut PpcSectionMem,
     handles: &[PpcHandleRecord],
     resources: &[PpcVfsResourceRecord],
@@ -4524,7 +4558,7 @@ fn ppc_dialog_item_text_style(
     index: usize,
     foreground: PpcRgbColor,
 ) -> Option<PpcDialogItemTextStyle> {
-    let handle = memory.read_u32_be(dialog + PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET)?;
+    let handle = memory.read_u32_be(window_list.dialog_private_address(dialog, PPC_DIALOG_ITEM_STYLE_HANDLE_OFFSET))?;
     let bytes = ppc_handle_bytes(memory, handles, handle)?;
     let word = |offset: usize| -> Option<u16> {
         Some(u16::from_be_bytes(
@@ -4736,6 +4770,7 @@ fn ppc_dialog_item_title(
 }
 
 pub(super) fn ppc_draw_dialog(
+    window_list: &SharedProcessWindowList,
     memory: &mut PpcSectionMem,
     handles: &[PpcHandleRecord],
     controls: &[PpcControlRecord],
@@ -4746,6 +4781,7 @@ pub(super) fn ppc_draw_dialog(
     dialog: u32,
 ) -> bool {
     ppc_draw_dialog_items(
+        window_list,
         memory,
         handles,
         controls,
@@ -4759,6 +4795,7 @@ pub(super) fn ppc_draw_dialog(
 }
 
 fn ppc_draw_dialog_items(
+    window_list: &SharedProcessWindowList,
     memory: &mut PpcSectionMem,
     handles: &[PpcHandleRecord],
     controls: &[PpcControlRecord],
@@ -4846,6 +4883,7 @@ fn ppc_draw_dialog_items(
                 if text_handle.is_some() {
                     let background = ppc_theme_rgb(palette.window_background);
                     let mut style = ppc_dialog_item_text_style(
+                        window_list,
                         memory,
                         handles,
                         vfs_resources,
@@ -4953,7 +4991,7 @@ fn ppc_draw_dialog_items(
                     ppc_theme_rgb(palette.frame_dark)
                 };
                 if let Some(mut style) =
-                    ppc_dialog_item_text_style(memory, handles, vfs_resources, dialog, index, color)
+                    ppc_dialog_item_text_style(window_list, memory, handles, vfs_resources, dialog, index, color)
                 {
                     if selected {
                         style.foreground = color;
@@ -5368,6 +5406,7 @@ fn ppc_read_event_record(memory: &mut PpcSectionMem, event_ptr: u32) -> Option<P
 /// One ModalDialog pass. `filter_result` is what the application's filter
 /// did with the event of the previous pass, when this pass resumes after it.
 fn ppc_modal_dialog(
+    window_list: &SharedProcessWindowList,
     cpu: &mut PpcCpu,
     process_memory_manager: &mut ProcessNativeMemoryManager,
     memory: &mut PpcSectionMem,
@@ -5506,6 +5545,7 @@ fn ppc_modal_dialog(
                         fore_color,
                     );
                     let _ = ppc_draw_dialog(
+                        window_list,
                         memory,
                         handles,
                         controls,
@@ -5544,6 +5584,7 @@ fn ppc_modal_dialog(
                     )
                 {
                     let _ = ppc_draw_dialog(
+                        window_list,
                         memory,
                         handles,
                         controls,
@@ -5575,7 +5616,7 @@ fn ppc_modal_dialog(
                 decision,
                 if decision == crate::dialog_manager::DialogFilterDecision::TriggerCancelButton {
                     let configured_cancel = memory
-                        .read_u16_be(dialog + DIALOG_CANCEL_ITEM_OFFSET)
+                        .read_u16_be(window_list.dialog_private_address(dialog, DIALOG_CANCEL_ITEM_OFFSET))
                         .filter(|item| *item != 0)
                         .map(|item| item as i16);
                     ppc_dialog_cancel_item(memory, handles, &items, configured_cancel)
@@ -5619,6 +5660,7 @@ fn ppc_modal_dialog(
                 if result == PPC_NO_ERR {
                     handled_edit_event = true;
                     let _ = ppc_draw_dialog(
+                        window_list,
                         memory,
                         handles,
                         controls,
@@ -5645,6 +5687,7 @@ fn ppc_modal_dialog(
         }
         Some(6) => {
             let _ = ppc_draw_dialog(
+                window_list,
                 memory,
                 handles,
                 controls,

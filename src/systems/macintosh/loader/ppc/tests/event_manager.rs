@@ -799,7 +799,7 @@ fn os_event_accessors_skip_toolbox_and_high_level_events() {
     assert_eq!(queue[1].what, 23);
     assert_eq!(
         ppc_peek_event(&queue, u16::MAX, PpcInputSnapshot::default(), true, 7),
-        (0, 0, 7, 0, 0, 0, false)
+        (0, 0, 7, 0, 0, 0x0080, false)
     );
 }
 
@@ -1001,6 +1001,73 @@ fn hle_import_runner_posts_events_through_sys_evt_mask_low_memory() {
 }
 
 #[test]
+fn null_event_polls_track_current_button_and_modifier_state() {
+    // Apple's Carbon Porting Guide (2002), Appendix B, p. 102:
+    // OSEventAvail returns current modifiers even when it returns a null event.
+    for symbol in [
+        "GetOSEvent",
+        "OSEventAvail",
+        "GetNextEvent",
+        "EventAvail",
+        "WaitNextEvent",
+    ] {
+        let pef = synthetic_pef_with_import(symbol.as_bytes());
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let event_ptr = PPC_DATA_BASE + 0x1000;
+        loaded.memory.add_region(event_ptr, vec![0xaa; 16]);
+        let queued = PpcQueuedEvent {
+            what: 1,
+            message: 0,
+            when: 11,
+            where_v: 12,
+            where_h: 13,
+            modifiers: 0x0200,
+        };
+        loaded.set_event_queue([queued.clone()]);
+        let target = dispatcher_target_for_import("InterfaceLib", symbol);
+        // Include mouse-down/up and keyboard transitions without posting a
+        // matching event. The pending mouse event must survive keyboard polls.
+        for (pressed, keys, expected) in [
+            (false, &[][..], 0x0080),
+            (true, &[][..], 0),
+            (true, &[0x37_u8, 0x38, 0x39, 0x3a, 0x3b][..], 0x1f00),
+            (false, &[0x3c, 0x3d, 0x3e][..], 0x1a80),
+            (false, &[][..], 0x0080),
+        ] {
+            let mut input = PpcInputSnapshot {
+                mouse_button: pressed,
+                mouse_v: 123,
+                mouse_h: 456,
+                ..PpcInputSnapshot::default()
+            };
+            for &key in keys {
+                input.key_map[usize::from(key >> 3)] |= 1 << (key & 7);
+            }
+            loaded.set_input_snapshot(input);
+            for mask in [0, 0x0038] {
+                loaded.cpu.gpr[3] = mask;
+                loaded.cpu.gpr[4] = event_ptr;
+                loaded.cpu.gpr[5] = 0;
+                loaded.cpu.gpr[6] = 0;
+                run_test_import(&mut loaded, target.clone());
+                assert_eq!(loaded.cpu.gpr[3], 0, "{symbol}");
+                assert_eq!(loaded.memory.read_u16_be(event_ptr), Some(0));
+                assert_eq!(loaded.memory.read_u32_be(event_ptr + 2), Some(0));
+                assert_eq!(loaded.memory.read_u16_be(event_ptr + 10), Some(123));
+                assert_eq!(loaded.memory.read_u16_be(event_ptr + 12), Some(456));
+                assert_eq!(
+                    loaded.memory.read_u16_be(event_ptr + 14),
+                    Some(expected),
+                    "{symbol}"
+                );
+                assert_eq!(loaded.event_queue().front(), Some(queued.clone()));
+                assert_eq!(loaded.event_queue().len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn hle_import_runner_handles_event_button_and_exit_utilities() {
     let pef = synthetic_pef_with_import(b"GetNextEvent");
     let mut loaded = load_pef_application(&pef).unwrap();
@@ -1026,7 +1093,7 @@ fn hle_import_runner_handles_event_button_and_exit_utilities() {
     assert_eq!(loaded.memory.read_u32_be(event_ptr + 6), Some(0));
     assert_eq!(loaded.memory.read_u16_be(event_ptr + 10), Some(123));
     assert_eq!(loaded.memory.read_u16_be(event_ptr + 12), Some(456));
-    assert_eq!(loaded.memory.read_u16_be(event_ptr + 14), Some(0));
+    assert_eq!(loaded.memory.read_u16_be(event_ptr + 14), Some(0x0080));
 
     let pef = synthetic_pef_with_import(b"GetNextEvent");
     let mut loaded = load_pef_application(&pef).unwrap();
@@ -1231,6 +1298,24 @@ fn get_mouse_honors_guest_low_memory_warp_across_slices() {
     });
     loaded.input_sprocket.device_mouse_v = Some(400);
     loaded.input_sprocket.device_mouse_h = Some(520);
+    loaded.input_sprocket.initialized = true;
+    for (element, binding) in [
+        (0x0300_0000, PpcInputSprocketActionBinding::DeltaYaw),
+        (0x0300_0100, PpcInputSprocketActionBinding::DeltaPitch),
+    ] {
+        loaded.input_sprocket_virtual_elements.push(PpcInputSprocketVirtualElementRecord {
+            element,
+            need_index: 0,
+            need_source: 0,
+            kind: u32::from_be_bytes(*b"dlta"),
+            default_state: 0,
+            action_binding: binding,
+            keyboard_binding: None,
+            need_name: "Mouse".into(),
+            need_record: Vec::new(),
+            mouse_position: std::cell::Cell::new((520, 400)),
+        });
+    }
     loaded.cpu.gpr[3] = point;
     let first = loaded.run_with_hle_imports(64);
     assert_eq!(first.handled_import_count, 1);
@@ -1241,6 +1326,17 @@ fn get_mouse_honors_guest_low_memory_warp_across_slices() {
     assert_eq!(loaded.input_sprocket.device_mouse_h, Some(400));
     assert_eq!(loaded.input_sprocket.device_mouse_v_carry, -4);
     assert_eq!(loaded.input_sprocket.device_mouse_h_carry, 6);
+
+    // Real unread motion survives the warp, but the warp itself is not input.
+    let warped_input = PpcInputSnapshot {
+        mouse_v: 300,
+        mouse_h: 400,
+        ..PpcInputSnapshot::default()
+    };
+    for (record, expected) in loaded.input_sprocket_virtual_elements.iter().zip([6 << 16, (-4i32 << 16) as u32]) {
+        assert_eq!(ppc_isp_virtual_mouse_delta(record, warped_input, loaded.input_sprocket), expected);
+        assert_eq!(ppc_isp_virtual_mouse_delta(record, warped_input, loaded.input_sprocket), 0);
+    }
 
     // A new slice without another host input must retain the guest warp.
     loaded.cpu.pc = loaded.entry_pc + 12;
@@ -1663,4 +1759,40 @@ fn wait_next_event_charges_toolbox_time_without_losing_queued_input() {
     assert_eq!(loaded.memory.read_u16_be(event_ptr), Some(1));
     assert!(loaded.event_queue().is_empty());
     assert!(ppc_run_result_cycles(input.result) > 64);
+}
+
+#[test]
+fn input_polls_observe_changes_without_snapshotting_unrelated_handles() {
+    for import in [b"GetKeys".as_slice(), b"Button".as_slice(), b"TickCount".as_slice()] {
+        let pef = synthetic_pef_with_import(import);
+        let mut loaded = load_pef_application(&pef).unwrap();
+        for _ in 0..64 {
+            assert_ne!(loaded.process_memory_manager.0.borrow_mut()
+                .new_native_handle(&mut loaded.memory, 32, true), 0);
+        }
+        let key_map = PPC_HEAP_BASE + 0x18000;
+        loaded.memory.add_region(key_map, vec![0xaa; 16]);
+        loaded.set_clock_cycle_timing(1_000_000, 0);
+        for down in [true, false] {
+            let mut input = PpcInputSnapshot::default();
+            input.mouse_button = down;
+            input.key_map[7] = if down { 0x80 } else { 0 };
+            loaded.set_input_snapshot(input);
+            loaded.set_tick_count(42);
+            loaded.cpu.pc = loaded.entry_pc;
+            loaded.cpu.gpr[3] = key_map;
+            let snapshots = super::super::dispatch_imports::handle_snapshot_count;
+            let before = snapshots();
+            let probe = loaded.run_with_hle_imports(64);
+            assert_eq!(probe.handled_import_count, 1);
+            assert_eq!(probe.unsupported_import_index, None);
+            assert_eq!(snapshots(), before);
+            match import {
+                b"GetKeys" => assert_eq!(loaded.memory.read_u8(key_map + 7), Some(if down { 0x80 } else { 0 })),
+                b"Button" => assert_eq!(loaded.cpu.gpr[3], u32::from(down)),
+                b"TickCount" => assert_eq!(loaded.cpu.gpr[3], 42),
+                _ => unreachable!(),
+            }
+        }
+    }
 }

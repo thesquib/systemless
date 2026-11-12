@@ -7,7 +7,15 @@ fn ppc_rebase_mouse_warp(
     sprocket: &mut PpcInputSprocketState,
     input: PpcInputSnapshot,
     position: (i16, i16),
+    virtual_elements: &[PpcInputSprocketVirtualElementRecord],
 ) {
+    for record in virtual_elements {
+        let (h, v) = record.mouse_position.get();
+        record.mouse_position.set((
+            h.saturating_add(i32::from(position.1) - i32::from(input.mouse_h)),
+            v.saturating_add(i32::from(position.0) - i32::from(input.mouse_v)),
+        ));
+    }
     if let Some(anchor) = sprocket.device_mouse_v.as_mut() {
         sprocket.device_mouse_v_carry = sprocket
             .device_mouse_v_carry
@@ -2024,6 +2032,7 @@ impl PpcLoadedApp {
                                             collections: &collections,
                                             drag_manager: &drag_manager,
                                             input,
+                                            process_input: &process_input,
                                             event_queue,
                                             draw_sprocket: &mut draw_sprocket,
                                             });
@@ -2035,13 +2044,15 @@ impl PpcLoadedApp {
                                             ))
                                             };
                                             // QDGlobals.thePort is guest-visible state. Keep it
-                                            // consistent with every explicit port selection,
+                                            // consistent with port opening and explicit selection,
                                             // including reselection after a window operation
                                             // already changed the host's current port.
                                             if toolbox_startup.init_graf_global_ptr != 0
                                                 && matches!(
                                                     binding.dispatcher_target,
                                                     PpcImportDispatcherTarget::SetPort
+                                                        | PpcImportDispatcherTarget::OpenPort
+                                                        | PpcImportDispatcherTarget::OpenCPort
                                                         | PpcImportDispatcherTarget::SetPortWindowPort
                                                         | PpcImportDispatcherTarget::SetPortDialogPort
                                                         | PpcImportDispatcherTarget::SetGWorld
@@ -2073,8 +2084,8 @@ impl PpcLoadedApp {
                     action
                 };
 
-                let cursor_device_move = binding.dispatcher_target
-                    == PpcImportDispatcherTarget::SystemCompatibility(
+                let cursor_device_move = binding.dispatcher_target == PpcImportDispatcherTarget::CrsrDevMoveTo
+                    || binding.dispatcher_target == PpcImportDispatcherTarget::SystemCompatibility(
                         PpcSystemCompatibilityOperation::CursorDeviceMove,
                     );
                 if (cursor_device_move || binding.dispatcher_target == PpcImportDispatcherTarget::GetMouse)
@@ -2085,11 +2096,17 @@ impl PpcLoadedApp {
                         if cursor_device_move || (v, h) != (input.mouse_v, input.mouse_h) {
                             // A programmatic warp is not physical mouse movement.
                             // Preserve unread motion while rebasing the anchors.
-                            ppc_rebase_mouse_warp(&mut input_sprocket, input, (v, h));
+                            ppc_rebase_mouse_warp(&mut input_sprocket, input, (v, h), &input_sprocket_virtual_elements);
                         }
                         input.mouse_v = v;
                         input.mouse_h = h;
                         process_input.set_mouse_position((v, h));
+                        if let Some(records) = process_input.cursor_device_records() {
+                            let _ = memory.write_bytes(
+                                records.data + 8,
+                                &crate::cursor_manager::cursor_device_position_bytes((v, h)),
+                            );
+                        }
                     }
                 }
                 ppc_sync_process_window_list(memory, &window_list);
@@ -2498,8 +2515,14 @@ impl PpcLoadedApp {
         if let Some(point) = self.memory.read_u32_be(crate::memory::globals::addr::MOUSE_LOC2) {
             let position = ((point >> 16) as i16, point as i16);
             if position != (input.mouse_v, input.mouse_h) {
-                ppc_rebase_mouse_warp(&mut input_sprocket, input, position);
+                ppc_rebase_mouse_warp(&mut input_sprocket, input, position, &input_sprocket_virtual_elements);
                 self.process_input.set_mouse_position(position);
+                if let Some(records) = self.process_input.cursor_device_records() {
+                    let _ = self.memory.write_bytes(
+                        records.data + 8,
+                        &crate::cursor_manager::cursor_device_position_bytes(position),
+                    );
+                }
             }
         }
 

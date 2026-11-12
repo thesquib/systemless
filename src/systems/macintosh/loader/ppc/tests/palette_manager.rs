@@ -18,6 +18,60 @@ use super::*;
     }
 
     #[test]
+    fn palette_update_accessors_preserve_modes_by_handle() {
+        use PpcImportDispatcherTarget::{GetPaletteUpdates, QuickDrawCompatibility, SetPaletteUpdates};
+
+        for library in ["InterfaceLib", "CarbonLib"] {
+            assert_eq!(
+                dispatcher_target_for_import(library, "SetPaletteUpdates"),
+                SetPaletteUpdates
+            );
+            assert_eq!(
+                dispatcher_target_for_import(library, "GetPaletteUpdates"),
+                GetPaletteUpdates
+            );
+        }
+        let pef = synthetic_pef_with_import(b"SetPaletteUpdates");
+        let mut loaded = load_pef_application(&pef).unwrap();
+        assert_eq!(loaded.imports[0].dispatcher_target, SetPaletteUpdates);
+        let mut palettes = [0; 2];
+        for (palette, mode) in palettes.iter_mut().zip([0x8000u16, 0xa000]) {
+            loaded.cpu.gpr[3] = 1;
+            loaded.cpu.gpr[4] = 0;
+            loaded.cpu.gpr[5] = 0;
+            loaded.cpu.gpr[6] = 0;
+            run_test_import(
+                &mut loaded,
+                QuickDrawCompatibility(PpcQuickDrawCompatibilityOperation::NewPalette),
+            );
+            *palette = loaded.cpu.gpr[3];
+            assert_ne!(*palette, 0);
+            run_test_import(&mut loaded, GetPaletteUpdates);
+            assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(0xe000u16 as i16));
+            loaded.cpu.gpr[3] = *palette;
+            loaded.cpu.gpr[4] = 0xabcd0000 | u32::from(mode);
+            run_test_import(&mut loaded, SetPaletteUpdates);
+            assert_eq!(loaded.cpu.gpr[3], *palette);
+        }
+        for (palette, mode) in palettes.into_iter().zip([0x8000u16, 0xa000]) {
+            loaded.cpu.gpr[3] = palette;
+            run_test_import(&mut loaded, GetPaletteUpdates);
+            assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(mode as i16));
+        }
+        loaded.cpu.gpr[3] = palettes[0];
+        run_test_import(
+            &mut loaded,
+            QuickDrawCompatibility(PpcQuickDrawCompatibilityOperation::DisposePalette),
+        );
+        loaded.cpu.gpr[3] = palettes[0];
+        run_test_import(&mut loaded, GetPaletteUpdates);
+        assert_eq!(loaded.cpu.gpr[3], 0);
+        loaded.cpu.gpr[3] = palettes[1];
+        run_test_import(&mut loaded, GetPaletteUpdates);
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(0xa000u16 as i16));
+    }
+
+    #[test]
     fn hle_import_runner_new_palette_initializes_entries_from_color_table() {
         let pef = synthetic_pef_with_import(b"NewPalette");
         let mut loaded = load_pef_application(&pef).unwrap();
@@ -127,16 +181,32 @@ use super::*;
     }
 
     #[test]
-    fn hle_import_runner_get_new_palette_returns_initialized_resource_copy() {
+    fn get_new_palette_returns_resource_copy_without_modifying_current_dialog() {
         let pef = synthetic_pef_with_import(b"GetNewPalette");
         let mut loaded = load_pef_application(&pef).unwrap();
         let window = PPC_DATA_BASE + 0x3000;
         loaded
             .memory
-            .add_region(window, vec![0; PPC_CGRAF_PORT_SIZE as usize]);
+            .add_region(
+                window,
+                vec![0; crate::dialog_manager::DIALOG_PUBLIC_RECORD_SIZE as usize],
+            );
         loaded
             .current_gworld
             .with_mut(|current_gworld| *current_gworld = window);
+        loaded.memory.write_u16_be(
+            window + PPC_CWINDOW_WINDOW_KIND_OFFSET,
+            crate::dialog_manager::DIALOG_WINDOW_KIND,
+        ).unwrap();
+        loaded.memory.write_u32_be(
+            window + crate::dialog_manager::DIALOG_ITEMS_OFFSET, 0x1122_3344,
+        ).unwrap();
+        loaded.memory.write_u32_be(
+            window + crate::dialog_manager::DIALOG_TEXT_HANDLE_OFFSET, 0x5566_7788,
+        ).unwrap();
+        let original_dialog = ppc_memory_read_bytes(
+            &mut loaded.memory, window, crate::dialog_manager::DIALOG_PUBLIC_RECORD_SIZE,
+        ).unwrap();
         let mut palette_resource = vec![0xbb; 32];
         palette_resource[..2].copy_from_slice(&1u16.to_be_bytes());
         palette_resource[16..22].copy_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
@@ -172,13 +242,14 @@ use super::*;
             assert_eq!(loaded.memory.read_u8(palette + offset), Some(0));
         }
         assert_eq!(
-            loaded.toolbox_startup.port_palettes.get(&window).map(|entry| entry.0),
-            Some(palette_handle)
+            ppc_memory_read_bytes(
+                &mut loaded.memory, window, crate::dialog_manager::DIALOG_PUBLIC_RECORD_SIZE,
+            ),
+            Some(original_dialog)
         );
-        assert_eq!(
-            loaded.toolbox_startup.port_palettes.get(&window).map(|entry| entry.1),
-            Some(1)
-        );
+        loaded.cpu.gpr[3] = window;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::GetPalette);
+        assert_eq!(loaded.cpu.gpr[3], 0);
     }
 
     #[test]
@@ -1379,6 +1450,25 @@ use super::*;
             .event_queue
             .iter()
             .any(|event| event.what == 6 && event.message == window_ptr));
+
+        // A mode change still installs the palette's colors. With background
+        // updates enabled, only the other visible window requests a redraw.
+        let back_window = PPC_DATA_BASE + 0x4000;
+        loaded.memory.add_region(back_window, vec![0; PPC_CGRAF_PORT_SIZE as usize]);
+        loaded.memory.write_u8(back_window + PPC_CWINDOW_VISIBLE_OFFSET, 1).unwrap();
+        loaded.toolbox_startup.port_palettes.insert(back_window, (palette_handle, 0));
+        loaded.window_list.push(back_window);
+        loaded.event_queue.clear();
+        loaded.cpu.gpr[3] = palette_handle;
+        loaded.cpu.gpr[4] = 0xa000;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::SetPaletteUpdates);
+        assert!(loaded.event_queue.is_empty());
+        loaded.memory.write_u16_be(palette_ptr + 16, 0x4321).unwrap();
+        loaded.cpu.gpr[3] = window_ptr;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::ActivatePalette);
+        assert_eq!(loaded.screen_clut[1][0], 0x4321);
+        assert!(loaded.event_queue.iter().any(|event| event.what == 6 && event.message == back_window));
+        assert!(!loaded.event_queue.iter().any(|event| event.what == 6 && event.message == window_ptr));
     }
 
     #[test]

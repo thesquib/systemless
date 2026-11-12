@@ -3294,6 +3294,10 @@ impl FixtureRunner {
         self.bus.write_word(0x082E, h as u16);
         self.bus.write_word(0x0830, v as u16);
         self.bus.write_word(0x0832, h as u16);
+        crate::cursor_manager::sync_classic_cursor_device(
+            &mut self.bus,
+            &self.dispatcher.input_state,
+        );
     }
 
     /// Sync mouse button + position low-memory globals from internal state.
@@ -3699,21 +3703,19 @@ impl FixtureRunner {
         let data_fork = self
             .dispatcher
             .vfs
-            .get(path)
-            .map(|bytes| bytes.as_slice())
-            .unwrap_or(&[]);
+            .get_shared(path)
+            .map_or_else(|| vfs_fork_hash(&[]), |bytes| bytes.content_hash());
         let resource_fork = self
             .dispatcher
             .vfs_rsrc
-            .get(path)
-            .map(|bytes| bytes.as_slice())
-            .unwrap_or(&[]);
+            .get_shared(path)
+            .map_or_else(|| vfs_fork_hash(&[]), |bytes| bytes.content_hash());
         Some(VfsFileSummary {
             path: stat.path,
             data_len: stat.data_len,
             resource_len: stat.resource_len,
-            data_hash: vfs_fork_hash(data_fork),
-            resource_hash: vfs_fork_hash(resource_fork),
+            data_hash: data_fork,
+            resource_hash: resource_fork,
             file_type: stat.file_type,
             creator: stat.creator,
             finder_flags: stat.finder_flags,
@@ -10705,7 +10707,7 @@ impl FixtureRunner {
     }
 
     fn ppc_host_row_bytes(width: u32, depth: u32) -> Option<u32> {
-        if !matches!(depth, 1 | 2 | 4 | 8 | 16) {
+        if !matches!(depth, 1 | 2 | 4 | 8 | 16 | 32) {
             return None;
         }
         width.checked_mul(depth)?.checked_add(7)?.checked_div(8)
@@ -11026,10 +11028,25 @@ impl FixtureRunner {
         let Some(percent) = percent else {
             return;
         };
+        let percent = percent.clamp(0, 100) as u32;
+        if depth == 32 {
+            let color = zero_color.unwrap_or(PpcRgbColor {
+                red: 0,
+                green: 0,
+                blue: 0,
+            });
+            let zero = [color.red, color.green, color.blue].map(|c| (u32::from(c) + 128) / 257);
+            for pixel in row.chunks_exact_mut(4) {
+                for (component, zero) in pixel[1..].iter_mut().zip(zero) {
+                    *component =
+                        ((u32::from(*component) * percent + zero * (100 - percent) + 50) / 100) as u8;
+                }
+            }
+            return;
+        }
         if depth != 16 {
             return;
         }
-        let percent = percent.clamp(0, 100) as u32;
         if percent == 100 && zero_color.is_none() {
             return;
         }
@@ -11188,7 +11205,7 @@ impl FixtureRunner {
         let (pixel_type, component_count, component_size, gdevice_type) = if depth <= 8 {
             (0, 1, depth, 0)
         } else {
-            (16, 3, 5, 2)
+            (16, 3, if depth == 32 { 8 } else { 5 }, 2)
         };
         self.bus.write_word(pixmap + 30, pixel_type);
         self.bus.write_word(pixmap + 32, depth);
@@ -11941,6 +11958,10 @@ impl FixtureRunner {
             // mechanism works"; Inside Macintosh Volume V (1986), V-365.
             let position = ((mouse >> 16) as i16, mouse as i16);
             self.dispatcher.input_state.set_mouse_position(position);
+            crate::cursor_manager::sync_classic_cursor_device(
+                &mut self.bus,
+                &self.dispatcher.input_state,
+            );
             self.pending_guest_cursor_warp = Some(position);
         }
     }

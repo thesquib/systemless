@@ -3781,6 +3781,30 @@ fn hle_import_runner_backpat_and_backpixpat_install_fill_patterns() {
 }
 
 #[test]
+fn rectangle_intersection_does_not_snapshot_unrelated_handles() {
+    let pef = synthetic_pef_with_import(b"SectRect");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    for _ in 0..64 {
+        assert_ne!(loaded.process_memory_manager.0.borrow_mut()
+            .new_native_handle(&mut loaded.memory, 32, true), 0);
+    }
+    let rect = PPC_HEAP_BASE + 0x18000;
+    loaded.memory.add_region(rect, vec![0; 16]);
+    ppc_write_rect(&mut loaded.memory, rect, 0, 0, 20, 20).unwrap();
+    ppc_write_rect(&mut loaded.memory, rect + 8, 10, 5, 30, 40).unwrap();
+    loaded.cpu.gpr[3] = rect;
+    loaded.cpu.gpr[4] = rect + 8;
+    loaded.cpu.gpr[5] = rect;
+    let snapshots = super::super::dispatch_imports::handle_snapshot_count;
+    let before = snapshots();
+    let probe = loaded.run_with_hle_imports(64);
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], 1);
+    assert_eq!(ppc_read_rect(&mut loaded.memory, rect), Some((10, 5, 20, 20)));
+    assert_eq!(snapshots(), before);
+}
+
+#[test]
 fn hle_import_runner_handles_set_rect() {
     let pef = synthetic_pef_with_import(b"SetRect");
     let mut loaded = load_pef_application(&pef).unwrap();
@@ -6079,6 +6103,71 @@ fn classic_port_drawing_is_visible_without_a_quartz_flush() {
 }
 
 #[test]
+fn qd_global_black_weak_import_copies_live_pattern_and_guards_destination() {
+    for library in ["InterfaceLib", "CarbonLib"] {
+        for symbol in ["GetQDGlobalsBlack", "getqdglobalsblack"] {
+            let loader = synthetic_loader_with_symbol_class(
+                library.as_bytes(),
+                symbol.as_bytes(),
+                0x82,
+                &[run_reloc(0x23, 1)],
+            );
+            let mut loaded = load_pef_application(&synthetic_pef_with_loader(loader)).unwrap();
+            let target = PpcImportDispatcherTarget::GetQDGlobalsBlack;
+            assert!(loaded.imports[0].weak);
+            assert_ne!(loaded.imports[0].address, 0);
+            assert_eq!(loaded.imports[0].dispatcher_target, target);
+            let destination = PPC_DATA_BASE + 0x2400;
+            loaded.memory.add_region(destination - 1, vec![0xA5; 10]);
+            loaded.cpu.gpr[3] = destination;
+            run_test_import(&mut loaded, target.clone());
+            assert_eq!(loaded.cpu.gpr[3], destination);
+            assert_eq!(
+                ppc_memory_read_bytes(&mut loaded.memory, destination, 8),
+                Some(vec![0xff; 8])
+            );
+            let globals = PPC_DATA_BASE + 0x2800;
+            loaded.memory.add_region(globals - 126, vec![0; 130]);
+            loaded.cpu.gpr[3] = globals;
+            run_test_import(&mut loaded, PpcImportDispatcherTarget::InitGraf);
+            assert_eq!(
+                ppc_memory_read_bytes(&mut loaded.memory, globals - 16, 8),
+                Some(vec![0xff; 8])
+            );
+            let pattern = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+            loaded.memory.write_bytes(globals - 16, &pattern).unwrap();
+            loaded.cpu.gpr[3] = destination;
+            run_test_import(&mut loaded, target.clone());
+            assert_eq!(loaded.cpu.gpr[3], destination);
+            assert_eq!(
+                ppc_memory_read_bytes(&mut loaded.memory, destination, 8),
+                Some(pattern.to_vec())
+            );
+            assert_eq!(loaded.memory.read_u8(destination - 1), Some(0xA5));
+            assert_eq!(loaded.memory.read_u8(destination + 8), Some(0xA5));
+            // Reading precedes writing even when caller and global overlap.
+            loaded.cpu.gpr[3] = globals - 15;
+            run_test_import(&mut loaded, target.clone());
+            assert_eq!(
+                ppc_memory_read_bytes(&mut loaded.memory, globals - 15, 8),
+                Some(pattern.to_vec())
+            );
+            let short = 0x70000000;
+            loaded.memory.add_region(short, vec![0x5A; 7]);
+            for invalid in [0, short, u32::MAX - 3] {
+                loaded.cpu.gpr[3] = invalid;
+                run_test_import(&mut loaded, target.clone());
+                assert_eq!(loaded.cpu.gpr[3], 0);
+            }
+            assert_eq!(
+                ppc_memory_read_bytes(&mut loaded.memory, short, 7),
+                Some(vec![0x5A; 7])
+            );
+        }
+    }
+}
+
+#[test]
 fn qd_global_white_weak_import_copies_live_pattern_and_guards_destination() {
     for library in ["InterfaceLib", "CarbonLib"] {
         for symbol in ["GetQDGlobalsWhite", "getqdglobalswhite"] {
@@ -7747,5 +7836,424 @@ fn rectangular_boolean_imports_allow_either_source_as_destination() {
             assert_eq!(loaded.last_mem_error(), PPC_NO_ERR);
             assert_eq!(ppc_region_storage(&mut loaded.memory, handles[destination]), Some(expected));
         }
+    }
+}
+
+#[test]
+fn eraserect_uses_live_color_background_with_clipping_and_port_phase() {
+    for depth in [8, 16] {
+        let mut loaded = load_pef_application_with_config(
+            &synthetic_pef_with_import(b"EraseRect"),
+            PpcLoadConfig {
+                screen_depth: depth,
+                ..PpcLoadConfig::default()
+            },
+        )
+        .unwrap();
+        let scratch = PPC_DATA_BASE + 0x5000;
+        loaded.memory.add_region(scratch, vec![0; 0x1000]);
+        let pattern = make_test_ppc_raw_color_pixpat_handle(&mut loaded.memory, scratch);
+        let ctable = loaded.memory.read_u32_be(PPC_MAIN_CTABLE_HANDLE).unwrap();
+        for (index, rgb) in [
+            (7u32, [0x1111u16, 0, 0]),
+            (8, [0, 0x2222, 0]),
+            (9, [0, 0, 0x3333]),
+        ] {
+            for channel in 0..3 {
+                loaded
+                    .memory
+                    .write_u16_be(
+                        ctable + 8 + index * 8 + 2 + channel as u32 * 2,
+                        rgb[channel],
+                    )
+                    .unwrap();
+            }
+        }
+        loaded.screen_clut.with_mut(|clut| {
+            clut[7] = [0x1111, 0, 0];
+            clut[8] = [0, 0x2222, 0];
+            clut[9] = [0, 0, 0x3333];
+        });
+        loaded.cpu.gpr[3] = pattern;
+        run_test_import(
+            &mut loaded,
+            PpcImportDispatcherTarget::QuickDrawCompatibility(
+                PpcQuickDrawCompatibilityOperation::BackPixPat,
+            ),
+        );
+        ppc_set_port_origin(&mut loaded.memory, PPC_MAIN_GWORLD, -1, -1).unwrap();
+        let clip = loaded
+            .memory
+            .read_u32_be(PPC_MAIN_GWORLD + PPC_CGRAF_PORT_CLIP_RGN_OFFSET)
+            .unwrap();
+        ppc_write_rgn_bbox(&mut loaded.memory, clip, 0, 0, 2, 2).unwrap();
+        let front =
+            ppc_live_quickdraw_surface(&mut loaded.memory, &loaded.gworlds, PPC_MAIN_GWORLD)
+                .unwrap()
+                .front_buffer;
+        for y in 0..4 {
+            for x in 0..4 {
+                ppc_quickdraw_write_raw_pixel(&mut loaded.memory, front, (x, y), 17);
+            }
+        }
+        loaded.cpu.gpr[3] = 10;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::PenMode);
+        loaded.toolbox_startup.quickdraw_pen_pattern = [0x33; 8];
+        for (left, right) in [(-1, 1), (1, 3)] {
+            ppc_write_rect(&mut loaded.memory, scratch + 0x200, -1, left, 3, right).unwrap();
+            loaded.cpu.gpr[3] = scratch + 0x200;
+            run_test_import(&mut loaded, PpcImportDispatcherTarget::EraseRect);
+        }
+        let colors = if depth == 8 {
+            [7, 8, 9]
+        } else {
+            [0x0800, 0x0080, 0x0006]
+        };
+        for y in 0..4 {
+            for x in 0..4 {
+                let expected = match (x, y) {
+                    (1, 1) => colors[0],
+                    (2, 1) | (2, 2) => colors[1],
+                    (1, 2) => colors[2],
+                    _ => 17,
+                };
+                assert_eq!(
+                    ppc_quickdraw_read_pixel(&mut loaded.memory, front, (x, y)),
+                    Some(expected),
+                    "depth={depth} ({x},{y})"
+                );
+            }
+        }
+        assert_eq!(loaded.toolbox_startup.quickdraw_pen_pattern, [0x33; 8]);
+        assert_eq!(loaded.memory.read_u16_be(PPC_MAIN_GWORLD + 56), Some(10));
+    }
+}
+
+#[test]
+fn eraserect_uses_backpat_and_mono_pixpat_at_every_supported_depth() {
+    for depth in [1, 2, 4, 8, 16] {
+        for pixpat in [false, true] {
+            let mut loaded = load_pef_application_with_config(
+                &synthetic_pef_with_import(b"EraseRect"),
+                PpcLoadConfig {
+                    screen_depth: depth,
+                    ..PpcLoadConfig::default()
+                },
+            )
+            .unwrap();
+            let scratch = PPC_DATA_BASE + 0x5000;
+            loaded.memory.add_region(scratch, vec![0; 0x400]);
+            let pattern = [0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55];
+            if pixpat {
+                loaded.memory.write_u32_be(scratch, scratch + 16).unwrap();
+                loaded.memory.write_bytes(scratch + 36, &pattern).unwrap();
+            } else {
+                loaded.memory.write_bytes(scratch, &pattern).unwrap();
+            }
+            loaded.cpu.gpr[3] = scratch;
+            run_test_import(
+                &mut loaded,
+                PpcImportDispatcherTarget::QuickDrawCompatibility(if pixpat {
+                    PpcQuickDrawCompatibilityOperation::BackPixPat
+                } else {
+                    PpcQuickDrawCompatibilityOperation::BackPat
+                }),
+            );
+            ppc_set_port_origin(&mut loaded.memory, PPC_MAIN_GWORLD, -1, -1).unwrap();
+            let clip = loaded
+                .memory
+                .read_u32_be(PPC_MAIN_GWORLD + PPC_CGRAF_PORT_CLIP_RGN_OFFSET)
+                .unwrap();
+            ppc_write_rgn_bbox(&mut loaded.memory, clip, 0, 0, 2, 2).unwrap();
+            let front =
+                ppc_live_quickdraw_surface(&mut loaded.memory, &loaded.gworlds, PPC_MAIN_GWORLD)
+                    .unwrap()
+                    .front_buffer;
+            let sentinel = if depth == 16 { 0x1234 } else { 1 };
+            for y in 0..4 {
+                for x in 0..4 {
+                    ppc_quickdraw_write_raw_pixel(&mut loaded.memory, front, (x, y), sentinel);
+                }
+            }
+            ppc_write_rect(&mut loaded.memory, scratch + 0x200, -1, -1, 3, 3).unwrap();
+            loaded.cpu.gpr[3] = scratch + 0x200;
+            run_test_import(&mut loaded, PpcImportDispatcherTarget::EraseRect);
+            let black = if depth == 16 { 0 } else { (1u16 << depth) - 1 };
+            let white = if depth == 16 { 0x7fff } else { 0 };
+            for y in 0..4 {
+                for x in 0..4 {
+                    let expected = if !(1..3).contains(&x) || !(1..3).contains(&y) {
+                        sentinel
+                    } else if (x + y) % 2 == 0 {
+                        black
+                    } else {
+                        white
+                    };
+                    assert_eq!(
+                        ppc_quickdraw_read_pixel(&mut loaded.memory, front, (x, y)),
+                        Some(expected),
+                        "depth={depth} pixpat={pixpat} ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ppc_hsl2rgb_supports_overlapping_buffers_and_preserves_neighbors() {
+    let mut memory = PpcSectionMem::new();
+    memory.add_region(0x2000, vec![0x5a; 16]);
+    for destination in [0x2002, 0x2004, 0x2008] {
+        memory.write_u16_be(0x2002, 0x5555).unwrap();
+        memory.write_u16_be(0x2004, 0xffff).unwrap();
+        memory.write_u16_be(0x2006, 0x7fff).unwrap();
+        assert!(ppc_hsl2rgb(&mut memory, 0x2002, destination));
+        for (offset, value) in [(0, 0), (2, 0xfffe), (4, 0)] {
+            assert_eq!(memory.read_u16_be(destination + offset), Some(value));
+        }
+        assert_eq!(memory.read_u16_be(0x2000), Some(0x5a5a));
+        assert_eq!(memory.read_u16_be(0x200e), Some(0x5a5a));
+    }
+}
+
+#[test]
+fn ppc_hsl2rgb_rejects_invalid_buffers_without_partial_writes() {
+    let mut memory = PpcSectionMem::new();
+    memory.add_region(0x2000, vec![0x5a; 16]);
+    for (source, destination) in [
+        (0, 0x2008),
+        (0x2000, 0),
+        (u32::MAX - 2, 0x2008),
+        (0x2000, u32::MAX - 2),
+        (0x200c, 0x2008),
+        (0x2000, 0x200c),
+    ] {
+        assert!(!ppc_hsl2rgb(&mut memory, source, destination));
+        for offset in (0..16).step_by(2) {
+            assert_eq!(memory.read_u16_be(0x2000 + offset), Some(0x5a5a));
+        }
+    }
+}
+
+#[test]
+fn ppc_hsl2rgb_import_dispatches_and_preserves_argument_registers() {
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(b"HSL2RGB")).unwrap();
+    assert_eq!(
+        loaded.imports[0].dispatcher_target,
+        PpcImportDispatcherTarget::HSL2RGB
+    );
+    let color = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(color, vec![0x5a; 10]);
+    loaded.memory.write_u16_be(color + 2, 0xaaaa).unwrap();
+    loaded.memory.write_u16_be(color + 4, 0xffff).unwrap();
+    loaded.memory.write_u16_be(color + 6, 0x7fff).unwrap();
+    loaded.cpu.gpr[3] = color + 2;
+    loaded.cpu.gpr[4] = color + 2;
+    loaded.cpu.gpr[5] = 0x12345678;
+    let stack = loaded.cpu.gpr[1];
+    run_test_import(&mut loaded, PpcImportDispatcherTarget::HSL2RGB);
+    assert_eq!(loaded.cpu.gpr[1], stack);
+    assert_eq!(loaded.cpu.gpr[3], color + 2);
+    assert_eq!(loaded.cpu.gpr[4], color + 2);
+    assert_eq!(loaded.cpu.gpr[5], 0x12345678);
+    assert_eq!(loaded.memory.read_u16_be(color), Some(0x5a5a));
+    assert_eq!(loaded.memory.read_u16_be(color + 2), Some(0));
+    assert_eq!(loaded.memory.read_u16_be(color + 4), Some(0));
+    assert_eq!(loaded.memory.read_u16_be(color + 6), Some(0xfffe));
+    assert_eq!(loaded.memory.read_u16_be(color + 8), Some(0x5a5a));
+}
+
+#[test]
+fn color_pixpat_fill_batches_clipped_intervals_without_touching_neighbors() {
+    use crate::memory::write_log;
+
+    for depth in [8, 16] {
+        let mut loaded = load_pef_application_with_config(
+            &synthetic_pef_with_import(b"FillCRgn"),
+            PpcLoadConfig {
+                screen_depth: depth,
+                ..PpcLoadConfig::default()
+            },
+        )
+        .unwrap();
+        let colors = [[0x1111, 0, 0], [0, 0x2222, 0], [0, 0, 0x3333]];
+        let ctable = loaded.memory.read_u32_be(PPC_MAIN_CTABLE_HANDLE).unwrap();
+        for (i, color) in colors.iter().enumerate() {
+            let index = 7 + i as u32;
+            for (component, value) in color.iter().enumerate() {
+                loaded
+                    .memory
+                    .write_u16_be(ctable + 8 + index * 8 + 2 + component as u32 * 2, *value)
+                    .unwrap();
+            }
+            loaded
+                .screen_clut
+                .with_mut(|clut| clut[index as usize] = *color);
+        }
+        let scratch = PPC_DATA_BASE + 0x5000;
+        loaded.memory.add_region(scratch, vec![0; 0x1000]);
+        let pattern = make_test_ppc_raw_color_pixpat_handle(&mut loaded.memory, scratch);
+        for (offset, rows) in [
+            (0x300, vec![vec![0, 8], vec![1, 7]]),
+            (0x500, vec![vec![1, 3, 5, 8], vec![0, 6]]),
+        ] {
+            let handle = scratch + offset;
+            loaded.memory.write_u32_be(handle, handle + 16).unwrap();
+            loaded
+                .memory
+                .write_bytes(
+                    handle + 16,
+                    &ppc_region_storage_from_rows(0, &rows).unwrap(),
+                )
+                .unwrap();
+        }
+        loaded
+            .memory
+            .write_u32_be(
+                PPC_MAIN_GWORLD + PPC_CGRAF_PORT_CLIP_RGN_OFFSET,
+                scratch + 0x500,
+            )
+            .unwrap();
+        let front =
+            ppc_live_quickdraw_surface(&mut loaded.memory, &loaded.gworlds, PPC_MAIN_GWORLD)
+                .unwrap()
+                .front_buffer;
+        for y in 0..3 {
+            for x in 0..10 {
+                assert!(ppc_quickdraw_write_raw_pixel(
+                    &mut loaded.memory,
+                    front,
+                    (x, y),
+                    42
+                ));
+            }
+        }
+        loaded.cpu.gpr[3] = scratch + 0x300;
+        loaded.cpu.gpr[4] = pattern;
+        write_log::start();
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::FillCRgn);
+        let writes = write_log::take();
+        let pixel_values = if depth == 8 {
+            [7, 8, 9]
+        } else {
+            [0x0800, 0x0080, 0x0006]
+        };
+        for y in 0..3 {
+            for x in 0..10 {
+                let filled = (y == 0 && ((1..3).contains(&x) || (5..8).contains(&x)))
+                    || (y == 1 && (1..6).contains(&x));
+                let tile = if y % 2 == 0 {
+                    [0, 1, 2, 1]
+                } else {
+                    [2, 1, 0, 1]
+                };
+                let expected = if filled {
+                    pixel_values[tile[x as usize % 4]]
+                } else {
+                    42
+                };
+                assert_eq!(
+                    ppc_quickdraw_read_pixel(&mut loaded.memory, front, (x, y)),
+                    Some(expected),
+                    "depth={depth} x={x} y={y}"
+                );
+            }
+        }
+        let bytes = depth as usize / 8;
+        let framebuffer_writes: Vec<_> = writes
+            .into_iter()
+            .filter(|(a, _)| {
+                *a >= front.base_addr && *a < front.base_addr + front.row_bytes * front.height
+            })
+            .collect();
+        assert_eq!(
+            framebuffer_writes,
+            vec![
+                (front.base_addr + bytes as u32, 2 * bytes),
+                (front.base_addr + 5 * bytes as u32, 3 * bytes),
+                (front.base_addr + front.row_bytes + bytes as u32, 5 * bytes),
+            ],
+            "one presentation-aware store per clipped interval, depth={depth}"
+        );
+    }
+}
+
+#[test]
+fn color_pixpat_fill_preserves_valid_pixels_around_an_unmapped_gap() {
+    let mut loaded = load_pef_application_with_config(
+        &synthetic_pef_with_import(b"FillCRect"),
+        PpcLoadConfig {
+            screen_depth: 16,
+            ..PpcLoadConfig::default()
+        },
+    )
+    .unwrap();
+    let scratch = PPC_DATA_BASE + 0x5000;
+    loaded.memory.add_region(scratch, vec![0; 0x1000]);
+    let pattern = make_test_ppc_raw_color_pixpat_handle(&mut loaded.memory, scratch);
+    let base = loaded.memory.mapping_holes(0x4000_0000, 0x7000_0000)
+        .into_iter().find(|(start, end)| end - start >= 16)
+        .expect("fixture needs an unmapped span").0;
+    loaded.memory.add_region(base, vec![0; 10]);
+    loaded.memory.add_region(base + 12, vec![0; 4]);
+    loaded.memory.write_u32_be(PPC_MAIN_PIXMAP, base).unwrap();
+    assert_eq!(
+        loaded.memory.read_u16_be(base + 10),
+        None,
+        "fixture gap must be unmapped before drawing"
+    );
+    assert!(ppc_fill_color_rect(
+        &mut loaded.memory,
+        &loaded.gworlds,
+        PPC_MAIN_GWORLD,
+        (0, 0, 1, 8),
+        pattern,
+        PPC_RGB_BLACK,
+        None,
+        PPC_RGB_WHITE,
+        None,
+    ));
+    let front = ppc_live_quickdraw_surface(&mut loaded.memory, &loaded.gworlds, PPC_MAIN_GWORLD)
+        .unwrap()
+        .front_buffer;
+    assert_eq!(front.base_addr, base);
+    let values = [0x0800, 0x0080, 0x0006, 0x0080];
+    for x in 0..8 {
+        assert_eq!(
+            ppc_quickdraw_read_pixel(&mut loaded.memory, front, (x, 0)),
+            if x == 5 {
+                None
+            } else {
+                Some(values[x as usize % 4])
+            },
+            "x={x}"
+        );
+    }
+}
+
+#[test]
+fn opening_ports_publishes_current_port_to_qd_globals() {
+    for target in [
+        PpcImportDispatcherTarget::OpenPort,
+        PpcImportDispatcherTarget::OpenCPort,
+    ] {
+        let pef = synthetic_pef_with_import(b"InitGraf");
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let globals = PPC_DATA_BASE + 0x2000;
+        let port = PPC_DATA_BASE + 0x3000;
+        loaded.memory.add_region(globals - 126, vec![0; 130]);
+        loaded
+            .memory
+            .add_region(port, vec![0; PPC_CGRAF_PORT_SIZE as usize]);
+        loaded.cpu.gpr[3] = globals;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::InitGraf);
+        loaded.cpu.gpr[3] = port;
+        run_test_import(&mut loaded, target);
+        // Both the accessor and the direct application global must agree.
+        loaded.cpu.gpr[3] = globals - 126;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::GetPort);
+        assert_eq!(loaded.memory.read_u32_be(globals - 126), Some(port));
+        assert_eq!(loaded.memory.read_u32_be(globals), Some(port));
     }
 }

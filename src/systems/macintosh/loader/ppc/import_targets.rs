@@ -80,6 +80,9 @@ pub enum PpcImportDispatcherTarget {
     PurgeMemSys,
     MemError,
     CurResFile,
+    LMGetCurMap,
+    LMSetCurMap,
+    LMSetResErr,
     UseResFile,
     CloseResFile,
     OpenResFile,
@@ -95,11 +98,14 @@ pub enum PpcImportDispatcherTarget {
     Get1Resource,
     GetNamedResource,
     Get1NamedResource,
+    GetNamedResourceCString,
+    Get1NamedResourceCString,
     GetIndResource,
     Get1IndResource,
     GetResAttrs,
     SetResAttrs,
     GetResInfo,
+    GetResInfoCString,
     GetResourceSizeOnDisk,
     SetResInfo,
     HomeResFile,
@@ -153,6 +159,7 @@ pub enum PpcImportDispatcherTarget {
     InitCursor,
     GetQDGlobalsArrow,
     GetQDGlobalsScreenBits,
+    GetQDGlobalsBlack,
     GetQDGlobalsWhite,
     GetQDGlobalsGray,
     ApplyThemeBackground,
@@ -190,6 +197,7 @@ pub enum PpcImportDispatcherTarget {
     PmBackColor,
     Color2Index,
     Index2Color,
+    HSL2RGB,
     RGB2HSL,
     RGB2HSV,
     HSV2RGB,
@@ -346,6 +354,8 @@ pub enum PpcImportDispatcherTarget {
     ActivatePalette,
     NSetPalette,
     GetPalette,
+    SetPaletteUpdates,
+    GetPaletteUpdates,
     GetPort,
     GetQDGlobalsThePort,
     GetPortPixMap,
@@ -355,6 +365,7 @@ pub enum PpcImportDispatcherTarget {
     SetPort,
     GetGDevice,
     SetGDevice,
+    GDeviceChanged,
     GetDeviceList,
     GetNextDevice,
     GetMainDevice,
@@ -366,7 +377,6 @@ pub enum PpcImportDispatcherTarget {
     GetFontName,
     GetFontNameC,
     SetMemErr,
-    SetResErr,
     ScreenRes,
     GetFNumC,
     StringWidthC,
@@ -881,6 +891,7 @@ pub enum PpcImportDispatcherTarget {
     LMGetUTableBase,
     SecondsToDate,
     Microseconds,
+    GetTimeBaseInfo,
     AbsoluteToNanoseconds,
     NanosecondsToAbsolute,
     AddAbsoluteToAbsolute,
@@ -1351,6 +1362,7 @@ pub enum PpcImportDispatcherTarget {
     ISpElementGetConfigurationInfo,
     ISpElementGetSimpleState,
     ISpGetVersion,
+    ISpTimeToMicroseconds,
     ISpStartup,
     ISpShutdown,
     ISpInit,
@@ -1366,6 +1378,7 @@ pub enum PpcImportDispatcherTarget {
     QtEndFullScreen,
     QtEnterMovies,
     QtAlignScreenRect,
+    QtAlignWindow,
     QtExitMovies,
     QtGetMoviesError,
     QtGetMoviesStickyError,
@@ -1610,6 +1623,10 @@ pub(crate) fn dispatcher_target_for_import(
     library_name: &str,
     symbol_name: &str,
 ) -> PpcImportDispatcherTarget {
+    if library_name == "CarbonLib" && matches!(symbol_name, "LMSetCurMap" | "LMGetFCBSPtr") {
+        // LowMem.h declares these accessors only for non-Carbon CFM.
+        return PpcImportDispatcherTarget::Unsupported;
+    }
     // CarbonLib also exports the MathLib (fp.h) entry points with the same
     // PowerPC floating-point ABI. A CarbonLib symbol that InterfaceLib does
     // not implement resolves through MathLib when MathLib implements it.
@@ -2902,7 +2919,6 @@ pub(crate) fn dispatcher_target_for_import(
             PpcFileCompatibilityOperation::PbHGetVolSync,
         ),
         ("InterfaceLib", "LMSetMemErr") => PpcImportDispatcherTarget::SetMemErr,
-        ("InterfaceLib", "LMSetResErr") => PpcImportDispatcherTarget::SetResErr,
         ("InterfaceLib", "ScreenRes") => PpcImportDispatcherTarget::ScreenRes,
         ("InterfaceLib", "LMGetTheGDevice") => PpcImportDispatcherTarget::GetGDevice,
         // No SCSI bus: scCommErr. No Edition, Component or Translation managers: paramErr.
@@ -3108,6 +3124,9 @@ pub(crate) fn dispatcher_target_for_import(
         ("InputSprocketLib", "ISpGetVersion") => PpcImportDispatcherTarget::ISpGetVersion,
         ("InputSprocketLib", "ISpStartup") => PpcImportDispatcherTarget::ISpStartup,
         ("InputSprocketLib", "ISpUptime") => PpcImportDispatcherTarget::Microseconds,
+        ("InputSprocketLib", "ISpTimeToMicroseconds") => {
+            PpcImportDispatcherTarget::ISpTimeToMicroseconds
+        }
         ("InputSprocketLib", "ISpShutdown") => PpcImportDispatcherTarget::ISpShutdown,
         ("InputSprocketLib", "ISpInit") => PpcImportDispatcherTarget::ISpInit,
         ("InputSprocketLib", "ISpStop") => PpcImportDispatcherTarget::ISpStop,
@@ -3241,13 +3260,16 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "TempMaxMem") => PpcImportDispatcherTarget::TempMaxMem,
         ("InterfaceLib", "TempTopMem") => PpcImportDispatcherTarget::TempTopMem,
         ("InterfaceLib", "MemError" | "LMGetMemErr") => PpcImportDispatcherTarget::MemError,
-        ("InterfaceLib", "CurResFile" | "LMGetCurMap") => PpcImportDispatcherTarget::CurResFile,
-        ("InterfaceLib", "UseResFile" | "LMSetCurMap") => PpcImportDispatcherTarget::UseResFile,
+        ("InterfaceLib", "CurResFile") => PpcImportDispatcherTarget::CurResFile,
+        ("InterfaceLib", "LMGetCurMap") => PpcImportDispatcherTarget::LMGetCurMap,
+        ("InterfaceLib", "LMSetCurMap") => PpcImportDispatcherTarget::LMSetCurMap,
+        ("InterfaceLib", "UseResFile") => PpcImportDispatcherTarget::UseResFile,
         ("InterfaceLib", "CloseResFile") => PpcImportDispatcherTarget::CloseResFile,
         ("InterfaceLib", "OpenResFile") => PpcImportDispatcherTarget::OpenResFile,
         ("InterfaceLib", "OpenRFPerm") => PpcImportDispatcherTarget::OpenRFPerm,
         ("InterfaceLib", "HOpenResFile") => PpcImportDispatcherTarget::HOpenResFile,
         ("InterfaceLib", "ResError" | "LMGetResErr") => PpcImportDispatcherTarget::ResError,
+        ("InterfaceLib", "LMSetResErr") => PpcImportDispatcherTarget::LMSetResErr,
         ("InterfaceLib", "SetResLoad" | "LMSetResLoad") => PpcImportDispatcherTarget::SetResLoad,
         ("InterfaceLib", "LMGetResLoad") => PpcImportDispatcherTarget::LMGetResLoad,
         ("InterfaceLib", "LoadResource") => PpcImportDispatcherTarget::LoadResource,
@@ -3258,12 +3280,15 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "GetResource") => PpcImportDispatcherTarget::GetResource,
         ("InterfaceLib", "Get1Resource") => PpcImportDispatcherTarget::Get1Resource,
         ("InterfaceLib", "GetNamedResource") => PpcImportDispatcherTarget::GetNamedResource,
+        ("InterfaceLib", "getnamedresource") => PpcImportDispatcherTarget::GetNamedResourceCString,
+        ("InterfaceLib", "get1namedresource") => PpcImportDispatcherTarget::Get1NamedResourceCString,
         ("InterfaceLib", "Get1NamedResource") => PpcImportDispatcherTarget::Get1NamedResource,
         ("InterfaceLib", "GetIndResource") => PpcImportDispatcherTarget::GetIndResource,
         ("InterfaceLib", "Get1IndResource") => PpcImportDispatcherTarget::Get1IndResource,
         ("InterfaceLib", "GetResAttrs") => PpcImportDispatcherTarget::GetResAttrs,
         ("InterfaceLib", "SetResAttrs") => PpcImportDispatcherTarget::SetResAttrs,
         ("InterfaceLib", "GetResInfo") => PpcImportDispatcherTarget::GetResInfo,
+        ("InterfaceLib", "getresinfo") => PpcImportDispatcherTarget::GetResInfoCString,
         ("InterfaceLib", "GetResourceSizeOnDisk")
         | ("InterfaceLib", "GetMaxResourceSize")
         | ("InterfaceLib", "MaxSizeRsrc")
@@ -3328,6 +3353,9 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib" | "CarbonLib", "GetQDGlobalsScreenBits" | "getqdglobalsscreenbits") => {
             PpcImportDispatcherTarget::GetQDGlobalsScreenBits
         }
+        ("InterfaceLib" | "CarbonLib", "GetQDGlobalsBlack" | "getqdglobalsblack") => {
+            PpcImportDispatcherTarget::GetQDGlobalsBlack
+        }
         ("InterfaceLib" | "CarbonLib", "GetQDGlobalsWhite" | "getqdglobalswhite") => {
             PpcImportDispatcherTarget::GetQDGlobalsWhite
         }
@@ -3362,8 +3390,12 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "HideCursor") => PpcImportDispatcherTarget::HideCursor,
         ("InterfaceLib", "ShowCursor") => PpcImportDispatcherTarget::ShowCursor,
         ("InterfaceLib", "ShieldCursor") => PpcImportDispatcherTarget::ShieldCursor,
-        ("InterfaceLib", "CrsrDevNextDevice") => PpcImportDispatcherTarget::CrsrDevNextDevice,
-        ("InterfaceLib", "CrsrDevMoveTo") => PpcImportDispatcherTarget::CrsrDevMoveTo,
+        ("InterfaceLib", "CrsrDevNextDevice" | "CursorDeviceNextDevice") => {
+            PpcImportDispatcherTarget::CrsrDevNextDevice
+        }
+        ("InterfaceLib", "CrsrDevMoveTo" | "CursorDeviceMoveTo") => {
+            PpcImportDispatcherTarget::CrsrDevMoveTo
+        }
         ("InterfaceLib", "GetCursor") => PpcImportDispatcherTarget::GetCursor,
         ("InterfaceLib", "SetCursor") => PpcImportDispatcherTarget::SetCursor,
         ("InterfaceLib", "GetCCursor") => PpcImportDispatcherTarget::GetCCursor,
@@ -3394,6 +3426,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "PmBackColor") => PpcImportDispatcherTarget::PmBackColor,
         ("InterfaceLib", "Color2Index") => PpcImportDispatcherTarget::Color2Index,
         ("InterfaceLib", "Index2Color") => PpcImportDispatcherTarget::Index2Color,
+        ("InterfaceLib", "HSL2RGB") => PpcImportDispatcherTarget::HSL2RGB,
         ("InterfaceLib", "RGB2HSL") => PpcImportDispatcherTarget::RGB2HSL,
         ("InterfaceLib", "RGB2HSV") => PpcImportDispatcherTarget::RGB2HSV,
         ("InterfaceLib", "HSV2RGB") => PpcImportDispatcherTarget::HSV2RGB,
@@ -3869,6 +3902,8 @@ pub(crate) fn dispatcher_target_for_import(
             PpcImportDispatcherTarget::NSetPalette
         }
         ("InterfaceLib", "GetPalette") => PpcImportDispatcherTarget::GetPalette,
+        ("InterfaceLib", "SetPaletteUpdates") => PpcImportDispatcherTarget::SetPaletteUpdates,
+        ("InterfaceLib", "GetPaletteUpdates") => PpcImportDispatcherTarget::GetPaletteUpdates,
         ("InterfaceLib", "GetPort") => PpcImportDispatcherTarget::GetPort,
         ("InterfaceLib", "GetPortPixMap") => PpcImportDispatcherTarget::GetPortPixMap,
         ("InterfaceLib", "GetQDGlobalsThePort") => PpcImportDispatcherTarget::GetQDGlobalsThePort,
@@ -3882,6 +3917,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "SetPort") => PpcImportDispatcherTarget::SetPort,
         ("InterfaceLib", "GetGDevice") => PpcImportDispatcherTarget::GetGDevice,
         ("InterfaceLib", "SetGDevice") => PpcImportDispatcherTarget::SetGDevice,
+        ("InterfaceLib", "GDeviceChanged") => PpcImportDispatcherTarget::GDeviceChanged,
         ("InterfaceLib", "GetDeviceList") => PpcImportDispatcherTarget::GetDeviceList,
         ("InterfaceLib", "GetNextDevice") => PpcImportDispatcherTarget::GetNextDevice,
         ("InterfaceLib", "GetMainDevice") => PpcImportDispatcherTarget::GetMainDevice,
@@ -4311,11 +4347,23 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "SysBreak") => PpcImportDispatcherTarget::SystemCompatibility(
             PpcSystemCompatibilityOperation::Debugger,
         ),
+        ("InterfaceLib", "LMGetMBarHook" | "lmgetmbarhook") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetMBarHook)
+        }
+        ("InterfaceLib", "LMSetMBarHook" | "lmsetmbarhook") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetMBarHook)
+        }
+        ("InterfaceLib", "LMGetMenuHook" | "lmgetmenuhook") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetMenuHook)
+        }
         ("InterfaceLib", "LMGetROM85") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetRom85)
         }
         ("InterfaceLib", "LMGetDoubleTime") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetDoubleTime)
+        }
+        ("InterfaceLib", "LMGetFCBSPtr") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetFcbSPtr)
         }
         ("InterfaceLib", "LMGetFSFCBLen") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetFsFcbLen)
@@ -5271,6 +5319,7 @@ pub(crate) fn dispatcher_target_for_import(
         // AbsoluteTime is hardware-relative. Use the virtual microsecond
         // clock as its unit so this struct-returning call stays deterministic.
         ("InterfaceLib" | "DriverServicesLib", "UpTime") => PpcImportDispatcherTarget::Microseconds,
+        ("DriverServicesLib", "GetTimeBaseInfo") => PpcImportDispatcherTarget::GetTimeBaseInfo,
         ("InterfaceLib" | "DriverServicesLib", "AbsoluteToNanoseconds") => {
             PpcImportDispatcherTarget::AbsoluteToNanoseconds
         }
@@ -5673,6 +5722,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("QuickTimeLib", "BeginFullScreen") => PpcImportDispatcherTarget::QtBeginFullScreen,
         ("QuickTimeLib", "EndFullScreen") => PpcImportDispatcherTarget::QtEndFullScreen,
         ("QuickTimeLib", "AlignScreenRect") => PpcImportDispatcherTarget::QtAlignScreenRect,
+        ("QuickTimeLib", "AlignWindow") => PpcImportDispatcherTarget::QtAlignWindow,
         ("QuickTimeLib", "EnterMovies") => PpcImportDispatcherTarget::QtEnterMovies,
         ("QuickTimeLib", "ExitMovies") => PpcImportDispatcherTarget::QtExitMovies,
         ("QuickTimeLib", "GetMoviesError") => PpcImportDispatcherTarget::QtGetMoviesError,

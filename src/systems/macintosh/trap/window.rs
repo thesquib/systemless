@@ -3242,7 +3242,12 @@ impl super::TrapDispatcher {
         }
     }
 
-    pub(crate) fn untrack_window(&mut self, bus: &mut MacMemoryBus, window_ptr: u32) {
+    pub(crate) fn untrack_window<C: CpuOps>(
+        &mut self,
+        bus: &mut MacMemoryBus,
+        cpu: &mut C,
+        window_ptr: u32,
+    ) {
         // A removed WindowRecord can be disposed or reused before the next
         // GetNextEvent. Pending activation events must no longer name it.
         // Inside Macintosh Volume I, p. I-279: disposing the active window
@@ -3297,9 +3302,11 @@ impl super::TrapDispatcher {
             self.sync_cached_front_window_render_state(bus);
         }
         if *self.current_port == window_ptr {
-            self
-                .current_port
-                .with_mut(|current_port| *current_port = self.front_window);
+            // Keep the existing front-port promotion coherent with GetPort's
+            // A5 QuickDraw global and low-memory ThePort alias. Preserve the
+            // selected device, as with an ordinary SetPort operation.
+            let device = *self.current_gdevice;
+            self.set_current_port_state(bus, cpu, self.front_window, Some(device));
         }
         self.saved_draw_old_regions.remove(&window_ptr);
     }
@@ -4503,7 +4510,7 @@ impl super::TrapDispatcher {
                 let exposed_rect = self.window_structure_rect(bus, the_window);
                 let windows_behind = self.visible_windows_behind(bus, the_window);
                 self.erase_window_for_removal(bus, the_window);
-                self.untrack_window(bus, the_window);
+                self.untrack_window(bus, cpu, the_window);
                 self.invalidate_exposed_windows(bus, &windows_behind, exposed_rect);
                 self.apply_closewindow_front_promotion_side_effects(bus, the_window, was_front);
                 cpu.write_reg(Register::A7, sp + 4);
@@ -4522,7 +4529,7 @@ impl super::TrapDispatcher {
                 let exposed_rect = self.window_structure_rect(bus, the_window);
                 let windows_behind = self.visible_windows_behind(bus, the_window);
                 self.erase_window_for_removal(bus, the_window);
-                self.untrack_window(bus, the_window);
+                self.untrack_window(bus, cpu, the_window);
                 self.invalidate_exposed_windows(bus, &windows_behind, exposed_rect);
                 self.apply_closewindow_front_promotion_side_effects(bus, the_window, was_front);
                 cpu.write_reg(Register::A7, sp + 4);
@@ -4541,8 +4548,16 @@ impl super::TrapDispatcher {
             (true, 0x11F) => {
                 let sp = cpu.read_reg(Register::A7);
                 let the_window = bus.read_long(sp);
+                // Dialog activation redraws its own contents. Ordinary windows
+                // need PaintOne for newly exposed areas, just like BringToFront
+                // (Inside Macintosh I-284, I-286, I-296).
+                let old_visible = (the_window != 0 && !self.dialog_items.contains_key(&the_window))
+                    .then(|| self.snapshot_window_visibility(bus, the_window));
                 cpu.write_reg(Register::A7, sp + 4);
                 self.activate_as_front_window(bus, the_window);
+                if let Some(old_visible) = old_visible {
+                    self.paint_newly_exposed_window(bus, cpu, the_window, old_visible, true, true);
+                }
                 Ok(())
             }
 

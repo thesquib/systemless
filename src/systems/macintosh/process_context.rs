@@ -40,7 +40,7 @@ struct ProcessMemoryRegion {
 /// `shared_handle` is reserved for
 /// installing another index over the same process fork, such as the native
 /// File Manager record and the classic VFS path map.
-pub struct ProcessForkBytes(Rc<UnsafeCell<Rc<Vec<u8>>>>);
+pub struct ProcessForkBytes(Rc<UnsafeCell<Rc<Vec<u8>>>>, Rc<Cell<Option<u64>>>);
 
 impl Default for ProcessForkBytes {
     fn default() -> Self {
@@ -54,7 +54,7 @@ impl Clone for ProcessForkBytes {
         // with_mut copies the backing bytes only if either snapshot is edited.
         // SAFETY: access is serialized by the runner, as for resource_snapshot.
         let backing = unsafe { Rc::clone(&*self.0.get()) };
-        Self(Rc::new(UnsafeCell::new(backing)))
+        Self(Rc::new(UnsafeCell::new(backing)), Rc::new(Cell::new(self.1.get())))
     }
 }
 
@@ -95,7 +95,7 @@ impl Eq for ProcessForkBytes {}
 
 impl From<Vec<u8>> for ProcessForkBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self(Rc::new(UnsafeCell::new(Rc::new(bytes))))
+        Self(Rc::new(UnsafeCell::new(Rc::new(bytes))), Rc::new(Cell::new(None)))
     }
 }
 
@@ -117,7 +117,22 @@ impl std::ops::Deref for ProcessForkBytes {
 
 impl ProcessForkBytes {
     pub(crate) fn shared_handle(&self) -> Self {
-        Self(Rc::clone(&self.0))
+        Self(Rc::clone(&self.0), Rc::clone(&self.1))
+    }
+
+    /// Hash unchanged forks once, including across attached native/classic views.
+    /// Detached snapshots retain their own cache when either view is edited.
+    pub(crate) fn content_hash(&self) -> u64 {
+        if let Some(hash) = self.1.get() {
+            return hash;
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in self.as_slice() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.1.set(Some(hash));
+        hash
     }
 
     /// Retain immutable bytes for resource records. A subsequent file write
@@ -132,6 +147,8 @@ impl ProcessForkBytes {
     /// Mutate this process-owned fork for one serialized operation without
     /// allowing the mutable byte reference to escape.
     pub fn with_mut<R>(&mut self, operation: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        // Invalidate before exposing bytes, including when the operation unwinds.
+        self.1.set(None);
         // SAFETY: the process runner serializes attached adapter access. The
         // closure keeps the mutable reference scoped to this operation.
         unsafe { operation(Rc::make_mut(&mut *self.0.get())) }
@@ -1953,6 +1970,9 @@ pub(crate) struct SharedProcessWindowList(SharedProcessValue<ProcessWindowListSt
 struct ProcessWindowListState {
     windows: Vec<u32>,
     classes: HashMap<u32, u32>,
+    // Caller-owned DialogRecords end at byte 170. Their manager-private
+    // tail lives in separately owned scratch, shared across CPU adapters.
+    caller_dialog_private_storage: HashMap<u32, u32>,
 }
 pub(crate) struct SharedProcessInputState(SharedProcessValue<ProcessInputState>);
 /// Detached-by-default attachment handle for Time Manager tasks.
@@ -2791,6 +2811,7 @@ impl ProcessMixedModeM68kState {
 /// I (1985), pp. I-259--I-263 and I-273--I-275.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcessInputState {
+    cursor_device_records: Option<crate::cursor_manager::CursorDeviceRecords>,
     mouse_pos: (i16, i16),
     mouse_button: bool,
     key_map: [u8; 16],
@@ -3005,6 +3026,19 @@ impl std::fmt::Debug for SharedProcessMixedModeM68kState {
 }
 
 impl SharedProcessInputState {
+    pub(crate) fn cursor_device_records(
+        &self,
+    ) -> Option<crate::cursor_manager::CursorDeviceRecords> {
+        self.with_ref(|state| state.cursor_device_records)
+    }
+
+    pub(crate) fn set_cursor_device_records(
+        &self,
+        records: crate::cursor_manager::CursorDeviceRecords,
+    ) {
+        self.with_mut(|state| state.cursor_device_records = Some(records));
+    }
+
     pub(crate) fn shared_handle(&self) -> Self {
         Self(self.0.shared_handle())
     }
@@ -3419,6 +3453,10 @@ impl SharedProcessSoundManager {
         self.with_mut(|manager| {
             manager.play_double_buffer_samples(guest_ptr, samples, sample_rate_fixed);
         });
+    }
+
+    pub(crate) fn enqueue_completion_fence(&self, channel: u32) -> u64 {
+        self.with_mut(|manager| manager.enqueue_completion_fence(channel))
     }
 
     pub(crate) fn create_internal_channel(&self) -> u32 {
@@ -4571,6 +4609,7 @@ impl SharedProcessWindowList {
         Self(SharedProcessValue::from_value(ProcessWindowListState {
             windows,
             classes: HashMap::new(),
+            caller_dialog_private_storage: HashMap::new(),
         }))
     }
 
@@ -4595,6 +4634,35 @@ impl SharedProcessWindowList {
             let result = operation(&mut state.windows);
             state.classes.retain(|window, _| state.windows.contains(window));
             result
+        })
+    }
+
+    pub(crate) fn set_caller_dialog_private_storage(&self, dialog: u32, storage: u32) -> Option<u32> {
+        self.0
+            .with_mut(|state| state.caller_dialog_private_storage.insert(dialog, storage))
+    }
+
+    pub(crate) fn take_caller_dialog_private_storage(&self, dialog: u32) -> Option<u32> {
+        self.0
+            .with_mut(|state| state.caller_dialog_private_storage.remove(&dialog))
+    }
+
+    pub(crate) fn has_caller_dialog_private_storage(&self, dialog: u32) -> bool {
+        self.0
+            .with_ref(|state| state.caller_dialog_private_storage.contains_key(&dialog))
+    }
+
+    pub(crate) fn dialog_private_address(&self, dialog: u32, offset: u32) -> u32 {
+        let public_size = crate::dialog_manager::DIALOG_PUBLIC_RECORD_SIZE;
+        debug_assert!(offset >= public_size);
+        self.0.with_ref(|state| {
+            state
+                .caller_dialog_private_storage
+                .get(&dialog)
+                .map_or_else(
+                    || dialog.wrapping_add(offset),
+                    |storage| storage.wrapping_add(offset - public_size),
+                )
         })
     }
 
@@ -10904,6 +10972,38 @@ impl ProcessContext {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fork_content_hash_tracks_attached_writes_and_detached_snapshots() {
+        let fork = super::ProcessForkBytes::from(b"hello".to_vec());
+        assert_eq!(fork.content_hash(), 0xa430_d846_80aa_bd0b);
+        let mut attached = fork.shared_handle();
+        let mut detached = fork.clone();
+        let snapshot = fork.resource_snapshot();
+        attached.with_mut(|bytes| bytes[0] = b'j');
+        assert_eq!(fork.content_hash(), super::ProcessForkBytes::from(b"jello".to_vec()).content_hash());
+        assert_eq!(attached.content_hash(), fork.content_hash());
+        assert_eq!(detached.content_hash(), 0xa430_d846_80aa_bd0b);
+        assert_eq!(snapshot, b"hello");
+        detached.with_mut(|bytes| bytes.clear());
+        assert_eq!(detached.content_hash(), 0xcbf2_9ce4_8422_2325);
+        attached.with_mut(|bytes| *bytes = b"hello".to_vec());
+        assert_eq!(fork.content_hash(), 0xa430_d846_80aa_bd0b);
+    }
+
+    #[test]
+    fn fork_content_hash_is_invalidated_before_a_panicking_write() {
+        let mut fork = super::ProcessForkBytes::from(b"hello".to_vec());
+        assert_eq!(fork.content_hash(), 0xa430_d846_80aa_bd0b);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fork.with_mut(|bytes| {
+                bytes.clear();
+                panic!("write interrupted");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(fork.content_hash(), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
     fn resource_snapshots_survive_attached_file_writes_and_detached_clones() {
         let mut fork = super::ProcessForkBytes::from(b"abcdef".to_vec());
         let mut attached = fork.shared_handle();
@@ -14289,6 +14389,32 @@ mod tests {
         assert_eq!(classic.window_class(0x1000), None);
         native.clear();
         assert_eq!(classic.window_class(0x2000), None);
+    }
+
+    #[test]
+    fn caller_dialog_private_storage_is_shared_but_snapshots_detach() {
+        let context = ProcessContext::default();
+        let mut classic = SharedProcessWindowList::from_value(vec![0x1000]);
+        let mut native = SharedProcessWindowList::default();
+        context.attach_window_list(&mut classic);
+        context.attach_window_list(&mut native);
+        assert_eq!(
+            classic.set_caller_dialog_private_storage(0x1000, 0x3000),
+            None
+        );
+        assert_eq!(native.dialog_private_address(0x1000, 172), 0x3002);
+        assert_eq!(native.dialog_private_address(0x2000, 172), 0x20ac);
+        let detached = native.clone();
+        native.remove_window(0x1000);
+        // CloseWindow is distinct from disposing the dialog record.
+        assert!(classic.has_caller_dialog_private_storage(0x1000));
+        assert_eq!(
+            native.take_caller_dialog_private_storage(0x1000),
+            Some(0x3000)
+        );
+        assert!(!classic.has_caller_dialog_private_storage(0x1000));
+        assert_eq!(detached.dialog_private_address(0x1000, 216), 0x302e);
+        assert_eq!(classic.dialog_private_address(0x1000, 216), 0x10d8);
     }
 
     #[test]
