@@ -1109,6 +1109,7 @@ pub(super) fn dispatch_dialog_import(
                 if ppc_window_is_visible(memory, params.dialog_ptr()) {
                     let _ = ppc_draw_dialog(
                         window_list,
+                        param_text,
                         memory,
                         handles,
                         controls,
@@ -2123,6 +2124,7 @@ fn ppc_dispatch_dialog_compatibility(
                 );
                 let _ = ppc_draw_dialog(
                     window_list,
+                    param_text,
                     memory,
                     handles,
                     controls,
