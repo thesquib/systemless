@@ -979,6 +979,23 @@ impl PpcPixPatSampler {
     }
 }
 
+fn ppc_generated_pixpat_rgb(memory: &mut PpcSectionMem, pp_ptr: u32) -> Option<PpcRgbColor> {
+    let map = memory
+        .read_u32_be(pp_ptr + 2)
+        .and_then(|handle| memory.read_u32_be(handle))
+        .filter(|ptr| *ptr != 0)?;
+    let table = memory
+        .read_u32_be(map + 42)
+        .and_then(|handle| memory.read_u32_be(handle))
+        .filter(|ptr| *ptr != 0)?;
+    let last = table + 8 + u32::from(memory.read_u16_be(table + 6)?) * 8;
+    Some(PpcRgbColor {
+        red: memory.read_u16_be(last + 2)?,
+        green: memory.read_u16_be(last + 4)?,
+        blue: memory.read_u16_be(last + 6)?,
+    })
+}
+
 fn ppc_decode_pixpat_sampler(
     memory: &mut PpcSectionMem,
     surface: PpcQuickDrawSurface,
@@ -1023,6 +1040,25 @@ fn ppc_decode_pixpat_sampler(
                 back_pixel,
             },
         };
+    }
+
+    // A MakeRGBPat pattern holds its colour in the last colorSpec and resolves
+    // it for the destination at drawing time. As on the 68K path, it draws as
+    // the closest solid colour rather than a ROM dither.
+    if pat_type == 2 {
+        if let Some(pixel) = ppc_generated_pixpat_rgb(memory, pp_ptr)
+            .and_then(|color| ppc_quickdraw_surface_color_pixel(memory, surface, color))
+        {
+            return PpcPixPatSampler {
+                width: 8,
+                height: 8,
+                kind: PpcPixPatKind::Mono {
+                    pat1: [0xFF; 8],
+                    fore_pixel: pixel,
+                    back_pixel: pixel,
+                },
+            };
+        }
     }
 
     let pat_map_raw = memory.read_u32_be(pp_ptr + 2).unwrap_or(0);
@@ -3444,6 +3480,12 @@ pub(crate) fn ppc_paint_rect(
             mode,
         );
     }
+    // Only notPatCopy is distinguished here; other pattern modes still copy.
+    let inverted = pattern.map(|row| !row);
+    let not_pat_copy = memory
+        .read_u16_be(current_gworld.wrapping_add(PPC_CGRAF_PORT_PN_MODE_OFFSET))
+        == Some(12);
+    let pattern = if not_pat_copy { &inverted } else { pattern };
     if pattern.iter().all(|row| *row == 0xff) {
         return ppc_paint_rect_bounds(
             memory,
@@ -5293,9 +5335,9 @@ pub(crate) fn ppc_copy_bits(
         // A GWorld made without noNewDevice has its own device built from its
         // table, but its record shares the main device. Imaging With QuickDraw
         // (1994), chapter 6.
-        // shortcut: the shared record cannot tell a selected main device from the
-        // implicit one, so screen destinations keep the main table and a noNewDevice
-        // GWorld on the main device uses its own; track the device if a title needs it.
+        // The shared record cannot tell a selected main device from the implicit
+        // one, so screen destinations keep the main table and a noNewDevice GWorld
+        // on the main device uses its own.
         let screen_base = gworlds
             .iter()
             .find(|record| record.port == PPC_MAIN_GWORLD)

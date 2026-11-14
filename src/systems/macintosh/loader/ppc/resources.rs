@@ -873,8 +873,8 @@ fn ppc_resource_chain_position(
             chain_match = Some((index, record.ref_num));
         }
     }
-    // shortcut: files opened after the current one stay visible, unlike the real
-    // chain; remove this fallback once callers are known not to rely on it.
+    // Unlike the real chain, files opened after the current one remain visible
+    // as a fallback.
     chain_match
         .map(|(index, _)| index)
         .or_else(|| vfs_resources.iter().position(is_match))

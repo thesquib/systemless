@@ -234,6 +234,7 @@ pub enum PpcImportDispatcherTarget {
     Move,
     LineTo,
     Line,
+    StdLine,
     DrawChar,
     DrawText,
     DrawString,
@@ -582,6 +583,7 @@ pub enum PpcImportDispatcherTarget {
     PBGetCatInfo,
     PBResolveFileIDRef,
     PBSetCatInfo,
+    PBGetVInfo,
     PBHGetVInfo,
     PBGetVolumeInfo,
     FSGetVolumeInfo,
@@ -810,6 +812,7 @@ pub enum PpcImportDispatcherTarget {
     CloseDeskAcc,
     AEInstallEventHandler,
     AERemoveEventHandler,
+    AEGetEventHandler,
     AEInstallSpecialHandler,
     AEProcessAppleEvent,
     LNew,
@@ -831,6 +834,7 @@ pub enum PpcImportDispatcherTarget {
     LUpdate,
     LAutoScroll,
     LSearch,
+    LLastClick,
     FlushEvents,
     GetMainEventQueue,
     GetMainEventLoop,
@@ -2895,6 +2899,7 @@ pub(crate) fn dispatcher_target_for_import(
             PpcImportDispatcherTarget::AEInstallEventHandler
         }
         ("InterfaceLib", "AERemoveEventHandler") => PpcImportDispatcherTarget::AERemoveEventHandler,
+        ("InterfaceLib", "AEGetEventHandler") => PpcImportDispatcherTarget::AEGetEventHandler,
         ("DrawSprocketLib", "DSpStartup") => PpcImportDispatcherTarget::DSpStartup,
         ("DrawSprocketLib", "DSpSetDebugMode") => PpcImportDispatcherTarget::DSpSetDebugMode,
         ("DrawSprocketLib", "DSpGetVersion") => PpcImportDispatcherTarget::DSpGetVersion,
@@ -3520,6 +3525,8 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "LMGetCurApRefNum") => PpcImportDispatcherTarget::LMGetCurApRefNum,
         ("InterfaceLib", "GetVCBQHdr") => PpcImportDispatcherTarget::GetVCBQHdr,
         ("InterfaceLib", "GetDrvQHdr") => PpcImportDispatcherTarget::GetDrvQHdr,
+        // Universal Interfaces' LowMem.h name for the same accessor.
+        ("InterfaceLib", "LMGetDrvQHdr") => PpcImportDispatcherTarget::GetDrvQHdr,
         ("InterfaceLib", "LMGetSysEvtMask") => PpcImportDispatcherTarget::LMGetSysEvtMask,
         ("InterfaceLib", "LMSetSysEvtMask") => PpcImportDispatcherTarget::LMSetSysEvtMask,
         ("InterfaceLib", "LMGetDefltStack") => PpcImportDispatcherTarget::LMGetDefltStack,
@@ -3644,6 +3651,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "Move") => PpcImportDispatcherTarget::Move,
         ("InterfaceLib", "LineTo") => PpcImportDispatcherTarget::LineTo,
         ("InterfaceLib", "Line") => PpcImportDispatcherTarget::Line,
+        ("InterfaceLib", "StdLine") => PpcImportDispatcherTarget::StdLine,
         ("InterfaceLib", "DrawChar") => PpcImportDispatcherTarget::DrawChar,
         ("InterfaceLib", "DrawText") => PpcImportDispatcherTarget::DrawText,
         ("InterfaceLib", "DrawString") => PpcImportDispatcherTarget::DrawString,
@@ -4387,8 +4395,8 @@ pub(crate) fn dispatcher_target_for_import(
         | ("InterfaceLib", "PBSetCatInfoAsync") => PpcImportDispatcherTarget::PBSetCatInfo,
         ("InterfaceLib", "PBGetVInfo")
         | ("InterfaceLib", "PBGetVInfoSync")
-        | ("InterfaceLib", "PBGetVInfoAsync")
-        | ("InterfaceLib", "PBHGetVInfo")
+        | ("InterfaceLib", "PBGetVInfoAsync") => PpcImportDispatcherTarget::PBGetVInfo,
+        ("InterfaceLib", "PBHGetVInfo")
         | ("InterfaceLib", "PBHGetVInfoSync")
         | ("InterfaceLib", "PBHGetVInfoAsync") => PpcImportDispatcherTarget::PBHGetVInfo,
         ("InterfaceLib", "PBGetVolumeInfoSync") => PpcImportDispatcherTarget::PBGetVolumeInfo,
@@ -5096,6 +5104,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "LUpdate") => PpcImportDispatcherTarget::LUpdate,
         ("InterfaceLib", "LAutoScroll") => PpcImportDispatcherTarget::LAutoScroll,
         ("InterfaceLib", "LSearch") => PpcImportDispatcherTarget::LSearch,
+        ("InterfaceLib", "LLastClick") => PpcImportDispatcherTarget::LLastClick,
         ("InterfaceLib", "FlushEvents") => PpcImportDispatcherTarget::FlushEvents,
         ("InterfaceLib", "GetMainEventQueue") => PpcImportDispatcherTarget::GetMainEventQueue,
         ("InterfaceLib" | "CarbonLib", "GetMainEventLoop" | "GetCurrentEventLoop") => {
@@ -6686,6 +6695,9 @@ pub(crate) fn dispatcher_target_for_import(
                 PpcQuickDrawCompatibilityOperation::CopyPixPat,
             )
         }
+        ("InterfaceLib", "MakeRGBPat") => PpcImportDispatcherTarget::QuickDrawCompatibility(
+            PpcQuickDrawCompatibilityOperation::MakeRGBPat,
+        ),
         ("InterfaceLib", "NewPixPat") => PpcImportDispatcherTarget::QuickDrawCompatibility(
             PpcQuickDrawCompatibilityOperation::NewPixPat,
         ),
@@ -6836,6 +6848,9 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("InterfaceLib", "GetSysBeepVolume") => PpcImportDispatcherTarget::SystemCompatibility(
             PpcSystemCompatibilityOperation::GetSysBeepVolume,
+        ),
+        ("InterfaceLib", "GetSysPPtr") => PpcImportDispatcherTarget::SystemCompatibility(
+            PpcSystemCompatibilityOperation::GetSysPPtr,
         ),
         ("InterfaceLib" | "CarbonLib", "IUCompString") => {
             PpcImportDispatcherTarget::SystemCompatibility(
@@ -7297,7 +7312,7 @@ pub(crate) fn dispatcher_target_for_import(
         (
             "InterfaceLib",
             "SFindStruct" | "SGetBlock" | "SGetCString" | "SGetSRsrc" | "SGetTypeSRsrc"
-            | "SNextTypeSRsrc",
+            | "SNextTypeSRsrc" | "SReadPRAMRec",
         ) => PpcImportDispatcherTarget::SlotCompatibility,
         ("InterfaceLib", "CustomGetFile") => PpcImportDispatcherTarget::StandardFileCompatibility(
             PpcStandardFileOperation::CustomGetFile,

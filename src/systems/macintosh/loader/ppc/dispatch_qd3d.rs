@@ -1012,6 +1012,7 @@ pub(super) struct PpcQ3StorageFileDispatchContext<'a> {
     pub(super) heap_cursor: &'a mut u32,
     pub(super) heap_limit: u32,
     pub(super) last_mem_error: &'a mut i16,
+    pub(super) vfs_volumes: &'a [PpcVfsVolumeRecord],
     pub(super) vfs_directories: &'a mut Vec<PpcVfsDirectory>,
     pub(super) vfs_files: &'a mut ProcessVfsFileRecords,
 }
@@ -1030,6 +1031,7 @@ pub(super) fn dispatch_q3_storage_file_import(
         heap_cursor,
         heap_limit,
         last_mem_error,
+        vfs_volumes,
         vfs_directories,
         vfs_files,
     } = context;
@@ -1069,6 +1071,7 @@ pub(super) fn dispatch_q3_storage_file_import(
                 vfs_files,
                 heap_cursor,
                 last_mem_error,
+                vfs_volumes,
             )))
         }
         PpcImportDispatcherTarget::Q3FileNew => Some(PpcImportAction::Return(ppc_q3_file_new(
@@ -1493,6 +1496,7 @@ pub(super) struct PpcQ3GroupViewDispatchContext<'a> {
     pub(super) current_gworld: u32,
     pub(super) q3_error_state: &'a mut PpcQ3ErrorState,
     pub(super) input_idle: bool,
+    pub(super) q3_present_pacing: Option<PpcQ3PresentPacing<'a>>,
 }
 
 pub(super) fn dispatch_q3_group_view_import(
@@ -1509,6 +1513,7 @@ pub(super) fn dispatch_q3_group_view_import(
         current_gworld,
         q3_error_state,
         input_idle,
+        q3_present_pacing,
     } = context;
 
     macro_rules! set_owned_view_slot {
@@ -1732,6 +1737,7 @@ pub(super) fn dispatch_q3_group_view_import(
                 current_gworld,
                 q3_error_state,
                 input_idle,
+                q3_present_pacing,
             ))
         }
         PpcImportDispatcherTarget::Q3ViewStartBoundingBox

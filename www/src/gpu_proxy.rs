@@ -5,7 +5,7 @@
 //! the thread that owns the device, so the emulation worker sends a snapshot
 //! to a dedicated compute worker and blocks on a shared reply buffer. Any
 //! failure returns an error, which leaves guest pixels to the CPU path.
-use crate::gpu_wire::{decode_response, Request, RequestKind, Response};
+use crate::gpu_wire::{decode_response, RequestKind, RequestRef, Response};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use systemless::gpu_compute::{quickdraw_prefers_blit, quickdraw_prefers_raster, Qd3dWorkEstimate};
@@ -65,7 +65,12 @@ pub struct ComputeOptions {
 }
 
 impl ComputeOptions {
+    #[cfg(test)]
     pub fn from_query(search: &str) -> Option<Self> {
+        Self::from_query_with_default(search, false)
+    }
+
+    pub fn from_query_with_default(search: &str, adaptive_default: bool) -> Option<Self> {
         let mut renderer_wgpu = false;
         let mut mode = None;
         let mut timeout_ms = None;
@@ -84,7 +89,7 @@ impl ComputeOptions {
             Some(Some(dispatch)) => dispatch,
             // An unrecognized explicit mode never enables GPU work.
             Some(None) => return None,
-            None if renderer_wgpu => Dispatch::Adaptive,
+            None if renderer_wgpu || adaptive_default => Dispatch::Adaptive,
             None => return None,
         };
         (dispatch != Dispatch::Off).then_some(Self {
@@ -151,7 +156,7 @@ impl GpuProxy {
     /// operation is counted as completed and its pixels reach guest memory.
     fn call<T>(
         &self,
-        request: Request,
+        request: RequestRef<'_>,
         accept: impl FnOnce(Response) -> Option<T>,
     ) -> Result<T, String> {
         if let Some(reason) = &self.0.stats.borrow().disabled {
@@ -233,21 +238,21 @@ impl QuickDrawGpuRenderer for GpuProxy {
         &mut self,
         command: &QuickDrawGpuBlit,
     ) -> Result<Vec<QuickDrawGpuPixel>, String> {
-        self.call(Request::BlitCells(command.clone()), |reply| match reply {
+        self.call(RequestRef::BlitCells(command), |reply| match reply {
             Response::Pixels(pixels) => Some(pixels),
             _ => None,
         })
     }
 
     fn render_packed_blit(&mut self, command: &QuickDrawGpuPackedCopy) -> Result<Vec<u8>, String> {
-        self.call(Request::PackedBlit(command.clone()), |reply| match reply {
+        self.call(RequestRef::PackedBlit(command), |reply| match reply {
             Response::Bytes(bytes) => Some(bytes),
             _ => None,
         })
     }
 
     fn render_blit(&mut self, command: &QuickDrawGpuBlit) -> Result<Vec<u32>, String> {
-        self.call(Request::Blit(command.clone()), |reply| match reply {
+        self.call(RequestRef::Blit(command), |reply| match reply {
             Response::Words(words) => Some(words),
             _ => None,
         })
@@ -259,9 +264,9 @@ impl QuickDrawGpuRenderer for GpuProxy {
         background: &[u32],
     ) -> Result<Vec<QuickDrawGpuPixel>, String> {
         self.call(
-            Request::Raster {
-                command: command.clone(),
-                background: background.to_vec(),
+            RequestRef::Raster {
+                command,
+                background,
             },
             |reply| match reply {
                 Response::Pixels(pixels) => Some(pixels),
@@ -279,10 +284,10 @@ impl GpuProxy {
         clut: Option<&[[u16; 3]; 256]>,
     ) -> Result<Vec<u16>, String> {
         self.call(
-            Request::Qd3d {
-                frame: frame.clone(),
-                background: background.to_vec(),
-                clut: clut.map(|clut| Box::new(*clut)),
+            RequestRef::Qd3d {
+                frame,
+                background,
+                clut,
             },
             |reply| match reply {
                 Response::Halfwords(pixels) if pixels.len() == background.len() => Some(pixels),
@@ -362,7 +367,7 @@ impl GpuTransport for WorkerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_wire::{encode_response, Failure};
+    use crate::gpu_wire::{encode_response, Failure, Request};
 
     /// Decodes each request and answers like a device that copies backgrounds.
     struct Loopback {
@@ -512,6 +517,29 @@ mod tests {
         assert_eq!(Dispatch::parse("force"), Some(Dispatch::Forced));
         assert_eq!(Dispatch::parse("cpu"), Some(Dispatch::Off));
         assert_eq!(Dispatch::parse("nope"), None);
+    }
+
+    #[test]
+    fn catalogue_default_respects_explicit_overrides() {
+        assert_eq!(
+            ComputeOptions::from_query_with_default("", true)
+                .unwrap()
+                .mode,
+            "adaptive"
+        );
+        for mode in ["off", "cpu", "0", "bogus"] {
+            assert_eq!(
+                ComputeOptions::from_query_with_default(&format!("?gpu_compute={mode}"), true),
+                None
+            );
+        }
+        assert_eq!(
+            ComputeOptions::from_query_with_default("?gpu_compute=force", true)
+                .unwrap()
+                .mode,
+            "force"
+        );
+        assert_eq!(ComputeOptions::from_query_with_default("", false), None);
     }
 
     #[test]

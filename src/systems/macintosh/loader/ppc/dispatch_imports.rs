@@ -121,6 +121,7 @@ pub(crate) struct PpcDispatchContext<'a> {
     pub(crate) process_input: &'a crate::process_context::SharedProcessInputState,
     pub(crate) event_queue: &'a mut EventQueue,
     pub(crate) draw_sprocket: &'a mut PpcDrawSprocketState,
+    pub(crate) q3_present_pacing: Option<PpcQ3PresentPacing<'a>>,
 }
 
 // These operations use movie/controller state and guest pointers directly, not
@@ -297,6 +298,7 @@ pub(crate) fn dispatch_supported_import(
         process_input,
         event_queue,
         draw_sprocket,
+        q3_present_pacing,
     } = context;
     if matches!(binding.dispatcher_target,
         PpcImportDispatcherTarget::CloseWindow |
@@ -408,6 +410,7 @@ pub(crate) fn dispatch_supported_import(
             heap_cursor,
             heap_limit,
             last_mem_error,
+            vfs_volumes,
             vfs_directories,
             vfs_files,
         },
@@ -502,6 +505,7 @@ pub(crate) fn dispatch_supported_import(
             current_gworld: *current_gworld,
             q3_error_state,
             input_idle: input.is_idle(),
+            q3_present_pacing,
         })
     {
         return Some(action);
@@ -597,6 +601,7 @@ pub(crate) fn dispatch_supported_import(
         vfs_resources,
         gworlds,
         *current_gworld,
+        vfs_volumes,
     ) {
         return Some(action);
     }
@@ -1088,6 +1093,7 @@ pub(crate) fn dispatch_supported_import(
             heap_cursor,
             last_mem_error,
             handles,
+            vfs_volumes,
             vfs_directories,
             vfs_files,
             vfs_resource_files,
@@ -1148,6 +1154,7 @@ pub(crate) fn dispatch_supported_import(
             cpu,
             memory,
             window_list,
+            param_text,
             process_memory_manager,
             heap_cursor,
             heap_limit,
@@ -1451,6 +1458,7 @@ pub(crate) fn dispatch_supported_import(
             cpu,
             memory,
             stack_top,
+            vfs_volumes,
             vfs_directories,
             vfs_files,
             vfs_resource_files,
@@ -1924,6 +1932,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::HSetVol
         | PpcImportDispatcherTarget::FlushVol
         | PpcImportDispatcherTarget::PBFlushVol
+        | PpcImportDispatcherTarget::PBGetVInfo
         | PpcImportDispatcherTarget::PBHGetVInfo
         | PpcImportDispatcherTarget::PBGetVolumeInfo
         | PpcImportDispatcherTarget::FSGetVolumeInfo
@@ -2122,7 +2131,8 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::PortSize
         | PpcImportDispatcherTarget::Move
         | PpcImportDispatcherTarget::LineTo
-        | PpcImportDispatcherTarget::Line => {
+        | PpcImportDispatcherTarget::Line
+        | PpcImportDispatcherTarget::StdLine => {
             unreachable!("QuickDraw imports return through dispatch_quickdraw_import")
         }
         PpcImportDispatcherTarget::DrawChar
@@ -2479,6 +2489,7 @@ pub(crate) fn dispatch_supported_import(
         }
         PpcImportDispatcherTarget::AEInstallEventHandler
         | PpcImportDispatcherTarget::AERemoveEventHandler
+        | PpcImportDispatcherTarget::AEGetEventHandler
         | PpcImportDispatcherTarget::AEInstallSpecialHandler
         | PpcImportDispatcherTarget::AEProcessAppleEvent => {
             unreachable!("Apple Event imports return through dispatch_apple_event_import")
@@ -2505,7 +2516,8 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::LRect
         | PpcImportDispatcherTarget::LUpdate
         | PpcImportDispatcherTarget::LAutoScroll
-        | PpcImportDispatcherTarget::LSearch => {
+        | PpcImportDispatcherTarget::LSearch
+        | PpcImportDispatcherTarget::LLastClick => {
             unreachable!("list imports return through dispatch_list_import")
         }
         PpcImportDispatcherTarget::SysEnvirons
@@ -4473,10 +4485,18 @@ mod agl_choose_tests {
 }
 
 fn ppc_dispatch_slot_compatibility(
-    _binding: &PpcImportBinding,
+    binding: &PpcImportBinding,
     cpu: &mut PpcCpu,
     memory: &mut PpcSectionMem,
 ) -> PpcImportAction {
+    if binding.symbol_name == "SReadPRAMRec" {
+        // FUNCTION SReadPRAMRec (spBlkPtr: SpBlockPtr): OSErr;
+        // Copies a slot's parameter RAM record to the caller's SPRAMRecord at
+        // spResult. No expansion cards are present, so report smEmptySlot and
+        // leave the caller's record untouched, matching the 68K _SlotManager path.
+        // Inside Macintosh: Devices (1994), Slot Manager.
+        return PpcImportAction::Return(ppc_i16_result(PPC_SM_EMPTY_SLOT_ERR));
+    }
     if cpu.gpr[3] != 0 {
         let _ = memory.write_u32_be(cpu.gpr[3], 0);
     }

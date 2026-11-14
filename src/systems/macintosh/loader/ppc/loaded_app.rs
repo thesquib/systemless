@@ -63,6 +63,7 @@ pub struct PpcLoadedApp {
     pub q3_error_state: PpcQ3ErrorState,
     pub q3_lifecycle: PpcQ3LifecycleState,
     pub q3_memory_storages: Vec<PpcQ3MemoryStorageRecord>,
+    pub q3_gpu_texture_cache: PpcQ3GpuTextureCache,
     pub q3_files: Vec<PpcQ3FileRecord>,
     pub q3_group_memberships: Vec<PpcQ3GroupMembershipRecord>,
     pub q3_file_groups: Vec<PpcQ3FileGroupRecord>,
@@ -90,6 +91,8 @@ pub struct PpcLoadedApp {
     pub q3_styles: Vec<PpcQ3StyleRecord>,
     pub q3_cameras: Vec<PpcQ3CameraRecord>,
     pub q3_lights: Vec<PpcQ3LightRecord>,
+    /// Retrace pacing of QuickDraw 3D window presents.
+    pub q3_present_pacing: PpcQ3PresentPacingState,
     pub input_sprocket: PpcInputSprocketState,
     pub input_sprocket_virtual_elements: Vec<PpcInputSprocketVirtualElementRecord>,
     pub toolbox_startup: PpcToolboxStartupState,
