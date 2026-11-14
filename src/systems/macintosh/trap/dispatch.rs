@@ -1352,6 +1352,7 @@ pub(crate) struct TrapTableProcessContext {
     raw_exception_vectors: [u32; 2],
     default_exception_vectors: [u32; 2],
     pending_native_trap_calls: HashMap<u16, Vec<NativeTrapCallState>>,
+    native_trap_return_counts: HashMap<u32, usize>,
     current_trap_caller: Option<u32>,
 }
 
@@ -2239,6 +2240,8 @@ pub struct TrapDispatcher {
     /// the outer invocation follows its saved daisy-chain link. Inside
     /// Macintosh: Operating System Utilities (1994), pp. 8-8 and 8-23--8-24.
     pub(crate) pending_native_trap_calls: HashMap<u16, Vec<NativeTrapCallState>>,
+    // One reference per retained invocation, independent of nesting depth.
+    native_trap_return_counts: HashMap<u32, usize>,
     /// Re-entrancy guard for the CopyBits `grafProcs.bitsProc` bottleneck:
     /// `(bitsProc address, stack pointer at the tail call)`. A custom bitsProc
     /// normally reaches the real transfer by calling CopyBits again; without
@@ -4156,6 +4159,7 @@ impl TrapDispatcher {
             trap_table_profile: None,
             trap_exception_vector_defaults: None,
             pending_native_trap_calls: HashMap::default(),
+            native_trap_return_counts: HashMap::default(),
             bits_proc_reentry: None,
             picture_stream_stack: Vec::new(),
             picture_write_stack: Vec::new(),
@@ -5413,7 +5417,52 @@ impl TrapDispatcher {
         Self::boot_volume_ref_num()
     }
 
+    /// The internal root directory of the mounted (non-boot) volume that a
+    /// volume or working-directory reference number names.
+    pub(crate) fn mounted_volume_root_dir_id(&self, vref: i16) -> Option<u32> {
+        let volume_ref_num = if self.vfs_volume_for_ref_num(vref).is_some() {
+            vref
+        } else {
+            self.working_directories.get(&vref)?.volume_ref_num
+        };
+        crate::process_context::process_mounted_volume_root_dir_id(
+            &self.vfs_volumes,
+            volume_ref_num,
+        )
+    }
+
+    /// The caller-visible ID, reported with `vref`, of an internal directory
+    /// ID: a mounted volume's root is fsRtDirID on that volume.
+    /// Files 1992, 1-27 and 2-85.
+    pub(crate) fn hfs_dir_id(&self, vref: i16, dir_id: u32) -> u32 {
+        crate::process_context::process_hfs_dir_id(&self.vfs_volumes, vref, dir_id)
+    }
+
+    /// The caller-visible parent ID, reported with `vref`, of a directory.
+    pub(crate) fn hfs_directory_parent_id(&self, vref: i16, directory: &VfsDirectory) -> u32 {
+        crate::process_context::process_hfs_directory_parent_id(
+            &self.vfs_volumes,
+            vref,
+            directory.dir_id,
+            directory.parent_dir_id,
+        )
+    }
+
+    /// The reference number of the volume that holds a VFS path.
+    pub(crate) fn volume_ref_num_for_vfs_path(&self, path: &str) -> i16 {
+        self.vfs_volume_for_path(path)
+            .map_or(Self::boot_volume_ref_num(), |volume| volume.ref_num)
+    }
+
     pub(crate) fn resolve_directory_id(&self, vref: i16, dir_id: u32) -> u32 {
+        // Directory IDs are scoped by volume, so fsRtDirID with a mounted
+        // volume's reference (or a working directory on it) selects that
+        // volume's root. Files 1992, 1-27 and 2-85.
+        if dir_id == 2 {
+            if let Some(root_dir_id) = self.mounted_volume_root_dir_id(vref) {
+                return root_dir_id;
+            }
+        }
         // HFS lookups treat WD refnums as an implicit directory selector when
         // ioDirID is 0 or 1, and they treat vRefNum=0 + ioDirID=0 as the
         // current default directory. Files 1992, 2-151 to 2-153.
@@ -6758,7 +6807,10 @@ impl TrapDispatcher {
         bus.write_long(fcb + 12, len);
         bus.write_long(fcb + 20, vcb);
         bus.write_long(fcb + 50, metadata.map_or(0, |file| file.file_type));
-        bus.write_long(fcb + 58, metadata.map_or(2, |file| file.parent_dir_id));
+        bus.write_long(
+            fcb + 58,
+            metadata.map_or(2, |file| self.hfs_dir_id(volume_ref, file.parent_dir_id)),
+        );
         let name = Self::hfs_name_from_vfs_component(Self::vfs_basename(path));
         Self::write_pstring(bus, fcb + 62, &name.chars().take(31).collect::<String>());
         Ok(refnum)
@@ -7706,6 +7758,7 @@ impl TrapDispatcher {
             raw_exception_vectors: image.exception_vectors,
             default_exception_vectors: image.exception_vectors,
             pending_native_trap_calls: HashMap::default(),
+            native_trap_return_counts: HashMap::default(),
             current_trap_caller: None,
         })
     }
@@ -7735,6 +7788,7 @@ impl TrapDispatcher {
                     .trap_exception_vector_defaults
                     .expect("active trap profile must have exception-vector defaults"),
                 pending_native_trap_calls: std::mem::take(&mut self.pending_native_trap_calls),
+                native_trap_return_counts: std::mem::take(&mut self.native_trap_return_counts),
                 current_trap_caller: self.current_trap_caller.take(),
             }
         });
@@ -7759,6 +7813,7 @@ impl TrapDispatcher {
         bus.write_long(0x28, incoming.raw_exception_vectors[0]);
         bus.write_long(0x2C, incoming.raw_exception_vectors[1]);
         self.pending_native_trap_calls = incoming.pending_native_trap_calls;
+        self.native_trap_return_counts = incoming.native_trap_return_counts;
         self.current_trap_caller = incoming.current_trap_caller;
         self.trap_table_profile = Some(incoming.profile);
         self.trap_exception_vector_defaults = Some(incoming.default_exception_vectors);
@@ -7768,6 +7823,7 @@ impl TrapDispatcher {
     /// Discard the active application's trap context during process teardown.
     pub(crate) fn teardown_trap_table_process_context(&mut self) {
         self.pending_native_trap_calls.clear();
+        self.native_trap_return_counts.clear();
         self.current_trap_caller = None;
         self.trap_table_profile = None;
         self.trap_exception_vector_defaults = None;
@@ -7936,6 +7992,10 @@ impl TrapDispatcher {
     }
 
     fn retain_native_trap_call(&mut self, trap_word: u16, call: NativeTrapCallState) {
+        *self
+            .native_trap_return_counts
+            .entry(call.return_pc)
+            .or_default() += 1;
         self.pending_native_trap_calls
             .entry(trap_word)
             .or_default()
@@ -7954,6 +8014,16 @@ impl TrapDispatcher {
         if empty {
             self.pending_native_trap_calls.remove(&trap_word);
         }
+        if let Some(call) = &call {
+            let count = self
+                .native_trap_return_counts
+                .get_mut(&call.return_pc)
+                .expect("each retained native trap call has a watch reference");
+            *count -= 1;
+            if *count == 0 {
+                self.native_trap_return_counts.remove(&call.return_pc);
+            }
+        }
         call
     }
 
@@ -7967,9 +8037,12 @@ impl TrapDispatcher {
     }
 
     pub(crate) fn append_pending_native_trap_return_pcs(&self, pcs: &mut Vec<u32>) {
-        for call in self.pending_native_trap_calls.values().flatten() {
-            if !pcs.contains(&call.return_pc) {
-                pcs.push(call.return_pc);
+        // Call stacks retain every invocation; batches need only the distinct
+        // return targets. Maintain their references when calls enter/leave so
+        // rebuilding a batch does not scan every retained nested invocation.
+        for &return_pc in self.native_trap_return_counts.keys() {
+            if !pcs.contains(&return_pc) {
+                pcs.push(return_pc);
             }
         }
     }

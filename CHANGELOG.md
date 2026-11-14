@@ -1,5 +1,83 @@
 # Changelog
 
+## [0.122.1](https://github.com/benletchford/systemless/compare/v0.122.0...v0.122.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **fonts:** preserve readable nine-point monospace text ([#6269](https://github.com/benletchford/systemless/issues/6269)) ([632c33b](https://github.com/benletchford/systemless/commit/632c33ba53eb4382ab4859753814e1f9ca3a91d8))
+* **text:** clear inverted copy character cells on repaint ([#6272](https://github.com/benletchford/systemless/issues/6272)) ([52be8e2](https://github.com/benletchford/systemless/commit/52be8e2fdd287e7294ca0e5cff3260c397f2230e))
+
+## [0.122.0](https://github.com/benletchford/systemless/compare/v0.121.1...v0.122.0) (2026-11-14)
+
+
+### Features
+
+* **launch:** mount additional disk images and folders as locked volumes ([#6250](https://github.com/benletchford/systemless/issues/6250)) ([aeb6199](https://github.com/benletchford/systemless/commit/aeb619989facf44af6b495cc1f6d61c97281620e))
+* **qd3d:** add opt-in pacing of window presents to the display tick ([#5993](https://github.com/benletchford/systemless/issues/5993)) ([8b2fa3e](https://github.com/benletchford/systemless/commit/8b2fa3e9e540578e9394b701b9c18ed19899c906))
+* replace the mascot with the orb brand icon ([#6267](https://github.com/benletchford/systemless/issues/6267)) ([d71a5b7](https://github.com/benletchford/systemless/commit/d71a5b7452ad3b579b5ac745e5abfb9a6331d902))
+
+
+### Bug Fixes
+
+* **ppc:** let NIH Image launch and draw its palettes ([#6266](https://github.com/benletchford/systemless/issues/6266)) ([b21859b](https://github.com/benletchford/systemless/commit/b21859be34b0456f5ea8596f362b86688e073671))
+
+
+### Performance Improvements
+
+* **qd3d:** shade gpu triangle vertices once before rasterization ([dc412f7](https://github.com/benletchford/systemless/commit/dc412f7cfb81d6006a9d8e220e47e245239b2ae1))
+* **web:** encode gpu compute requests from borrowed slices in bulk ([220b080](https://github.com/benletchford/systemless/commit/220b080d6adc36aec491316a7edf0f3e646ccd58))
+
+## [0.121.1](https://github.com/benletchford/systemless/compare/v0.121.0...v0.121.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **desktop:** preserve guest desktop and window frames with native menus ([34a42c5](https://github.com/benletchford/systemless/commit/34a42c56be0ec8271f74d914c381933e90abec16))
+* **ppc:** bind LMGetDrvQHdr to the drive queue header accessor ([0220319](https://github.com/benletchford/systemless/commit/0220319ab8150b69ed6eec3c4ec0ddbd134ca228))
+* **ppc:** expand ParamText when drawing static dialog items ([77459d6](https://github.com/benletchford/systemless/commit/77459d6443bc58428116304831c04e1a037c2693))
+* **ppc:** fill only the 64-byte VolumeParam for PBGetVInfo ([f95b565](https://github.com/benletchford/systemless/commit/f95b565a15921f28b51a3b0e9f971f7ed201bb39))
+* **ppc:** populate PBGetFInfo outputs without overwriting the parameter block ([da9d345](https://github.com/benletchford/systemless/commit/da9d345a904aee44662d904e5e49a24453316095))
+* **ppc:** resolve full pathnames against the named volume ([2ea0b6a](https://github.com/benletchford/systemless/commit/2ea0b6a2e62a4c6275f594a80166b349e2891aba))
+* **ppc:** share StdLine and MakeRGBPat QuickDraw behavior ([7c4f989](https://github.com/benletchford/systemless/commit/7c4f989aca114cd8c3b5377a6963972d020356ef))
+
+
+### Performance Improvements
+
+* **ppc:** bypass shared ledger lookups for plain scalar memory ([580f8c6](https://github.com/benletchford/systemless/commit/580f8c6acb98b255a19cf90c6dd1bba30d6e34fc))
+* **presentation:** sync a plain screen row in one pass ([f710601](https://github.com/benletchford/systemless/commit/f71060138a79f33572435165a936500ac0f34a67))
+* **qd3d:** cache converted guest textures across frames ([ac14df6](https://github.com/benletchford/systemless/commit/ac14df62f19b43c02fcde86121c660670aab07c7))
+* **qd3d:** read software background pixels by row ([65fb550](https://github.com/benletchford/systemless/commit/65fb550a6cbf0f85e559fabc7cf00a36f4175851))
+
+## [0.121.0](https://github.com/benletchford/systemless/compare/v0.120.0...v0.121.0) (2026-11-13)
+
+
+### Features
+
+* add the original Absolute Zero demo ([c98c6f0](https://github.com/benletchford/systemless/commit/c98c6f021461675317c10e6c99d0d03d491c16c0))
+* add the original Flight Commander 2 demo ([4a4e601](https://github.com/benletchford/systemless/commit/4a4e60179ba0dc5b36f79378062c02b3f77aa9ea))
+* add the original Skull Cracker demo ([167adaa](https://github.com/benletchford/systemless/commit/167adaa965beaf6ffa7de68676f289fecce25f76))
+* add the original Time Warp of Dr Brain demo ([fbc32ec](https://github.com/benletchford/systemless/commit/fbc32ec91094ff71828be061c20194c06a06be35))
+* **catalogue:** declare curated native app availability ([#6242](https://github.com/benletchford/systemless/issues/6242)) ([4ed72d3](https://github.com/benletchford/systemless/commit/4ed72d36e27d5c3b9bf68bce61f01d2e9fc3e7d8))
+* **catalogue:** publish resolved JSON feed for native clients ([#6238](https://github.com/benletchford/systemless/issues/6238)) ([2b54c53](https://github.com/benletchford/systemless/commit/2b54c5315955f00c11912caba83195dd13ffdb5b))
+* **web:** support per-title adaptive GPU compute defaults ([88b6a04](https://github.com/benletchford/systemless/commit/88b6a0495a2ec4fa66f41fdbf3a0389ec3b7cded))
+
+
+### Bug Fixes
+
+* keep HFS file information lookups within their directory ([af38fb8](https://github.com/benletchford/systemless/commit/af38fb8b7291d9be1e396496a801352c8ee0570f))
+* **web:** support require-corp isolation for GPU compute ([e695682](https://github.com/benletchford/systemless/commit/e69568222b8a17e86a6fddc783809f0c9be4bae4))
+
+
+### Performance Improvements
+
+* cache native trap return watch targets ([3d874b1](https://github.com/benletchford/systemless/commit/3d874b12a1bd86b0f1bc675635268c0d04a3845b))
+* **qd3d:** compute the normal matrix once per draw command ([20ba723](https://github.com/benletchford/systemless/commit/20ba723b1773111b9a88b50954c59c8bfe1ecbbb))
+* **qd3d:** copy guest arrays in bulk when equivalent ([6cdbc1c](https://github.com/benletchford/systemless/commit/6cdbc1cbebf33c0a52a40b891766b1a31de06a33))
+* **qd3d:** report software fills to memory observers in runs ([fe5a118](https://github.com/benletchford/systemless/commit/fe5a1188a3de74481866abe8a0b9bbcc02e5e6cd))
+* **qd3d:** return triangles inside the frustum without clipping ([97ed5af](https://github.com/benletchford/systemless/commit/97ed5af0fe4052fddaa86b0ad2cf122163874e9b))
+* **qd3d:** test depth before interpolating and shading a software pixel ([bea2ac5](https://github.com/benletchford/systemless/commit/bea2ac538ba58d14ed046271330d77189f66635c))
+
 ## [0.120.0](https://github.com/benletchford/systemless/compare/v0.119.0...v0.120.0) (2026-11-12)
 
 

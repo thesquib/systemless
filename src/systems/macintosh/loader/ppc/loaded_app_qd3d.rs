@@ -82,6 +82,7 @@ fn q3_gpu_nonfilled_draw(
 
 fn q3_cached_gpu_texture(
     memory: &mut PpcSectionMem,
+    decoded: &mut PpcQ3GpuTextureCache,
     textures: &mut Vec<PpcQ3GpuTexture>,
     cache: &mut Vec<(PpcQ3SoftwareTexture, Option<PpcQ3ShaderBoundaryRecord>, usize)>,
     texture: PpcQ3SoftwareTexture,
@@ -93,7 +94,7 @@ fn q3_cached_gpu_texture(
     {
         return Some(*index);
     }
-    let decoded = ppc_q3_gpu_texture_from_software(memory, texture, boundary)?;
+    let decoded = decoded.texture(memory, texture, boundary)?;
     let index = textures.len();
     textures.push(decoded);
     cache.push((texture, boundary, index));
@@ -373,12 +374,7 @@ impl PpcLoadedApp {
         background.try_reserve_exact(count).ok()?;
         // Tag all background cells, including RGB555 targets. The shader
         // clears bit 15 only where it paints; untouched cells cause no stores.
-        for y in 0..front.height {
-            for x in 0..front.width {
-                background
-                    .push(surface.read_pixel(&mut self.memory, (x as i32, y as i32))? | 0x8000);
-            }
-        }
+        q3_read_tagged_background(&mut self.memory, &surface, &mut background)?;
         let rendered = match indexed_clut.as_ref() {
             Some(clut) => renderer.render_indexed(&packet, &background, clut),
             None => renderer.render_native(&packet, &background),
@@ -461,9 +457,11 @@ impl PpcLoadedApp {
             .viewport
             .unwrap_or_else(|| PpcQ3ViewportRect::full(front_buffer));
         let viewport_bounds = viewport.inclusive_bounds()?;
+        self.q3_gpu_texture_cache.begin_frame();
         let mut textures = Vec::new();
-        // Reuse decoded texels only within this packet. Guest writes between
-        // frames must always be observed by a fresh preparation.
+        // Within this packet a texture is decoded once. Across packets a
+        // decoding is reused only while its source bytes compare equal, so
+        // guest writes between frames are always observed.
         let mut texture_cache = Vec::new();
         let mut draws = Vec::new();
 
@@ -471,6 +469,7 @@ impl PpcLoadedApp {
             let PpcQ3SceneCommand::TriMesh(command) = command else {
                 continue;
             };
+            let normal_matrix = ppc_q3_software_normal_matrix(command.local_to_world);
             let fill_style = ppc_q3_software_fill_style(&command.material);
             if !extended && fill_style != PPC_Q3_FILL_STYLE_FILLED {
                 return None;
@@ -516,12 +515,11 @@ impl PpcLoadedApp {
             if points.is_empty() {
                 continue;
             }
-            let vertex_uvs = if material.texture.is_some() {
-                self.q3_software_trimesh_vertex_uvs(&command, points.len())
-            } else {
-                Some(vec![(0.0, 0.0); points.len()])
-            };
-            if !extended && vertex_uvs.is_none() {
+            let vertex_uvs = material
+                .texture
+                .and_then(|_| self.q3_software_trimesh_vertex_uvs(&command, points.len()));
+            let missing_texture_uvs = material.texture.is_some() && vertex_uvs.is_none();
+            if !extended && missing_texture_uvs {
                 return None;
             }
             // Software samples raw pixel (0, 0) when UVs are absent or unreadable.
@@ -529,7 +527,7 @@ impl PpcLoadedApp {
             // the shader transform/boundaries. Every draw, including expanded
             // degenerate edges, samples a 1x1 texture holding that pixel.
             let mut gpu_material = material;
-            if vertex_uvs.is_none() {
+            if missing_texture_uvs {
                 gpu_material.uv_transform = None;
             }
             let vertex_diffuse =
@@ -551,10 +549,14 @@ impl PpcLoadedApp {
             let triangle_diffuse = self.q3_software_trimesh_triangle_diffuse_colors(&command);
             let triangle_alpha = self.q3_software_trimesh_triangle_alphas(&command);
             let triangle_normals = self.q3_software_trimesh_triangle_normals(&command);
+            let uses_specular =
+                extended && ppc_q3_software_uses_specular_attributes(&material, &command.lights);
+            let projector =
+                PpcQ3SoftwarePointProjector::new(&command, front_buffer, viewport, uses_specular);
             let mut projected = points
                 .iter()
                 .copied()
-                .map(|point| ppc_q3_software_project_point(&command, front_buffer, viewport, point))
+                .map(|point| projector.project(point))
                 .collect::<Vec<_>>();
             for (index, projected) in projected.iter_mut().enumerate() {
                 let Some(projected) = projected else {
@@ -567,7 +569,7 @@ impl PpcLoadedApp {
                     .as_ref()
                     .and_then(|values| values.get(index).copied())
                     .and_then(|normal| {
-                        ppc_q3_software_transform_normal(normal, command.local_to_world)
+                        ppc_q3_software_transform_normal_by(normal, normal_matrix)
                     });
                 projected.specular_color = vertex_specular
                     .as_ref()
@@ -588,7 +590,7 @@ impl PpcLoadedApp {
             }
 
             let texture_index = match material.texture {
-                Some(texture) if vertex_uvs.is_none() => {
+                Some(texture) if missing_texture_uvs => {
                     // If even the first texel is unreadable, software leaves
                     // the material unmodulated. Retain the original material
                     // for transparency classification.
@@ -612,6 +614,7 @@ impl PpcLoadedApp {
                 }
                 Some(texture) => Some(q3_cached_gpu_texture(
                     &mut self.memory,
+                    &mut self.q3_gpu_texture_cache,
                     &mut textures,
                     &mut texture_cache,
                     texture,
@@ -674,7 +677,7 @@ impl PpcLoadedApp {
                             normals
                                 .into_iter()
                                 .map(|normal| {
-                                    ppc_q3_software_transform_normal(normal, command.local_to_world)
+                                    ppc_q3_software_transform_normal_by(normal, normal_matrix)
                                 })
                                 .collect::<Option<Vec<_>>>()
                         }),
@@ -744,14 +747,14 @@ impl PpcLoadedApp {
                     .as_ref()
                     .and_then(|values| values.get(triangle.index).copied().flatten())
                     .and_then(|normal| {
-                        ppc_q3_software_transform_normal(normal, command.local_to_world)
+                        ppc_q3_software_transform_normal_by(normal, normal_matrix)
                     });
                 let geometric_normal = ppc_q3_software_geometric_normal(
                     triangle.points.map(|index| points[index]),
                     orientation_style,
                 )
                 .and_then(|normal| {
-                    ppc_q3_software_transform_normal(normal, command.local_to_world)
+                    ppc_q3_software_transform_normal_by(normal, normal_matrix)
                 });
                 for vertex in &mut triangle_vertices {
                     vertex.normal = vertex.normal.or(normal).or(geometric_normal);
@@ -788,7 +791,7 @@ impl PpcLoadedApp {
                     && ppc_q3_software_triangle_is_backfacing(
                         orientation_style,
                         command.camera,
-                        command.local_to_world,
+                        normal_matrix,
                         triangle_normals
                             .as_ref()
                             .and_then(|normals| normals.get(triangle.index))
@@ -1005,11 +1008,15 @@ impl PpcLoadedApp {
         if let (Some(clear_color), Some((left, top, right, bottom))) =
             (target.clear_color, viewport.inclusive_bounds())
         {
+            // Nothing observes guest memory between the pixels of the clear.
+            let mut run = PpcQ3UnreportedRun::default();
             for y in top..=bottom {
                 for x in left..=right {
-                    let _ = surface.write_pixel(&mut self.memory, (x, y), clear_color);
+                    let _ =
+                        surface.write_pixel_in_run(&mut self.memory, (x, y), clear_color, &mut run);
                 }
             }
+            run.finish(&mut self.memory, surface);
         }
         let mut deferred_primitives = Vec::new();
         for command in commands {
@@ -1017,6 +1024,7 @@ impl PpcLoadedApp {
                 PpcQ3SceneCommand::TriMesh(command) => command,
                 PpcQ3SceneCommand::Submission(_) => continue,
             };
+            let normal_matrix = ppc_q3_software_normal_matrix(command.local_to_world);
             let Some(points) = self.q3_software_trimesh_points(&command) else {
                 continue;
             };
@@ -1065,10 +1073,16 @@ impl PpcLoadedApp {
             } else {
                 None
             };
+            let projector = PpcQ3SoftwarePointProjector::new(
+                &command,
+                front_buffer,
+                viewport,
+                uses_specular_attributes,
+            );
             let mut projected: Vec<Option<PpcQ3SoftwareProjectedVertex>> = points
                 .iter()
                 .copied()
-                .map(|point| ppc_q3_software_project_point(&command, front_buffer, viewport, point))
+                .map(|point| projector.project(point))
                 .collect();
             if let Some(vertex_uvs) = vertex_uvs {
                 for (projected, uv) in projected.iter_mut().zip(vertex_uvs) {
@@ -1123,7 +1137,7 @@ impl PpcLoadedApp {
                 for (projected, normal) in projected.iter_mut().zip(vertex_normals) {
                     if let Some(projected) = projected {
                         projected.normal =
-                            ppc_q3_software_transform_normal(normal, command.local_to_world);
+                            ppc_q3_software_transform_normal_by(normal, normal_matrix);
                     }
                 }
             }
@@ -1232,10 +1246,7 @@ impl PpcLoadedApp {
                                     normals
                                         .into_iter()
                                         .map(|normal| {
-                                            ppc_q3_software_transform_normal(
-                                                normal,
-                                                command.local_to_world,
-                                            )
+                                            ppc_q3_software_transform_normal_by(normal, normal_matrix)
                                         })
                                         .collect::<Option<Vec<_>>>()
                                 })
@@ -1292,7 +1303,7 @@ impl PpcLoadedApp {
                         .as_ref()
                         .and_then(|normals| normals.get(triangle.index).copied().flatten())
                         .and_then(|normal| {
-                            ppc_q3_software_transform_normal(normal, command.local_to_world)
+                            ppc_q3_software_transform_normal_by(normal, normal_matrix)
                         })
                     {
                         for vertex in &mut vertices {
@@ -1340,7 +1351,7 @@ impl PpcLoadedApp {
                             ppc_q3_software_orientation_style(&command.material),
                         )
                         .and_then(|normal| {
-                            ppc_q3_software_transform_normal(normal, command.local_to_world)
+                            ppc_q3_software_transform_normal_by(normal, normal_matrix)
                         });
                         for vertex in &mut vertices {
                             if vertex.normal.is_none() {
@@ -1366,7 +1377,7 @@ impl PpcLoadedApp {
                     && ppc_q3_software_triangle_is_backfacing(
                         orientation_style,
                         command.camera,
-                        command.local_to_world,
+                        normal_matrix,
                         triangle_normals.as_ref().and_then(|normals| normals.get(triangle.index)).copied().flatten(),
                         &clipped_points,
                     );
@@ -2962,6 +2973,47 @@ impl PpcLoadedApp {
     }
 }
 
+/// Appends every target pixel as RGB555 with bit 15 set, in row order. A row
+/// is taken with one routed read when the whole row is mapped; any row that
+/// read declines keeps the per-pixel path, including its failure.
+fn q3_read_tagged_background(
+    memory: &mut PpcSectionMem,
+    surface: &PpcQ3SoftwareFrontBufferSurface,
+    background: &mut Vec<u16>,
+) -> Option<()> {
+    let front = surface.front_buffer;
+    let pixel_bytes = match front.depth {
+        8 => 1,
+        16 => 2,
+        _ => 0,
+    };
+    let row_len = front.width.checked_mul(pixel_bytes)?;
+    let mut row = vec![0u8; row_len as usize];
+    for y in 0..front.height {
+        let whole_row = (row_len != 0 && row_len <= front.row_bytes)
+            .then(|| front.base_addr.checked_add(y.checked_mul(front.row_bytes)?))
+            .flatten()
+            .and_then(|address| memory.read_bytes_into(address, &mut row));
+        if whole_row.is_none() {
+            for x in 0..front.width {
+                background.push(surface.read_pixel(memory, (x as i32, y as i32))? | 0x8000);
+            }
+        } else if pixel_bytes == 2 {
+            background.extend(
+                row.chunks_exact(2)
+                    .map(|pixel| u16::from_be_bytes([pixel[0], pixel[1]]) | 0x8000),
+            );
+        } else {
+            let clut = surface.indexed_clut.as_ref()?;
+            background.extend(row.iter().map(|&index| {
+                let [red, green, blue] = clut[usize::from(index)];
+                ((red >> 11) << 10) | ((green >> 11) << 5) | (blue >> 11) | 0x8000
+            }));
+        }
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod packet_texture_cache_tests {
     use super::*;
@@ -2981,14 +3033,15 @@ mod packet_texture_cache_tests {
             byte_order: PPC_Q3_ENDIAN_BIG,
             pixel_bytes: 4,
         };
+        let mut decoded = PpcQ3GpuTextureCache::default();
         let mut textures = Vec::new();
         let mut cache = Vec::new();
         assert_eq!(
-            q3_cached_gpu_texture(&mut memory, &mut textures, &mut cache, texture, None),
+            q3_cached_gpu_texture(&mut memory, &mut decoded, &mut textures, &mut cache, texture, None),
             Some(0)
         );
         assert_eq!(
-            q3_cached_gpu_texture(&mut memory, &mut textures, &mut cache, texture, None),
+            q3_cached_gpu_texture(&mut memory, &mut decoded, &mut textures, &mut cache, texture, None),
             Some(0)
         );
         assert_eq!(textures.len(), 1);
@@ -2999,7 +3052,7 @@ mod packet_texture_cache_tests {
             v_boundary: PPC_Q3_SHADER_UV_BOUNDARY_CLAMP,
         });
         assert_eq!(
-            q3_cached_gpu_texture(&mut memory, &mut textures, &mut cache, texture, clamp),
+            q3_cached_gpu_texture(&mut memory, &mut decoded, &mut textures, &mut cache, texture, clamp),
             Some(1)
         );
         assert_eq!(textures.len(), 2);
@@ -3009,7 +3062,7 @@ mod packet_texture_cache_tests {
             ..clamp.unwrap()
         });
         assert!(
-            q3_cached_gpu_texture(&mut memory, &mut textures, &mut cache, texture, invalid).is_none()
+            q3_cached_gpu_texture(&mut memory, &mut decoded, &mut textures, &mut cache, texture, invalid).is_none()
         );
         assert_eq!(textures.len(), 2);
 
@@ -3017,10 +3070,92 @@ mod packet_texture_cache_tests {
         let mut next_textures = Vec::new();
         let mut next_cache = Vec::new();
         assert_eq!(
-            q3_cached_gpu_texture(&mut memory, &mut next_textures, &mut next_cache, texture, None),
+            q3_cached_gpu_texture(
+                &mut memory,
+                &mut decoded,
+                &mut next_textures,
+                &mut next_cache,
+                texture,
+                None
+            ),
             Some(0)
         );
         assert_eq!(next_textures[0].rgba, [0, 255, 0, 255]);
         assert_eq!(textures[0].rgba, [255, 0, 0, 255]);
+    }
+}
+
+#[cfg(test)]
+mod tagged_background_tests {
+    use super::*;
+    use crate::memory::bus::SharedRamRegion;
+
+    /// Frozen per-pixel construction the row reader replaced.
+    fn reference(
+        memory: &mut PpcSectionMem,
+        surface: &PpcQ3SoftwareFrontBufferSurface,
+    ) -> Option<Vec<u16>> {
+        let front = surface.front_buffer;
+        let mut background = Vec::new();
+        for y in 0..front.height {
+            for x in 0..front.width {
+                background.push(surface.read_pixel(memory, (x as i32, y as i32))? | 0x8000);
+            }
+        }
+        Some(background)
+    }
+
+    #[test]
+    fn row_reads_match_per_pixel_reads_across_layouts() {
+        const BASE: u32 = 0x4000;
+        let bytes = |len: u32| (0..len).map(|n| (n * 37 + n / 7 + 11) as u8).collect::<Vec<u8>>();
+        let mut clut = [[0u16; 3]; 256];
+        for (index, entry) in clut.iter_mut().enumerate() {
+            *entry = [(index * 257) as u16, (index * 131 + 7) as u16, (index * 59 + 900) as u16];
+        }
+        // (depth, width, height, row_bytes)
+        let shapes = [
+            (16, 5, 4, 10), (16, 5, 4, 16), (8, 7, 3, 7), (8, 7, 3, 12), (16, 5, 4, 8), (32, 3, 2, 12),
+            (8, 0, 3, 4), (16, 0, 2, 4), (8, 7, 3, 5),
+        ];
+        for (depth, width, height, row_bytes) in shapes {
+            let front = PpcFrontBuffer { base_addr: BASE, width, height, row_bytes, depth };
+            let len = row_bytes * height;
+            for layout in 0..4 {
+                let mut memory = PpcSectionMem::new();
+                match layout {
+                    // Mapped past the last row, so a row longer than rowBytes is
+                    // readable and only the per-pixel bounds reject it.
+                    0 => memory.add_region(BASE, bytes(len + 2 * row_bytes)),
+                    // A shared mapping: no borrowed span, routed reads only.
+                    // SAFETY: the test owns the backing and accesses it serially.
+                    1 => unsafe {
+                        memory.add_shared_region(BASE, SharedRamRegion::from_owned_bytes(bytes(len)))
+                    },
+                    // The last row is cut short, so its tail is unmapped.
+                    2 => memory.add_region(BASE, bytes(len - row_bytes + 1)),
+                    // Rows split across two regions at an odd offset.
+                    _ => {
+                        memory.add_region(BASE, bytes(len)[..row_bytes as usize + 3].to_vec());
+                        memory.add_region(
+                            BASE + row_bytes + 3,
+                            bytes(len)[row_bytes as usize + 3..].to_vec(),
+                        );
+                    }
+                }
+                for indexed in [Some(clut), None] {
+                    let surface = PpcQ3SoftwareFrontBufferSurface::new(&mut memory, front, indexed);
+                    let expected = reference(&mut memory, &surface);
+                    let mut actual = Vec::new();
+                    let result = q3_read_tagged_background(&mut memory, &surface, &mut actual);
+                    assert_eq!(
+                        result.map(|()| actual),
+                        expected,
+                        "depth={depth}, row_bytes={row_bytes}, layout={layout}, clut={}",
+                        indexed.is_some()
+                    );
+                }
+            }
+        }
     }
 }

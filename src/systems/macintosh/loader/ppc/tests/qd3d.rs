@@ -25577,6 +25577,385 @@ fn q3_software_renderer_projects_orthographic_and_view_plane_cameras() {
 }
 
 #[test]
+fn q3_point_projector_matches_per_point_projection_and_gates_view_direction() {
+    fn reference_project(
+        command: &PpcQ3SceneTriMeshCommand,
+        front_buffer: PpcFrontBuffer,
+        viewport: PpcQ3ViewportRect,
+        point: (f32, f32, f32),
+    ) -> Option<PpcQ3SoftwareProjectedVertex> {
+        let world = ppc_q3_point3d_transform_values(point, command.local_to_world);
+        let view_direction = ppc_q3_software_view_direction(command.camera, world);
+        let (projected, fog_depth, clip) = if let Some(camera) = command.camera {
+            let world_to_view = ppc_q3_camera_world_to_view_matrix(camera.placement)?;
+            let view_to_frustum = ppc_q3_camera_raster_projection_matrix(&camera)?;
+            let view = ppc_q3_point3d_transform_values(world, world_to_view);
+            let mut clip = ppc_q3_point3d_transform_4d_values(view, view_to_frustum);
+            clip.2 = (-2.0_f32).mul_add(clip.2, -clip.3);
+            (
+                ppc_q3_software_clip_to_projected(clip)?,
+                -view.2,
+                Some(clip),
+            )
+        } else {
+            (world, world.2, None)
+        };
+        if !ppc_q3_point_finite(projected) || !fog_depth.is_finite() {
+            return None;
+        }
+        let (screen_x, screen_y) =
+            ppc_q3_software_projected_to_screen(projected, command.camera, front_buffer, viewport);
+        Some(PpcQ3SoftwareProjectedVertex {
+            x: screen_x,
+            y: screen_y,
+            z: projected.2,
+            clip,
+            world,
+            view_direction,
+            fog_depth,
+            uv: None,
+            diffuse: None,
+            ambient_coefficient: None,
+            normal: None,
+            specular_color: None,
+            specular_control: None,
+            highlight_state: None,
+            vertex_alpha: None,
+        })
+    }
+
+    fn bits_pair(pair: (f32, f32)) -> [u32; 2] {
+        [pair.0.to_bits(), pair.1.to_bits()]
+    }
+    fn bits_triple(triple: (f32, f32, f32)) -> [u32; 3] {
+        [triple.0.to_bits(), triple.1.to_bits(), triple.2.to_bits()]
+    }
+    fn bits_quad(quad: (f32, f32, f32, f32)) -> [u32; 4] {
+        [
+            quad.0.to_bits(),
+            quad.1.to_bits(),
+            quad.2.to_bits(),
+            quad.3.to_bits(),
+        ]
+    }
+    fn assert_vertex_bits_eq(
+        actual: Option<PpcQ3SoftwareProjectedVertex>,
+        expected: Option<PpcQ3SoftwareProjectedVertex>,
+    ) {
+        assert_eq!(actual.is_some(), expected.is_some());
+        let (Some(a), Some(e)) = (actual, expected) else {
+            return;
+        };
+        assert_eq!(a.x.to_bits(), e.x.to_bits());
+        assert_eq!(a.y.to_bits(), e.y.to_bits());
+        assert_eq!(a.z.to_bits(), e.z.to_bits());
+        assert_eq!(a.clip.map(bits_quad), e.clip.map(bits_quad));
+        assert_eq!(bits_triple(a.world), bits_triple(e.world));
+        assert_eq!(
+            a.view_direction.map(bits_triple),
+            e.view_direction.map(bits_triple)
+        );
+        assert_eq!(a.fog_depth.to_bits(), e.fog_depth.to_bits());
+        assert_eq!(a.uv.map(bits_pair), e.uv.map(bits_pair));
+    }
+
+    let view = PPC_Q3_OBJECT_BASE;
+    let front_buffer = PpcFrontBuffer {
+        base_addr: PPC_HEAP_BASE,
+        row_bytes: 320 * 2,
+        width: 320,
+        height: 240,
+        depth: 16,
+    };
+    let sub_viewport = PpcQ3ViewportRect {
+        left: 17,
+        top: 23,
+        right: 291,
+        bottom: 211,
+    };
+    let placement = PpcQ3CameraPlacement {
+        camera_location: (1.25, -0.75, 4.5),
+        point_of_interest: (-0.5, 0.25, -2.0),
+        up_vector: (0.1, 1.0, 0.05),
+    };
+    let perspective = PpcQ3CameraRecord {
+        camera: PPC_Q3_OBJECT_BASE + PPC_Q3_OBJECT_STRIDE,
+        camera_type: PPC_Q3_CAMERA_TYPE_VIEW_ANGLE_ASPECT,
+        placement,
+        range_hither: 0.5,
+        range_yon: 50.0,
+        viewport_origin: (-0.75, 0.85),
+        viewport_width: 1.5,
+        viewport_height: 1.6,
+        projection: PpcQ3CameraProjection::ViewAngleAspect {
+            fov: 1.1,
+            aspect_ratio_x_to_y: 4.0 / 3.0,
+        },
+    };
+    let orthographic = PpcQ3CameraRecord {
+        camera_type: PPC_Q3_CAMERA_TYPE_ORTHOGRAPHIC,
+        projection: PpcQ3CameraProjection::Orthographic {
+            left: -2.0,
+            top: 2.0,
+            right: 2.0,
+            bottom: -2.0,
+        },
+        ..perspective
+    };
+    let origin_perspective = PpcQ3CameraRecord {
+        placement: PpcQ3CameraPlacement {
+            camera_location: (0.0, 0.0, 0.0),
+            point_of_interest: (0.0, 0.0, -1.0),
+            up_vector: (0.0, 1.0, 0.0),
+        },
+        ..perspective
+    };
+    let degenerate_camera = PpcQ3CameraRecord {
+        placement: PpcQ3CameraPlacement {
+            camera_location: (1.0, 2.0, 3.0),
+            point_of_interest: (1.0, 2.0, 3.0),
+            up_vector: (0.0, 1.0, 0.0),
+        },
+        ..perspective
+    };
+    let transform = [
+        [1.25, -0.2, 0.1, 0.0],
+        [0.15, 0.9, -0.3, 0.0],
+        [-0.05, 0.25, 1.1, 0.0],
+        [0.4, -0.6, -3.2, 1.0],
+    ];
+    let sample_points = [
+        (0.0, 0.0, 0.0),
+        (-1.3, 0.7, -2.1),
+        (2.4, -1.9, 0.5),
+        // Exactly at camera location after identity transform for degenerate view test:
+        (1.25, -0.75, 4.5),
+        (f32::NAN, 0.0, -1.0),
+    ];
+
+    for local_to_world in [transform, ppc_q3_matrix4x4_identity()] {
+        for camera in [
+            Some(perspective),
+            Some(orthographic),
+            Some(origin_perspective),
+            Some(degenerate_camera),
+            None,
+        ] {
+            let command = PpcQ3SceneTriMeshCommand {
+                submission_index: 0,
+                view_state: PpcQ3ViewStateRecord::new(view),
+                camera,
+                geometry: PpcQ3SceneTriMeshGeometry {
+                    source: PpcQ3SceneTriMeshSource::DataPtr(0),
+                    data: Vec::new(),
+                    memory_regions: Vec::new(),
+                },
+                local_to_world,
+                material: PpcQ3SubmissionMaterialRecord {
+                    view,
+                    kind: PpcQ3SubmissionKind::TriMesh,
+                    primary: 0,
+                    secondary: 0,
+                    shader: 0,
+                    illumination_type: PPC_Q3_ILLUMINATION_TYPE_PHONG,
+                    styles: Vec::new(),
+                    fog_style: None,
+                    attributes: Vec::new(),
+                    shader_uv_transform: None,
+                    shader_boundary: None,
+                    texture_shader: None,
+                    mipmap_texture: None,
+                },
+                lights: PpcQ3SubmissionLightRecord {
+                    view,
+                    kind: PpcQ3SubmissionKind::TriMesh,
+                    primary: 0,
+                    secondary: 0,
+                    light_group: 0,
+                    lights: Vec::new(),
+                },
+            };
+            let with_view =
+                PpcQ3SoftwarePointProjector::new(&command, front_buffer, sub_viewport, true);
+            let without_view =
+                PpcQ3SoftwarePointProjector::new(&command, front_buffer, sub_viewport, false);
+            for point in sample_points {
+                let expected = reference_project(&command, front_buffer, sub_viewport, point);
+                if local_to_world == ppc_q3_matrix4x4_identity() {
+                    if point == (1.25, -0.75, 4.5)
+                        && (camera == Some(perspective) || camera == Some(orthographic))
+                    {
+                        assert_eq!(expected.unwrap().view_direction, Some((0.0, 0.0, 1.0)));
+                    }
+                    if point == (0.0, 0.0, 0.0) && camera == Some(origin_perspective) {
+                        assert!(expected.is_none());
+                    }
+                }
+                assert_vertex_bits_eq(with_view.project(point), expected);
+                assert_vertex_bits_eq(
+                    ppc_q3_software_project_point(&command, front_buffer, sub_viewport, point),
+                    expected,
+                );
+                let mut expected_no_view = expected;
+                if let Some(v) = &mut expected_no_view {
+                    v.view_direction = None;
+                }
+                assert_vertex_bits_eq(without_view.project(point), expected_no_view);
+            }
+        }
+    }
+
+    // Verify prepare_q3_gpu_frame handles untextured meshes without dummy UVs,
+    // preserves uv_transform evaluation on default (0, 0) UVs, and populates
+    // view_direction only when Phong specular attributes are active.
+    let trimesh_data = PPC_DATA_BASE + 0x1000;
+    let triangles_ptr = PPC_DATA_BASE + 0x1100;
+    let points_ptr = PPC_DATA_BASE + 0x1200;
+    let front_base = PPC_HEAP_BASE + 0x1000;
+    let pef = synthetic_pef_with_library_import(b"QuickDraw\xaa 3D", b"Q3TriMesh_Submit");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    loaded.memory.add_region(trimesh_data, vec![0; 0x400]);
+    loaded.memory.add_region(front_base, vec![0; 16 * 16 * 2]);
+    loaded.gworlds = vec![PpcGWorldRecord {
+        ui_theme: crate::ui_theme::UiThemeId::ClassicSystem7,
+        port: PPC_MAIN_GWORLD,
+        pixmap_handle: 0,
+        pixmap: 0,
+        base_addr: front_base,
+        gdevice: PPC_MAIN_GDEVICE,
+        width: 16,
+        height: 16,
+        depth: 16,
+        row_bytes: 32,
+        pixels_locked: false,
+        pixels_no_purge: false,
+    }];
+    loaded
+        .current_gworld
+        .with_mut(|current_gworld| *current_gworld = PPC_MAIN_GWORLD);
+    loaded
+        .memory
+        .write_u32_be(trimesh_data + PPC_Q3_TRIMESH_NUM_TRIANGLES_OFFSET, 1)
+        .unwrap();
+    loaded
+        .memory
+        .write_u32_be(
+            trimesh_data + PPC_Q3_TRIMESH_TRIANGLES_OFFSET,
+            triangles_ptr,
+        )
+        .unwrap();
+    loaded
+        .memory
+        .write_u32_be(trimesh_data + PPC_Q3_TRIMESH_NUM_POINTS_OFFSET, 3)
+        .unwrap();
+    loaded
+        .memory
+        .write_u32_be(trimesh_data + PPC_Q3_TRIMESH_POINTS_OFFSET, points_ptr)
+        .unwrap();
+    for (idx, pt) in [(-0.5, -0.5, 0.0), (-0.5, 0.5, 0.0), (0.5, -0.5, 0.0)]
+        .into_iter()
+        .enumerate()
+    {
+        ppc_write_q3_vector3d(&mut loaded.memory, points_ptr + idx as u32 * 12, pt).unwrap();
+        loaded
+            .memory
+            .write_u32_be(triangles_ptr + idx as u32 * 4, idx as u32)
+            .unwrap();
+    }
+    loaded.q3_views.push(PpcQ3ViewStateRecord::new(view));
+    loaded.q3_submissions.push(PpcQ3SubmissionRecord {
+        view,
+        kind: PpcQ3SubmissionKind::TriMesh,
+        primary: trimesh_data,
+        secondary: 0,
+    });
+    loaded
+        .q3_submission_transforms
+        .push(PpcQ3SubmissionTransformRecord {
+            view,
+            kind: PpcQ3SubmissionKind::TriMesh,
+            primary: trimesh_data,
+            secondary: 0,
+            local_to_world: ppc_q3_matrix4x4_identity(),
+        });
+    loaded
+        .q3_submission_materials
+        .push(PpcQ3SubmissionMaterialRecord {
+            view,
+            kind: PpcQ3SubmissionKind::TriMesh,
+            primary: trimesh_data,
+            secondary: 0,
+            shader: 0,
+            illumination_type: PPC_Q3_ILLUMINATION_TYPE_LAMBERT,
+            styles: Vec::new(),
+            fog_style: None,
+            attributes: Vec::new(),
+            shader_uv_transform: Some(PpcQ3ShaderUvTransformRecord {
+                shader: 0,
+                matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.25, 0.75, 1.0]],
+            }),
+            shader_boundary: None,
+            texture_shader: None,
+            mipmap_texture: None,
+        });
+    loaded
+        .q3_submission_lights
+        .push(PpcQ3SubmissionLightRecord {
+            view,
+            kind: PpcQ3SubmissionKind::TriMesh,
+            primary: trimesh_data,
+            secondary: 0,
+            light_group: 0,
+            lights: Vec::new(),
+        });
+
+    // Unlit/legacy transport accepts untextured mesh without UVs and still transforms (0, 0).
+    let base_commands = loaded.q3_scene_commands();
+    let transport_frame = loaded
+        .prepare_q3_gpu_frame(base_commands.clone(), false)
+        .expect("untextured mesh without vertex UVs should prepare on legacy GPU transport");
+    assert_eq!(transport_frame.draws[0].vertices[0].uv, [0.25, 0.75]);
+
+    // Lambert with active directional light omits view_direction; Phong populates it.
+    let mut lambert_commands = base_commands;
+    let PpcQ3SceneCommand::TriMesh(cmd) = &mut lambert_commands[0] else {
+        unreachable!()
+    };
+    cmd.camera = Some(perspective);
+    cmd.lights.lights.push(PpcQ3LightRecord {
+        light: PPC_Q3_OBJECT_BASE + PPC_Q3_OBJECT_STRIDE * 3,
+        light_type: PPC_Q3_LIGHT_TYPE_DIRECTIONAL,
+        data: PpcQ3LightData {
+            is_on: 1,
+            brightness: 1.0,
+            color: (1.0, 1.0, 1.0),
+        },
+        kind: PpcQ3LightKind::Directional {
+            casts_shadows: 0,
+            direction: (0.0, 0.0, -1.0),
+        },
+    });
+    let lambert_frame = loaded
+        .prepare_q3_gpu_frame(lambert_commands.clone(), true)
+        .unwrap();
+    assert!(lambert_frame.draws[0]
+        .vertices
+        .iter()
+        .all(|v| v.shading.view_direction.is_none()));
+
+    let mut phong_commands = lambert_commands;
+    let PpcQ3SceneCommand::TriMesh(cmd) = &mut phong_commands[0] else {
+        unreachable!()
+    };
+    cmd.material.illumination_type = PPC_Q3_ILLUMINATION_TYPE_PHONG;
+    let phong_frame = loaded.prepare_q3_gpu_frame(phong_commands, true).unwrap();
+    assert!(phong_frame.draws[0]
+        .vertices
+        .iter()
+        .all(|v| v.shading.view_direction.is_some()));
+}
+
+#[test]
 fn hle_import_runner_records_q3_fog_style_submit_state() {
     let view = PPC_Q3_OBJECT_BASE;
     let fog_data_ptr = PPC_DATA_BASE + 0x1000;
@@ -27941,4 +28320,477 @@ fn hle_import_runner_reports_the_apple_software_engine_without_fast_features() {
         assert_eq!(loaded.cpu.gpr[3], 0, "selector {selector}");
         assert_eq!(loaded.memory.read_u32_be(response_ptr), Some(expected), "selector {selector}");
     }
+}
+
+#[test]
+fn q3_copy_or_zero_matches_the_byte_loop_across_layouts() {
+    use crate::memory::bus::SharedRamRegion;
+    // Frozen pre-optimization copy: forward byte order, unreadable source
+    // bytes as zero, stopping at the first rejected store.
+    fn reference(memory: &mut PpcSectionMem, source_ptr: u32, dest_ptr: u32, byte_count: u32) -> bool {
+        if dest_ptr == 0 {
+            return false;
+        }
+        for offset in 0..byte_count {
+            let byte = if source_ptr == 0 { 0 } else { memory.read_u8(source_ptr + offset).unwrap_or(0) };
+            if memory.write_u8(dest_ptr + offset, byte).is_none() {
+                return false;
+            }
+        }
+        true
+    }
+    const A: u32 = 0x2000;
+    const B: u32 = 0x3000;
+    let pattern = |seed: u32| (0..64u32).map(|n| (n * 29 + seed) as u8).collect::<Vec<u8>>();
+    let layout = |kind: u32| {
+        let mut memory = PpcSectionMem::new();
+        match kind {
+            0 => {
+                memory.add_region(A, pattern(1));
+                memory.add_region(B, pattern(7));
+            }
+            // Both ranges in one region, for overlapping copies.
+            1 => memory.add_region(A, [pattern(1), pattern(7)].concat()),
+            // A hole in the source and a read-only destination tail.
+            2 => {
+                memory.add_region(A, pattern(1)[..20].to_vec());
+                memory.add_region(A + 24, pattern(1)[24..].to_vec());
+                memory.add_region(B, pattern(7)[..40].to_vec());
+                memory.add_readonly_region(B + 40, pattern(7)[40..].to_vec());
+            }
+            // One shared allocation mapped at both addresses: disjoint
+            // addresses alias the same bytes.
+            3 => {
+                let shared = SharedRamRegion::from_owned_bytes(pattern(3));
+                // SAFETY: the test owns the backing and accesses it serially.
+                unsafe {
+                    memory.add_shared_region(A, shared.clone());
+                    memory.add_shared_region(B, shared);
+                }
+            }
+            // An ordinary source and a shared destination.
+            4 => {
+                memory.add_region(A, pattern(1));
+                // SAFETY: as above.
+                unsafe { memory.add_shared_region(B, SharedRamRegion::from_owned_bytes(pattern(7))) };
+            }
+            // A newer overlay covering part of an older region.
+            5 => {
+                memory.add_region(A, pattern(1));
+                memory.add_region(A + 16, pattern(5)[..16].to_vec());
+                memory.add_region(B, pattern(7));
+            }
+            _ => unreachable!(),
+        }
+        memory
+    };
+    let cases = [
+        (A, B, 64), (A + 5, B + 9, 30), (0, B, 64), (A, B, 0), (0, B + 40, 24),
+        (A, A + 3, 40), (A + 3, A, 40), (A, A, 64), (A + 64, A + 70, 40),
+        (A + 10, B + 30, 30), (A + 18, B, 12), (A, B + 60, 8), (A + 60, B, 8), (0x9000, B, 8),
+    ];
+    for kind in 0..6 {
+        for (source, dest, count) in cases {
+            let (mut expected, mut actual) = (layout(kind), layout(kind));
+            let result = reference(&mut expected, source, dest, count);
+            assert_eq!(ppc_q3_copy_or_zero(&mut actual, source, dest, count), result,
+                "layout={kind}, source={source:#x}, dest={dest:#x}, count={count}");
+            for address in (A - 8..A + 136).chain(B - 8..B + 72) {
+                assert_eq!(actual.read_u8(address), expected.read_u8(address),
+                    "layout={kind}, source={source:#x}, dest={dest:#x}, count={count}, address={address:#x}");
+            }
+        }
+    }
+    // Ranges spanning several bulk chunks, unaligned to the chunk size, into
+    // a writable or a read-only destination.
+    const C: u32 = 0x10000;
+    const D: u32 = 0x20000;
+    const LONG: u32 = 3 * 4096 + 100;
+    let long = |seed: u32| (0..LONG).map(|n| (n * 29 + n / 251 + seed) as u8).collect::<Vec<u8>>();
+    for readonly in [false, true] {
+        let layout = || {
+            let mut memory = PpcSectionMem::new();
+            memory.add_region(C, long(1));
+            if readonly {
+                memory.add_readonly_region(D, long(7));
+            } else {
+                memory.add_region(D, long(7));
+            }
+            memory
+        };
+        for (source, dest, count) in [(C, D, LONG), (C + 5, D + 4093, 2 * 4096 + 17), (0, D + 1, 4097)] {
+            let (mut expected, mut actual) = (layout(), layout());
+            let result = reference(&mut expected, source, dest, count);
+            assert_eq!(result, !readonly);
+            assert_eq!(ppc_q3_copy_or_zero(&mut actual, source, dest, count), result,
+                "readonly={readonly}, source={source:#x}, dest={dest:#x}, count={count}");
+            for address in (C - 8..C + LONG + 8).chain(D - 8..D + LONG + 8) {
+                assert_eq!(actual.read_u8(address), expected.read_u8(address),
+                    "readonly={readonly}, source={source:#x}, dest={dest:#x}, count={count}, address={address:#x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn q3_clip_inside_triangles_match_the_plane_by_plane_clip() {
+    let camera = PpcQ3CameraRecord {
+        camera: PPC_Q3_OBJECT_BASE, camera_type: PPC_Q3_CAMERA_TYPE_VIEW_ANGLE_ASPECT,
+        placement: PpcQ3CameraPlacement {
+            camera_location: (0., 0., 0.), point_of_interest: (0., 0., -1.),
+            up_vector: (0., 1., 0.),
+        },
+        range_hither: 10., range_yon: 2800.,
+        viewport_origin: (-1., 1.), viewport_width: 2., viewport_height: 2.,
+        projection: PpcQ3CameraProjection::ViewAngleAspect { fov: 1., aspect_ratio_x_to_y: 1. },
+    };
+    let front = PpcFrontBuffer { base_addr: 0, row_bytes: 1280, width: 640, height: 480, depth: 16 };
+    let pane = PpcQ3ViewportRect { left: 118, top: 9, right: 628, bottom: 370 };
+    // The six clips in their original order, without the early return.
+    let reference = |vertices: [PpcQ3SoftwareProjectedVertex; 3]| {
+        let mut clipped = vertices.to_vec();
+        for plane in [
+            PpcQ3SoftwareClipPlane::Near, PpcQ3SoftwareClipPlane::Left, PpcQ3SoftwareClipPlane::Right,
+            PpcQ3SoftwareClipPlane::Bottom, PpcQ3SoftwareClipPlane::Top, PpcQ3SoftwareClipPlane::Far,
+        ] {
+            clipped = ppc_q3_software_clip_projected_polygon_clip(&clipped, plane, camera, front, pane);
+            if clipped.len() < 3 {
+                return Vec::new();
+            }
+        }
+        clipped
+    };
+    // Ratios to w that sit inside, on, within the tolerance of, and outside a plane.
+    let eps = PPC_Q3_SOFTWARE_CLIP_EPSILON;
+    let ratios = [0., 0.4, -0.7, 1., -1., 1. + eps * 0.5, -1. - eps * 0.5, 1. + eps * 4., -1. - eps * 4., 1.3, -2.];
+    let ws = [1., 37.5, 0.001, -2., 0., f32::NAN, f32::INFINITY];
+    let mut seed = 0x2545_f491u32;
+    let mut next = |len: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize % len
+    };
+    let (mut inside, mut clipped_cases) = (0, 0);
+    for case in 0..6000 {
+        let vertices: [PpcQ3SoftwareProjectedVertex; 3] = std::array::from_fn(|index| {
+            // Most cases keep every vertex strictly inside; the rest mix in boundary values.
+            let w = if case % 3 == 0 { ws[next(2)] } else { ws[next(ws.len())] };
+            let mut ratio = || if case % 3 == 0 { ratios[next(3)] } else { ratios[next(ratios.len())] };
+            let clip = (ratio() * w, ratio() * w, ratio() * w, w);
+            let (x, y, z) = match ppc_q3_software_clip_to_projected(clip) {
+                Some(projected) => {
+                    let (x, y) = ppc_q3_software_projected_to_screen(projected, Some(camera), front, pane);
+                    (x, y, projected.2)
+                }
+                None => (0., 0., 0.),
+            };
+            PpcQ3SoftwareProjectedVertex {
+                x, y, z, clip: Some(clip), world: (index as f32, case as f32, 0.),
+                view_direction: None, fog_depth: 0., uv: Some((index as f32, 1.)), diffuse: None,
+                ambient_coefficient: None, normal: None, specular_color: None,
+                specular_control: None, highlight_state: None, vertex_alpha: None,
+            }
+        });
+        let expected = reference(vertices);
+        let actual = ppc_q3_software_clip_projected_triangle(Some(camera), front, pane, vertices);
+        // Debug formatting compares NaN payloads that PartialEq would reject.
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "case {case}: {vertices:?}");
+        if expected == vertices.to_vec() { inside += 1 } else { clipped_cases += 1 }
+    }
+    assert!(inside > 500 && clipped_cases > 500, "inside={inside}, clipped={clipped_cases}");
+}
+
+#[test]
+fn q3_gpu_texture_cache_reuses_only_unchanged_ordinary_rows() {
+    use crate::memory::bus::SharedRamRegion;
+    const BASE: u32 = 0x1200;
+    let pixels: Vec<u8> = (0..64).map(|n| (n * 13 + 5) as u8).collect();
+    let texture = PpcQ3SoftwareTexture {
+        image_base: BASE, valid_size: pixels.len() as u32, image_offset: 3,
+        width: 3, height: 2, row_bytes: 11, pixel_type: PPC_Q3_PIXEL_TYPE_ARGB16,
+        byte_order: PPC_Q3_ENDIAN_BIG, pixel_bytes: 2,
+    };
+    let clamp = Some(PpcQ3ShaderBoundaryRecord {
+        shader: 0, u_boundary: PPC_Q3_SHADER_UV_BOUNDARY_CLAMP,
+        v_boundary: PPC_Q3_SHADER_UV_BOUNDARY_CLAMP,
+    });
+    // Ordinary memory: a repeat request reuses the entry, a guest write
+    // replaces it, and every answer equals a fresh conversion.
+    let mut memory = PpcSectionMem::new();
+    memory.add_region(BASE, pixels.clone());
+    let mut cache = PpcQ3GpuTextureCache::default();
+    let first = ppc_q3_gpu_texture_from_software(&mut memory, texture, clamp);
+    for frame in 0..3 {
+        cache.begin_frame();
+        if frame == 2 {
+            memory.write_u8(BASE + 4, 0x7f).unwrap();
+        }
+        let fresh = ppc_q3_gpu_texture_from_software(&mut memory, texture, clamp);
+        assert_eq!(cache.texture(&mut memory, texture, clamp), fresh, "frame={frame}");
+        assert_eq!(fresh == first, frame < 2, "the guest write must change the texture");
+        assert_eq!(cache.len(), 1);
+    }
+    // Another descriptor at the same address is converted separately.
+    let other = PpcQ3SoftwareTexture { pixel_type: PPC_Q3_PIXEL_TYPE_RGB16, ..texture };
+    assert_eq!(cache.texture(&mut memory, other, clamp),
+        ppc_q3_gpu_texture_from_software(&mut memory, other, clamp));
+    assert_eq!(cache.len(), 2);
+    // Textures the last two frames did not use are forgotten.
+    for unused_frames in 1..=3 {
+        cache.begin_frame();
+        assert_eq!(cache.len(), if unused_frames < 3 { 2 } else { 0 }, "{unused_frames}");
+    }
+    // Rows split across mappings or touching shared memory cannot be compared
+    // as one slice, so they are converted every time and never cached.
+    for layout in 0..2 {
+        let mut memory = PpcSectionMem::new();
+        if layout == 0 {
+            memory.add_region(BASE, pixels[..6].to_vec());
+            memory.add_region(BASE + 6, pixels[6..].to_vec());
+        } else {
+            memory.add_region(BASE, pixels.clone());
+            // SAFETY: the test owns the backing and accesses it serially.
+            unsafe {
+                memory.add_shared_region(BASE + 6, SharedRamRegion::from_owned_bytes(vec![0x8a, 0xba, 0xcd]));
+            }
+        }
+        let mut cache = PpcQ3GpuTextureCache::default();
+        cache.begin_frame();
+        let fresh = ppc_q3_gpu_texture_from_software(&mut memory, texture, clamp);
+        assert!(fresh.is_some(), "layout={layout}");
+        assert_eq!(cache.texture(&mut memory, texture, clamp), fresh, "layout={layout}");
+        assert_eq!(cache.len(), 0, "layout={layout}");
+    }
+}
+
+#[test]
+fn q3_gpu_texture_cache_observes_a_write_to_any_byte() {
+    const BASE: u32 = 0x1200;
+    let pixels: Vec<u8> = (0..64).map(|n| (n * 13 + 5) as u8).collect();
+    let texture = PpcQ3SoftwareTexture {
+        image_base: BASE, valid_size: pixels.len() as u32, image_offset: 3,
+        width: 4, height: 4, row_bytes: 11, pixel_type: PPC_Q3_PIXEL_TYPE_ARGB16,
+        byte_order: PPC_Q3_ENDIAN_BIG, pixel_bytes: 2,
+    };
+    // One mapping takes the whole-image comparison. A split at the start of
+    // row 2 leaves every row readable but not the image, so rows are compared
+    // one at a time.
+    for split in [None, Some(3 + 2 * 11)] {
+        for target in 0..pixels.len() as u32 {
+            let mut memory = PpcSectionMem::new();
+            match split {
+                None => memory.add_region(BASE, pixels.clone()),
+                Some(at) => {
+                    memory.add_region(BASE, pixels[..at].to_vec());
+                    memory.add_region(BASE + at as u32, pixels[at..].to_vec());
+                }
+            }
+            let mut cache = PpcQ3GpuTextureCache::default();
+            cache.begin_frame();
+            let first = cache.texture(&mut memory, texture, None);
+            assert!(first.is_some());
+            assert_eq!(first, ppc_q3_gpu_texture_from_software(&mut memory, texture, None));
+            assert_eq!(cache.len(), 1, "split={split:?}");
+            // Flip all bits so every texel channel that reads the byte changes.
+            memory.write_u8(BASE + target, !pixels[target as usize]).unwrap();
+            cache.begin_frame();
+            assert_eq!(
+                cache.texture(&mut memory, texture, None),
+                ppc_q3_gpu_texture_from_software(&mut memory, texture, None),
+                "split={split:?}, target={target}"
+            );
+        }
+    }
+}
+
+const PRESENT_PACING_VIEW: u32 = 0x0200_0100;
+const PRESENT_PACING_CONTEXT: u32 = 0x0200_0200;
+const PRESENT_PACING_WINDOW: u32 = 0x0300_0000;
+const PRESENT_PACING_OFFSCREEN: u32 = 0x0310_0000;
+
+fn present_pacing_mac_context(port: u32, double_buffered: bool) -> PpcQ3DrawContextRecord {
+    let mut data = vec![0u8; PPC_Q3_MAC_DRAW_CONTEXT_DATA_SIZE as usize];
+    let state = PPC_Q3_DRAW_CONTEXT_DOUBLE_BUFFER_STATE_OFFSET as usize;
+    data[state..state + 4].copy_from_slice(&u32::from(double_buffered).to_be_bytes());
+    let port_offset = PPC_Q3_MAC_DRAW_CONTEXT_PORT_OFFSET as usize;
+    data[port_offset..port_offset + 4].copy_from_slice(&port.to_be_bytes());
+    PpcQ3DrawContextRecord {
+        draw_context: PRESENT_PACING_CONTEXT,
+        draw_context_type: PPC_Q3_DRAW_CONTEXT_TYPE_MACINTOSH,
+        data,
+    }
+}
+
+fn present_pacing_pixmap_context() -> PpcQ3DrawContextRecord {
+    let mut data = vec![0u8; PPC_Q3_PIXMAP_DRAW_CONTEXT_DATA_SIZE as usize];
+    let state = PPC_Q3_DRAW_CONTEXT_DOUBLE_BUFFER_STATE_OFFSET as usize;
+    data[state..state + 4].copy_from_slice(&1u32.to_be_bytes());
+    PpcQ3DrawContextRecord {
+        draw_context: PRESENT_PACING_CONTEXT,
+        draw_context_type: PPC_Q3_DRAW_CONTEXT_TYPE_PIXMAP,
+        data,
+    }
+}
+
+/// Runs the EndRendering that completes one frame on `context` at `tick`
+/// and returns its action. `tick` of `None` means pacing is off.
+fn present_pacing_end_rendering(
+    context: &PpcQ3DrawContextRecord,
+    state: &mut PpcQ3PresentPacingState,
+    tick: Option<u32>,
+    park_enabled: bool,
+) -> PpcImportAction {
+    present_pacing_end_rendering_at_depth(context, state, tick, park_enabled, 1)
+}
+
+fn present_pacing_end_rendering_at_depth(
+    context: &PpcQ3DrawContextRecord,
+    state: &mut PpcQ3PresentPacingState,
+    tick: Option<u32>,
+    park_enabled: bool,
+    rendering_depth: u32,
+) -> PpcImportAction {
+    let mut cpu = PpcCpu::new();
+    cpu.gpr[3] = PRESENT_PACING_VIEW;
+    let mut views = vec![PpcQ3ViewStateRecord {
+        draw_context: context.draw_context,
+        rendering_depth,
+        ..PpcQ3ViewStateRecord::new(PRESENT_PACING_VIEW)
+    }];
+    let is_window_port = |port: u32| port == PRESENT_PACING_WINDOW;
+    let pacing = tick.map(|tick| PpcQ3PresentPacing {
+        state,
+        park_enabled,
+        tick,
+        cycles_until_next_tick: PRESENT_PACING_CYCLES_TO_BOUNDARY,
+        is_window_port: &is_window_port,
+    });
+    let action = dispatch_q3_view_end_rendering_import(
+        &mut cpu,
+        &mut views,
+        &[],
+        &[],
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        std::slice::from_ref(context),
+        &[],
+        &[],
+        0,
+        &mut PpcQ3ErrorState::default(),
+        false,
+        pacing,
+    );
+    // A blocked present must leave the frame open for the re-entered call.
+    if matches!(action, PpcImportAction::Yield(_)) {
+        assert_eq!(views[0].rendering_depth, rendering_depth);
+    }
+    action
+}
+
+const PRESENT_PACING_CYCLES_TO_BOUNDARY: u64 = 400_000;
+const PRESENT_DONE: PpcImportAction = PpcImportAction::Return(PPC_Q3_VIEW_STATUS_DONE);
+
+#[test]
+fn q3_present_pacing_blocks_a_second_window_present_in_one_tick_until_the_boundary() {
+    let context = present_pacing_mac_context(PRESENT_PACING_WINDOW, true);
+    let mut state = PpcQ3PresentPacingState::default();
+
+    assert_eq!(present_pacing_end_rendering(&context, &mut state, Some(100), true), PRESENT_DONE);
+    // The second frame of tick 100 blocks in EndRendering for exactly the
+    // cycles left to the boundary, without consuming the frame.
+    assert_eq!(
+        present_pacing_end_rendering(&context, &mut state, Some(100), true),
+        PpcImportAction::Yield(PRESENT_PACING_CYCLES_TO_BOUNDARY)
+    );
+    // A slice that ended before the boundary re-enters in the same tick and
+    // keeps waiting; it is still one wait.
+    assert_eq!(
+        present_pacing_end_rendering(&context, &mut state, Some(100), true),
+        PpcImportAction::Yield(PRESENT_PACING_CYCLES_TO_BOUNDARY)
+    );
+    assert_eq!(state.parks_of(PpcQ3PresentKind::Window), 1);
+    assert_eq!(state.presents_of(PpcQ3PresentKind::Window), 1);
+    // At the boundary the blocked present goes through as tick 101's present.
+    assert_eq!(present_pacing_end_rendering(&context, &mut state, Some(101), true), PRESENT_DONE);
+    assert_eq!(state.presents_of(PpcQ3PresentKind::Window), 2);
+    // So the next frame drawn in tick 101 waits for tick 102.
+    assert!(matches!(
+        present_pacing_end_rendering(&context, &mut state, Some(101), true),
+        PpcImportAction::Yield(_)
+    ));
+    assert_eq!(state.parks_of(PpcQ3PresentKind::Window), 2);
+}
+
+#[test]
+fn q3_present_pacing_never_parks_the_first_present_of_a_tick() {
+    let context = present_pacing_mac_context(PRESENT_PACING_WINDOW, true);
+    let mut state = PpcQ3PresentPacingState::default();
+    for tick in [0, 1, 2, 5, 9, u32::MAX, 0] {
+        assert_eq!(present_pacing_end_rendering(&context, &mut state, Some(tick), true), PRESENT_DONE);
+    }
+    assert_eq!(state.parks_of(PpcQ3PresentKind::Window), 0);
+    assert_eq!(state.presents_of(PpcQ3PresentKind::Window), 7);
+}
+
+#[test]
+fn q3_present_pacing_never_parks_pixmap_offscreen_or_single_buffered_contexts() {
+    for (context, kind) in [
+        (present_pacing_pixmap_context(), PpcQ3PresentKind::Pixmap),
+        (
+            present_pacing_mac_context(PRESENT_PACING_OFFSCREEN, true),
+            PpcQ3PresentKind::Offscreen,
+        ),
+        (
+            present_pacing_mac_context(PRESENT_PACING_WINDOW, false),
+            PpcQ3PresentKind::SingleBuffered,
+        ),
+    ] {
+        let mut state = PpcQ3PresentPacingState::default();
+        for _ in 0..4 {
+            assert_eq!(
+                present_pacing_end_rendering(&context, &mut state, Some(42), true),
+                PRESENT_DONE,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(state.presents_of(kind), 4, "{kind:?}");
+        assert_eq!(state.parks, [0; 5], "{kind:?}");
+    }
+}
+
+#[test]
+fn q3_present_pacing_off_leaves_end_rendering_unchanged() {
+    let context = present_pacing_mac_context(PRESENT_PACING_WINDOW, true);
+    let mut state = PpcQ3PresentPacingState::default();
+    for _ in 0..3 {
+        assert_eq!(present_pacing_end_rendering(&context, &mut state, None, true), PRESENT_DONE);
+    }
+    assert_eq!(state, PpcQ3PresentPacingState::default());
+    // Counting without parking also leaves every present untouched.
+    for _ in 0..3 {
+        assert_eq!(present_pacing_end_rendering(&context, &mut state, Some(9), false), PRESENT_DONE);
+    }
+    assert_eq!(state.presents_of(PpcQ3PresentKind::Window), 3);
+    assert_eq!(state.parks, [0; 5]);
+}
+
+#[test]
+fn q3_present_pacing_does_not_block_an_unfinished_nested_end_rendering() {
+    let context = present_pacing_mac_context(PRESENT_PACING_WINDOW, true);
+    let mut state = PpcQ3PresentPacingState::default();
+    assert_eq!(present_pacing_end_rendering(&context, &mut state, Some(5), true), PRESENT_DONE);
+    // An inner EndRendering (rendering depth stays above zero) presents
+    // nothing, so it neither waits nor counts.
+    assert_eq!(
+        present_pacing_end_rendering_at_depth(&context, &mut state, Some(5), true, 2),
+        PRESENT_DONE
+    );
+    assert_eq!(state.presents_of(PpcQ3PresentKind::Window), 1);
+    assert_eq!(state.parks, [0; 5]);
 }

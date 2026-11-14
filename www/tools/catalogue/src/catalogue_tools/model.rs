@@ -61,6 +61,9 @@ pub struct Entry {
     /// Enables the launcher, independently of listing and compatibility verification.
     #[serde(default, skip_serializing_if = "is_default")]
     pub launch_enabled: bool,
+    /// Curated native-app availability; omitted entries are excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeAvailability>,
     pub compatibility: Compatibility,
     #[serde(
         default,
@@ -80,6 +83,15 @@ pub struct Entry {
     pub plugins: Vec<Plugin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAvailability {
+    #[serde(default)]
+    pub enabled: bool,
+    pub edition: String,
+    pub limits: String,
 }
 
 /// Optional downloads and installation files are declared assets, so provenance,
@@ -202,6 +214,8 @@ pub struct Verification {
 #[serde(default, deny_unknown_fields)]
 pub struct Runtime {
     pub worker: bool,
+    /// Prefer adaptive guest-visible compute after per-title qualification.
+    pub gpu_compute: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub launch_modifiers: Vec<LaunchModifier>,
     pub show_menu_bar: bool,
@@ -225,6 +239,7 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             worker: true,
+            gpu_compute: false,
             launch_modifiers: Vec::new(),
             show_menu_bar: false,
             screen_depth: None,

@@ -130,6 +130,9 @@ impl State {
             .map_err(|e| e.to_string())?;
         let health = super::renderer_recovery::Health::install(&device, None);
         let core = pollster::block_on(Qd3dCompute::new(device, queue, health.clone()))?;
+        // Native frames come straight from guest memory each frame, so keep
+        // their converted textures on the device and upload only new bytes.
+        core.set_resident_textures(true);
         Ok(Self { health, core })
     }
 
@@ -495,6 +498,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn resident_textures_render_like_full_uploads() {
+        let state = match State::new() {
+            Ok(state) => state,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("SYSTEMLESS_REQUIRE_GPU").is_none(),
+                    "GPU required: {error}"
+                );
+                return;
+            }
+        };
+        // One textured triangle per texture, side by side.
+        let frame = |textures: &[u8]| {
+            let draws = (0..textures.len())
+                .map(|index| {
+                    let mut draw = triangle(0.5, [1., 1., 1., 1.]);
+                    draw.texture = Some(index);
+                    let left = (index * 8) as f32;
+                    for (v, (x, y, uv)) in draw.vertices.iter_mut().zip([
+                        (left, 1., [0., 0.]),
+                        (left + 7., 1., [1., 0.]),
+                        (left, 22., [0., 1.]),
+                    ]) {
+                        (v.screen_x, v.screen_y, v.uv) = (x, y, uv);
+                    }
+                    draw
+                })
+                .collect();
+            PpcQ3RasterFrame {
+                width: 32,
+                height: 24,
+                viewport: [0, 0, 31, 23],
+                clear_color: None,
+                textures: textures
+                    .iter()
+                    .map(|&seed| PpcQ3GpuTexture {
+                        width: 2,
+                        height: 2,
+                        rgba: (0..16u8)
+                            .map(|n| if n % 4 == 3 { 255 } else { n.wrapping_mul(37) ^ seed })
+                            .collect(),
+                        wrap_u: false,
+                        wrap_v: false,
+                    })
+                    .collect(),
+                draws,
+            }
+        };
+        let background = vec![0x801f; 32 * 24];
+        let render = |frame: &PpcQ3RasterFrame| state.render(frame, &background).unwrap();
+        // A separate renderer without residency writes every texture every
+        // frame: the oracle. It shares no resident state with `state`.
+        let oracle = State::new().expect("GPU already initialized");
+        oracle.set_resident_textures(false);
+        let fresh = |frame: &PpcQ3RasterFrame| oracle.render(frame, &background).unwrap();
+        let mut steps: Vec<Vec<u8>> = vec![
+            vec![1],
+            vec![1],
+            // The same texture with changed pixels and unchanged dimensions,
+            // as a mutated clone would be; both versions may coexist.
+            vec![91],
+            vec![1, 91],
+            // One resident texture and one new, then a duplicate in one frame
+            // beside a texture that differs in high bits, so a wrong offset
+            // shows in the 5-bit output.
+            vec![1, 2],
+            vec![2, 2, 130],
+        ];
+        // New textures until the buffer must be refilled, then old ones.
+        steps.extend((2..10).map(|n| vec![n as u8 * 11, 1]));
+        steps.push(vec![2, 1, 33]);
+        steps.push(Vec::new());
+        steps.push(vec![77, 1]);
+        for (step, textures) in steps.iter().enumerate() {
+            let frame = frame(textures);
+            let expected = fresh(&frame);
+            assert_eq!(render(&frame), expected, "step {step}");
+            assert_eq!(render(&frame), expected, "step {step} reused");
+            // Independently of the texture buffer layout: each triangle's
+            // pixel near its first vertex samples texel (0, 1) of its texture.
+            for (index, texture) in frame.textures.iter().enumerate() {
+                let texel = &texture.rgba[8..11];
+                let rgb = [0, 1, 2].map(|i| f32::from(texel[i]) / 255.);
+                assert_eq!(
+                    expected[3 * 32 + index * 8 + 1],
+                    ppc_q3_rgb555((rgb[0], rgb[1], rgb[2])),
+                    "step {step}, texture {index}"
+                );
+            }
+        }
+        // A frame rejected after its textures were planned is never
+        // submitted, so it must record nothing as resident.
+        let resident = state.resident_texture_count();
+        let mut rejected = frame(&[9, 1]);
+        rejected.draws[1].vertices[0].screen_x = f32::NAN;
+        assert!(state.render(&rejected, &background).is_err());
+        assert_eq!(state.resident_texture_count(), resident);
+        let accepted = frame(&[9, 1]);
+        assert_eq!(render(&accepted), fresh(&accepted));
     }
 
     #[test]
@@ -1986,6 +2091,222 @@ mod tests {
                 };
                 let pixels = state.render(&frame, &vec![0; 32 * 24]).unwrap();
                 assert_eq!(pixels[8 * 32 + 8], expected, "wrap={wrap},uv={uv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_qd3d_vertex_shade_pass_matches_mixed_multi_tile_scene() {
+        let state = match State::new() {
+            Ok(state) => state,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("SYSTEMLESS_REQUIRE_GPU").is_none(),
+                    "GPU required: {error}"
+                );
+                return;
+            }
+        };
+        let (width, height) = (48, 32);
+        let background: Vec<u16> = (0..(width * height) as usize)
+            .map(|i| 0x8000 | ((i as u16 * 13 + 7) & 0x7fff))
+            .collect();
+
+        // Span multiple 16x16 tiles so a triangle shaded in place is read by
+        // several tiles without repeating or corrupting vertex colors.
+        let mut lit_front = PpcQ3RasterDraw {
+            primitive: PpcQ3RasterPrimitive::Triangles,
+            test_depth: true,
+            write_depth: true,
+            blend: false,
+            ambient_light: Some([0.12, 0.16, 0.2]),
+            ambient_per_vertex: true,
+            fog: Some(PpcQ3FogStyleData {
+                state: 1,
+                mode: PPC_Q3_FOG_MODE_LINEAR,
+                fog_start: 1.,
+                fog_end: 6.,
+                density: 0.25,
+                color: (1., 0.1, 0.2, 0.4),
+            }),
+            texture: None,
+            lighting: Some(PpcQ3RasterLighting {
+                interpolation_style: PPC_Q3_INTERPOLATION_STYLE_VERTEX,
+                illumination_type: PPC_Q3_ILLUMINATION_TYPE_PHONG,
+                lights: vec![
+                    PpcQ3LightRecord {
+                        light: 0,
+                        light_type: 0,
+                        data: PpcQ3LightData {
+                            is_on: 1,
+                            brightness: 0.75,
+                            color: (0.9, 0.5, 0.3),
+                        },
+                        kind: PpcQ3LightKind::Directional {
+                            casts_shadows: 0,
+                            direction: (0.25, -0.35, -1.),
+                        },
+                    },
+                    PpcQ3LightRecord {
+                        light: 0,
+                        light_type: 0,
+                        data: PpcQ3LightData {
+                            is_on: 1,
+                            brightness: 0.55,
+                            color: (0.3, 0.6, 0.9),
+                        },
+                        kind: PpcQ3LightKind::Point {
+                            casts_shadows: 0,
+                            attenuation: 1,
+                            location: (0.4, 0.2, 2.),
+                        },
+                    },
+                ],
+            }),
+            vertices: vec![
+                vertex(5., 4., 0.3, [0.7, 0.35, 0.25, 1.]),
+                vertex(41., 6., 0.35, [0.3, 0.75, 0.4, 1.]),
+                vertex(20., 27., 0.4, [0.25, 0.4, 0.8, 1.]),
+            ],
+        };
+        for (i, v) in lit_front.vertices.iter_mut().enumerate() {
+            let n = ppc_q3_vector3d_normalized_value(
+                [(0., 0., 1.), (0.4, -0.2, 1.), (-0.3, 0.5, 1.)][i],
+            )
+            .unwrap();
+            v.shading.normal = Some([n.0, n.1, n.2]);
+            v.shading.view_direction = Some([0.1, -0.1, 1.]);
+            v.shading.world = [[-0.6, -0.4, 0.], [1.1, -0.2, 0.2], [0.2, 0.9, -0.1]][i];
+            v.shading.specular_color = [0.5, 0.6, 0.8];
+            v.shading.specular_control = 12.;
+            v.shading.highlight = true;
+            v.ambient_coefficient = [0.3, 0.85, 0.55][i];
+            v.fog_depth = [1.5, 3.2, 4.8][i];
+            v.reciprocal_w = [1., 0.6, 0.35][i];
+        }
+
+        // Partially occluded behind lit_front so depth-rejected pixels skip
+        // attribute loads while visible pixels still show vertex lighting.
+        let mut lit_back = lit_front.clone();
+        for (v, (x, y)) in lit_back
+            .vertices
+            .iter_mut()
+            .zip([(10., 5.), (43., 25.), (6., 26.)])
+        {
+            v.screen_x = x;
+            v.screen_y = y;
+            v.depth = 0.75;
+            v.color = [0.9, 0.8, 0.2, 1.];
+        }
+
+        // Per-vertex ambient without spatial lights exercises the ambient-only
+        // branch of shade_vertices across tile boundaries.
+        let mut ambient_blend = PpcQ3RasterDraw {
+            primitive: PpcQ3RasterPrimitive::Triangles,
+            test_depth: true,
+            write_depth: false,
+            blend: true,
+            ambient_light: Some([0.85, 0.7, 0.5]),
+            ambient_per_vertex: true,
+            fog: None,
+            texture: None,
+            lighting: None,
+            vertices: vec![
+                vertex(6., 8., 0.2, [0.8, 0.4, 0.9, 0.55]),
+                vertex(38., 10., 0.2, [0.3, 0.9, 0.5, 0.55]),
+                vertex(22., 26., 0.2, [0.9, 0.6, 0.2, 0.55]),
+            ],
+        };
+        for (i, v) in ambient_blend.vertices.iter_mut().enumerate() {
+            v.ambient_coefficient = [0.2, 0.95, 0.5][i];
+            v.reciprocal_w = [1., 0.5, 0.25][i];
+        }
+
+        // Pixel-interpolated Phong triangle in the same dispatch must remain
+        // untouched by shade_vertices and shade per pixel in raster.
+        let mut phong_pixel = lit_front.clone();
+        phong_pixel.lighting.as_mut().unwrap().interpolation_style =
+            PPC_Q3_INTERPOLATION_STYLE_PIXEL;
+        phong_pixel.fog = None;
+        for (v, (x, y)) in phong_pixel
+            .vertices
+            .iter_mut()
+            .zip([(26., 4.), (42., 5.), (36., 18.)])
+        {
+            v.screen_x = x;
+            v.screen_y = y;
+            v.depth = 0.15;
+        }
+
+        // Lines with ambient_per_vertex=true and points outside the cleared
+        // sub-viewport must keep kind != 0u ambient semantics and background reads.
+        let mut line = triangle(0.1, [0.9, 0.5, 0.4, 0.6]);
+        line.primitive = PpcQ3RasterPrimitive::Lines;
+        line.test_depth = true;
+        line.write_depth = false;
+        line.blend = true;
+        line.ambient_light = Some([0.8, 0.75, 0.6]);
+        line.ambient_per_vertex = true;
+        line.vertices = vec![
+            vertex(1., 2., 0.1, [0.9, 0.5, 0.4, 0.6]),
+            vertex(24., 16., 0.1, [0.9, 0.5, 0.4, 0.6]),
+            vertex(1., 2., 0.1, [0.9, 0.5, 0.4, 0.6]),
+        ];
+        for v in &mut line.vertices {
+            v.ambient_coefficient = 0.65;
+        }
+
+        let frame = PpcQ3RasterFrame {
+            width,
+            height,
+            viewport: [4, 3, 43, 28],
+            clear_color: Some([0.12, 0.22, 0.34, 1.]),
+            textures: vec![],
+            draws: vec![lit_front, lit_back, phong_pixel, ambient_blend, line],
+        };
+        let expected = cpu_render(&frame, &background);
+        let first = state.render(&frame, &background).unwrap();
+        let unlit = PpcQ3RasterFrame {
+            width,
+            height,
+            viewport: [4, 3, 43, 28],
+            clear_color: None,
+            textures: vec![],
+            draws: vec![triangle(0.4, [0.3, 0.6, 0.2, 1.])],
+        };
+        assert_eq!(
+            state.render(&unlit, &background).unwrap(),
+            cpu_render(&unlit, &background)
+        );
+        #[cfg(feature = "test-support")]
+        let creations_before = state.buffers.resource_snapshot()["bind_group_creations"]
+            .as_u64()
+            .unwrap();
+        let second = state.render(&frame, &background).unwrap();
+        assert_eq!(
+            state.render(&unlit, &background).unwrap(),
+            cpu_render(&unlit, &background)
+        );
+        #[cfg(feature = "test-support")]
+        assert_eq!(
+            state.buffers.resource_snapshot()["bind_group_creations"]
+                .as_u64()
+                .unwrap(),
+            creations_before,
+            "steady-state mixed vertex/raster dispatches must reuse cached bind groups"
+        );
+        assert_eq!(first, second);
+        for (i, (&actual, &expected)) in first.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual & 0x8000,
+                expected & 0x8000,
+                "coverage bit at pixel {i}"
+            );
+            for shift in [0, 5, 10] {
+                assert!(
+                    ((actual >> shift) & 31).abs_diff((expected >> shift) & 31) <= 1,
+                    "pixel {i} channel shift {shift}: {actual:04x} vs {expected:04x}"
+                );
             }
         }
     }
