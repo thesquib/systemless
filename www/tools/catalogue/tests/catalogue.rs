@@ -1693,3 +1693,60 @@ fn architecture_archives_survive_compilation_and_select_default_port() {
     assert!(generated.contains(&format!("GameArchitecture::M68k, {classic_url:?}")));
     assert!(generated.contains(&format!("GameArchitecture::PowerPc, {ppc_url:?}")));
 }
+
+#[test]
+fn compute_default_survives_catalogue_serialization_and_images_use_cors() {
+    let c = common::catalogue();
+    let mut entry = c.documents[0].entry.clone();
+    assert!(!entry.runtime.gpu_compute);
+    entry.runtime.gpu_compute = true;
+    let text = catalogue::serialize_document(&entry, "").unwrap();
+    let (roundtrip, _) = catalogue::parse_document(&text).unwrap();
+    assert!(roundtrip.runtime.gpu_compute);
+    entry.runtime.worker = false;
+    assert!(validate::entry(&entry)
+        .unwrap_err()
+        .to_string()
+        .contains("requires worker"));
+    let html = catalogue::render_markdown(
+        &c.config,
+        &entry,
+        "![sample](https://example.org/image.png)\n\n`<img src=x>`",
+    );
+    assert!(html.contains("<img crossorigin=\"anonymous\" src="));
+    assert!(html.contains("&lt;img src=x&gt;"));
+}
+
+#[test]
+fn native_availability_is_opt_in_and_survives_compilation() {
+    let mut source = common::catalogue();
+    assert!(catalogue::build(&source)
+        .unwrap()
+        .entries
+        .iter()
+        .all(|e| e.native.is_none()));
+    let native = serde_json::from_value(serde_json::json!({
+        "enabled": true, "edition": "Demo", "limits": "Original unchanged package"
+    }))
+    .unwrap();
+    let id = source.documents[0].entry.id.clone();
+    source.documents[0].entry.native = Some(native);
+    let compiled = catalogue::build(&source).unwrap();
+    let entry = compiled.entries.iter().find(|e| e.id == id).unwrap();
+    assert!(entry.native.as_ref().unwrap().enabled);
+    let json = serde_json::to_value(entry).unwrap();
+    assert_eq!(json["native"]["edition"], "Demo");
+    source.documents[0].entry.native.as_mut().unwrap().enabled = false;
+    assert!(
+        !catalogue::build(&source)
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap()
+            .native
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+}

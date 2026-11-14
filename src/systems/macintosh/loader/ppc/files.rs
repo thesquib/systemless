@@ -42,6 +42,7 @@ pub(crate) const PPC_CLASSIC_ALIAS_RECORD_SIZE: usize =
 pub(super) fn ppc_fs_make_fsspec(
     cpu: &mut PpcCpu,
     memory: &mut PpcSectionMem,
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_directories: &[PpcVfsDirectory],
     vfs_files: &[PpcVfsFileRecord],
     vfs_resource_files: &[PpcVfsResourceFileRecord],
@@ -80,12 +81,58 @@ pub(super) fn ppc_fs_make_fsspec(
     } else if requested_dir_id == 0 && working_directory.is_some() {
         working_directory.unwrap().dir_id
     } else {
-        ppc_resolve_directory_id(requested_vref, requested_dir_id, default_dir_id)
+        ppc_resolve_volume_directory_id(
+            vfs_volumes,
+            Some(working_directories),
+            requested_vref,
+            requested_dir_id,
+            default_dir_id,
+        )
     };
+    // A full pathname that names a mounted volume selects that volume.
+    // Inside Macintosh: Files (1992), pp. 2-27 to 2-30.
+    let mounted_full_path = (absolute_boot_name.is_none())
+        .then(|| {
+            ppc_full_pathname_vfs_path(vfs_directories, vfs_volumes, &decode_mac_roman(&name_bytes))
+                .ok()
+                .flatten()
+        })
+        .flatten()
+        .filter(|(_, vref)| *vref != PPC_BOOT_VOLUME_REF_NUM);
 
+    let mut output_vref = effective_vref;
     let mut output_dir_id = effective_dir_id;
     let mut output_name_bytes = name_bytes.clone();
-    let result = if effective_dir_id > 1
+    let result = if let Some((path, vref)) = mounted_full_path {
+        let path = path.trim_end_matches('/');
+        output_vref = vref;
+        let target_path = ppc_vfs_target_path(vfs_directories, vfs_files, vfs_resource_files, path);
+        let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        if let Some(volume) = target_path
+            .as_deref()
+            .and_then(|path| ppc_mounted_volume_with_root_path(vfs_volumes, vfs_directories, path))
+        {
+            output_dir_id = HFS_ROOT_PARENT_DIR_ID;
+            output_name_bytes = encode_mac_roman_lossy(&volume.name);
+            PPC_NO_ERR
+        } else if let Some(target_path) = target_path {
+            output_dir_id = ppc_hfs_parent_dir_id_for_path(
+                vfs_volumes,
+                vfs_directories,
+                output_vref,
+                &target_path,
+            );
+            output_name_bytes = ppc_vfs_basename_bytes(&target_path);
+            PPC_NO_ERR
+        } else if let Some(parent_dir_id) = ppc_directory_id_for_path(vfs_directories, parent_path)
+        {
+            output_dir_id = process_hfs_dir_id(vfs_volumes, output_vref, parent_dir_id);
+            output_name_bytes = ppc_vfs_basename_bytes(path);
+            PPC_FNF_ERR
+        } else {
+            PPC_DIR_NF_ERR
+        }
+    } else if effective_dir_id > 1
         && ppc_directory_path_for_id(vfs_directories, effective_dir_id).is_none()
     {
         PPC_DIR_NF_ERR
@@ -98,14 +145,31 @@ pub(super) fn ppc_fs_make_fsspec(
     ) {
         // Empty/NIL input names identify the directory itself (Files,
         // table 2-10), but the returned FSSpec still names its parent/leaf.
-        if target_path.is_empty() {
+        if let Some(volume) =
+            ppc_mounted_volume_with_root_path(vfs_volumes, vfs_directories, &target_path)
+        {
+            // A mounted volume's root is named by its volume inside fsRtParID.
+            output_vref = volume.ref_num;
+            output_dir_id = HFS_ROOT_PARENT_DIR_ID;
+            output_name_bytes = encode_mac_roman_lossy(&volume.name);
+        } else if target_path.is_empty() {
             // The root directory is named by its volume inside fsRtParID.
             output_dir_id = 1;
             output_name_bytes = encode_mac_roman_lossy(
                 crate::trap::TrapDispatcher::boot_volume_name(),
             );
         } else {
-            output_dir_id = ppc_parent_dir_id_for_path(vfs_directories, &target_path);
+            if let Some(volume) =
+                process_volume_for_vfs_path(vfs_volumes, vfs_directories, &target_path)
+            {
+                output_vref = volume.ref_num;
+            }
+            output_dir_id = ppc_hfs_parent_dir_id_for_path(
+                vfs_volumes,
+                vfs_directories,
+                output_vref,
+                &target_path,
+            );
             output_name_bytes = ppc_vfs_basename_bytes(&target_path);
         }
         PPC_NO_ERR
@@ -122,7 +186,7 @@ pub(super) fn ppc_fs_make_fsspec(
         };
         match ppc_missing_partial_fsspec_leaf(vfs_directories, effective_dir_id, &missing_name) {
             Ok((parent_dir_id, leaf_name)) => {
-                output_dir_id = parent_dir_id;
+                output_dir_id = process_hfs_dir_id(vfs_volumes, output_vref, parent_dir_id);
                 output_name_bytes = leaf_name;
                 PPC_FNF_ERR
             }
@@ -133,7 +197,7 @@ pub(super) fn ppc_fs_make_fsspec(
         ppc_write_fsspec(
             memory,
             spec_ptr,
-            effective_vref,
+            output_vref,
             output_dir_id,
             &output_name_bytes,
         )
@@ -242,11 +306,25 @@ pub(super) fn ppc_pb_get_cat_info(
     // selects that directory, rather than the containing volume's root.
     let working_directory = working_directories.get(&vref);
     let effective_dir_id = if requested_dir_id == 0 {
-        working_directory.map(|record| record.dir_id).unwrap_or_else(|| {
-            ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id)
-        })
+        working_directory
+            .map(|record| record.dir_id)
+            .unwrap_or_else(|| {
+                ppc_resolve_volume_directory_id(
+                    vfs_volumes,
+                    Some(working_directories),
+                    vref,
+                    requested_dir_id,
+                    default_dir_id,
+                )
+            })
     } else {
-        requested_dir_id
+        ppc_resolve_volume_directory_id(
+            vfs_volumes,
+            Some(working_directories),
+            vref,
+            requested_dir_id,
+            default_dir_id,
+        )
     };
     // A negative index selects the directory by ID. ioNamePtr is output-only,
     // including when its buffer does not yet contain a valid Pascal string.
@@ -332,10 +410,53 @@ pub(super) fn ppc_pb_get_cat_info(
     if filled.is_none() {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
+    // Directory IDs are scoped by volume: on the volume the request names, a
+    // mounted volume's root is fsRtDirID with parent fsRtParID. A full
+    // pathname names its own volume. Inside Macintosh: Files (1992),
+    // pp. 1-27, 2-27 and 2-85.
+    let id_vref = if absolute_pathname {
+        pathname_volume.map_or(PPC_BOOT_VOLUME_REF_NUM, |volume| volume.ref_num)
+    } else {
+        resolved_vref
+    };
+    let directory = entry
+        .is_directory
+        .then(|| {
+            vfs_directories
+                .iter()
+                .find(|directory| directory.path.eq_ignore_ascii_case(&entry.path))
+        })
+        .flatten();
+    let (dir_id, parent_dir_id) = match directory {
+        Some(directory) => (
+            Some(process_hfs_dir_id(vfs_volumes, id_vref, directory.dir_id)),
+            process_hfs_directory_parent_id(
+                vfs_volumes,
+                id_vref,
+                directory.dir_id,
+                directory.parent_dir_id,
+            ),
+        ),
+        None => (
+            None,
+            ppc_hfs_parent_dir_id_for_path(vfs_volumes, vfs_directories, id_vref, &entry.path),
+        ),
+    };
+    if dir_id.is_some_and(|dir_id| memory.write_u32_be(pb + 48, dir_id).is_none())
+        || memory.write_u32_be(pb + 100, parent_dir_id).is_none()
+    {
+        return PPC_PARAM_ERR;
+    }
     // Inside Macintosh: Files (1992), p. 2-191: the root directory's name is
     // the volume name. Path builders that walk parent IDs up to fsRtDirID
     // rely on it to form full pathnames.
-    let output_name = if entry.is_directory && entry.path.is_empty() {
+    let mounted_root = entry
+        .is_directory
+        .then(|| ppc_mounted_volume_with_root_path(vfs_volumes, vfs_directories, &entry.path))
+        .flatten();
+    let output_name = if let Some(volume) = mounted_root {
+        encode_mac_roman_lossy(&volume.name)
+    } else if entry.is_directory && entry.path.is_empty() {
         let volume_name = vfs_volumes
             .iter()
             .find(|volume| volume.ref_num == resolved_vref)
@@ -379,6 +500,7 @@ pub(super) fn ppc_pb_set_cat_info(
     vfs_files: &mut [PpcVfsFileRecord],
     vfs_resource_files: &mut [PpcVfsResourceFileRecord],
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let pb = cpu.gpr[3];
     if pb == 0 {
@@ -396,7 +518,8 @@ pub(super) fn ppc_pb_set_cat_info(
     let Some(requested_dir_id) = memory.read_u32_be(pb + 48) else {
         return PPC_PARAM_ERR;
     };
-    let effective_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
+    let effective_dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, requested_dir_id, default_dir_id);
     let name_bytes = if name_ptr == 0 {
         Vec::new()
     } else {
@@ -470,7 +593,10 @@ pub(super) fn ppc_pb_set_cat_info(
 pub(super) fn ppc_pb_get_finfo(
     cpu: &mut PpcCpu,
     memory: &mut PpcSectionMem,
+    files: &[PpcFileRecord],
+    resource_files: &[PpcResourceFileRecord],
     vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_files: &[PpcVfsFileRecord],
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     vfs_resources: &[PpcVfsResourceRecord],
@@ -503,8 +629,9 @@ pub(super) fn ppc_pb_get_finfo(
     } else {
         0
     };
-    let resolved_vref = ppc_resolve_volume_ref_num(vref);
-    let effective_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
+    let mut resolved_vref = ppc_resolve_volume_ref_num(vref);
+    let effective_dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, requested_dir_id, default_dir_id);
     let name_bytes = if name_ptr == 0 {
         Vec::new()
     } else {
@@ -513,19 +640,41 @@ pub(super) fn ppc_pb_get_finfo(
             None => return ppc_complete_pb(memory, pb, PPC_PARAM_ERR),
         }
     };
-    if effective_dir_id > 1
+    let absolute_path = if fdir_index <= 0 {
+        match ppc_full_pathname_vfs_path(
+            vfs_directories,
+            vfs_volumes,
+            &decode_mac_roman(&name_bytes),
+        ) {
+            Ok(Some((path, vref))) => {
+                resolved_vref = vref;
+                Some(path)
+            }
+            Ok(None) => None,
+            Err(error) => return ppc_complete_pb(memory, pb, error),
+        }
+    } else {
+        None
+    };
+    if absolute_path.is_none()
+        && effective_dir_id > 1
         && ppc_directory_path_for_id(vfs_directories, effective_dir_id).is_none()
     {
         return ppc_complete_pb(memory, pb, PPC_DIR_NF_ERR);
     }
-    let Some(path) = ppc_pb_finfo_path_for_lookup(
-        vfs_directories,
-        vfs_files,
-        vfs_resource_files,
-        effective_dir_id,
-        &name_bytes,
-        fdir_index,
-    ) else {
+    let path = if let Some(path) = absolute_path {
+        ppc_vfs_file_or_resource_path(vfs_files, vfs_resource_files, &path)
+    } else {
+        ppc_pb_finfo_path_for_lookup(
+            vfs_directories,
+            vfs_files,
+            vfs_resource_files,
+            effective_dir_id,
+            &name_bytes,
+            fdir_index,
+        )
+    };
+    let Some(path) = path else {
         return ppc_complete_pb(memory, pb, PPC_FNF_ERR);
     };
     if ppc_fill_file_finfo_pb(
@@ -537,24 +686,67 @@ pub(super) fn ppc_pb_get_finfo(
         vfs_resources,
         &path,
         hfs,
+        vfs_volumes,
+        resolved_vref,
     )
     .is_none()
     {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
-    if name_ptr != 0 && !ppc_write_pstring_bytes(memory, name_ptr, &ppc_vfs_basename_bytes(&path)) {
+    // Inside Macintosh Volume IV (1986), IV-148--IV-149 (PBGetFInfo), and
+    // Inside Macintosh: Files (1992), 2-194--2-195 (PBHGetFInfo), on a
+    // lookup by name: "If the file is open, the reference number of the
+    // first access path found is returned in ioFRefNum, and the name of the
+    // file is returned in ioNamePtr (unless ioNamePtr is NIL)." Otherwise the
+    // name is input only, and callers go on using the same string. An
+    // indexed lookup returns the name it found, as before. ioFRefNum is
+    // cleared when the file is not open, so a block reused across calls
+    // cannot report a stale access path.
+    let open_ref_num = ppc_open_fork_ref_num_for_path(files, resource_files, &path);
+    if (fdir_index > 0 || open_ref_num != 0)
+        && name_ptr != 0
+        && !ppc_write_pstring_bytes(memory, name_ptr, &ppc_vfs_basename_bytes(&path))
+    {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
-    if memory.write_u16_be(pb + 22, resolved_vref as u16).is_none() {
+    if memory.write_u16_be(pb + 22, resolved_vref as u16).is_none()
+        || memory.write_u16_be(pb + 24, open_ref_num as u16).is_none()
+    {
         return PPC_PARAM_ERR;
     }
     ppc_complete_pb(memory, pb, PPC_NO_ERR)
+}
+
+/// Reference number of the first open fork of `path`, or zero when neither
+/// fork is open.
+fn ppc_open_fork_ref_num_for_path(
+    files: &[PpcFileRecord],
+    resource_files: &[PpcResourceFileRecord],
+    path: &str,
+) -> i16 {
+    files
+        .iter()
+        .find(|file| {
+            file.path
+                .strip_prefix(PPC_OPEN_RESOURCE_FORK_PREFIX)
+                .unwrap_or(&file.path)
+                .eq_ignore_ascii_case(path)
+        })
+        .map(|file| file.ref_num)
+        .or_else(|| {
+            resource_files
+                .iter()
+                .find(|file| file.path.eq_ignore_ascii_case(path))
+                .map(|file| file.ref_num)
+        })
+        .unwrap_or(0)
 }
 
 pub(super) fn ppc_pb_set_finfo(
     cpu: &mut PpcCpu,
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_files: &mut [PpcVfsFileRecord],
     vfs_resource_files: &mut [PpcVfsResourceFileRecord],
     default_dir_id: u32,
@@ -586,8 +778,9 @@ pub(super) fn ppc_pb_set_finfo(
     } else {
         0
     };
-    let resolved_vref = ppc_resolve_volume_ref_num(vref);
-    let effective_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
+    let mut resolved_vref = ppc_resolve_volume_ref_num(vref);
+    let effective_dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, requested_dir_id, default_dir_id);
     let name_bytes = if name_ptr == 0 {
         Vec::new()
     } else {
@@ -596,7 +789,24 @@ pub(super) fn ppc_pb_set_finfo(
             None => return ppc_complete_pb(memory, pb, PPC_PARAM_ERR),
         }
     };
-    if effective_dir_id > 1
+    let absolute_path = if fdir_index <= 0 {
+        match ppc_full_pathname_vfs_path(
+            vfs_directories,
+            vfs_volumes,
+            &decode_mac_roman(&name_bytes),
+        ) {
+            Ok(Some((path, vref))) => {
+                resolved_vref = vref;
+                Some(path)
+            }
+            Ok(None) => None,
+            Err(error) => return ppc_complete_pb(memory, pb, error),
+        }
+    } else {
+        None
+    };
+    if absolute_path.is_none()
+        && effective_dir_id > 1
         && ppc_directory_path_for_id(vfs_directories, effective_dir_id).is_none()
     {
         return ppc_complete_pb(memory, pb, PPC_DIR_NF_ERR);
@@ -604,14 +814,19 @@ pub(super) fn ppc_pb_set_finfo(
     let Some((file_type, creator, finder_flags)) = ppc_read_finfo(memory, pb + 32) else {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     };
-    let Some(path) = ppc_pb_finfo_path_for_lookup(
-        vfs_directories,
-        vfs_files,
-        vfs_resource_files,
-        effective_dir_id,
-        &name_bytes,
-        fdir_index,
-    ) else {
+    let path = if let Some(path) = absolute_path {
+        ppc_vfs_file_or_resource_path(vfs_files, vfs_resource_files, &path)
+    } else {
+        ppc_pb_finfo_path_for_lookup(
+            vfs_directories,
+            vfs_files,
+            vfs_resource_files,
+            effective_dir_id,
+            &name_bytes,
+            fdir_index,
+        )
+    };
+    let Some(path) = path else {
         return ppc_complete_pb(memory, pb, PPC_FNF_ERR);
     };
     if !ppc_set_finfo_for_path(
@@ -672,6 +887,49 @@ pub(super) fn ppc_pb_finfo_path_for_lookup(
     ppc_vfs_file_or_resource_path_by_basename(vfs_files, vfs_resource_files, &normalized_name)
 }
 
+/// Resolve an absolute HFS pathname against its named mounted volume.
+/// A full pathname is authoritative: callers must not fall back to leaf lookup.
+fn ppc_full_pathname_vfs_path(
+    vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
+    name: &str,
+) -> Result<Option<(String, i16)>, i16> {
+    if name.starts_with(':') {
+        return Ok(None);
+    }
+    let Some((volume, rest)) = name.split_once(':') else {
+        return Ok(None);
+    };
+    let (root, vref) = if volume
+        .eq_ignore_ascii_case(crate::trap::TrapDispatcher::boot_volume_name())
+    {
+        ("", PPC_BOOT_VOLUME_REF_NUM)
+    } else {
+        let volume = vfs_volumes
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(volume))
+            .ok_or(PPC_NSV_ERR)?;
+        (
+            ppc_directory_path_for_id(vfs_directories, volume.root_dir_id).ok_or(PPC_DIR_NF_ERR)?,
+            volume.ref_num,
+        )
+    };
+    let mut components = Vec::new();
+    let parts: Vec<_> = rest.split(':').collect();
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            if index + 1 != parts.len() && components.pop().is_none() {
+                return Err(PPC_DIR_NF_ERR);
+            }
+        } else {
+            components.push(crate::trap::TrapDispatcher::encode_hfs_component_for_vfs(
+                part,
+            ));
+        }
+    }
+    Ok(Some((ppc_join_vfs_path(root, &components.join("/")), vref)))
+}
+
 pub(super) fn ppc_vfs_file_or_resource_path(
     vfs_files: &[PpcVfsFileRecord],
     vfs_resource_files: &[PpcVfsResourceFileRecord],
@@ -730,6 +988,8 @@ pub(super) fn ppc_fill_file_finfo_pb(
     vfs_resources: &[PpcVfsResourceRecord],
     path: &str,
     include_parent_dir_id: bool,
+    vfs_volumes: &[PpcVfsVolumeRecord],
+    vref: i16,
 ) -> Option<()> {
     let data_len = vfs_files
         .iter()
@@ -749,7 +1009,10 @@ pub(super) fn ppc_fill_file_finfo_pb(
     memory.write_u32_be(pb + 72, 0)?;
     memory.write_u32_be(pb + 76, 0)?;
     if include_parent_dir_id {
-        memory.write_u32_be(pb + 100, ppc_parent_dir_id_for_path(vfs_directories, path))?;
+        memory.write_u32_be(
+            pb + 100,
+            ppc_hfs_parent_dir_id_for_path(vfs_volumes, vfs_directories, vref, path),
+        )?;
     }
     Some(())
 }
@@ -795,10 +1058,14 @@ pub(super) fn ppc_pbh_get_v_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     default_dir_id: u32,
     working_directories: &HashMap<i16, ProcessWorkingDirectory>,
-    hierarchical: bool,
+    hfs: bool,
 ) -> i16 {
+    // Inside Macintosh Volume IV (1986), IV-129--IV-130: PBGetVInfo's
+    // parameter block ends with ioVFrBlk at offset 62, 64 bytes in all, and
+    // PBHGetVInfo "returns a larger parameter block" that runs to 122 bytes.
+    // Callers of the former allocate only the shorter block.
     let pb = cpu.gpr[3];
-    let pb_len = if hierarchical { 122 } else { 64 };
+    let pb_len = if hfs { 122 } else { 64 };
     if pb == 0 || !ppc_memory_can_write_bytes(memory, pb, pb_len) {
         return PPC_PARAM_ERR;
     }
@@ -916,8 +1183,12 @@ pub(super) fn ppc_pbh_get_v_info(
         })
         .unwrap_or(volume.file_count);
 
-    // Inside Macintosh: Files (1992), p. 2-238: HVolumeParam layout.
-    let writes = [
+    // The two layouts have the same field sizes through offset 63, and both
+    // calls receive the same values there, as before. Offset 34 is named
+    // ioVLsBkUp in the shorter block and ioVLsMod in the longer, and holds
+    // the last modification date in both (Inside Macintosh Volume IV,
+    // IV-123--IV-124).
+    let common = [
         memory.write_u16_be(pb + 22, volume.ref_num as u16),
         memory.write_u32_be(pb + 30, volume.created_date),
         memory.write_u32_be(pb + 34, volume.modified_date),
@@ -932,11 +1203,10 @@ pub(super) fn ppc_pbh_get_v_info(
         memory.write_u32_be(pb + 58, volume.next_catalog_id),
         memory.write_u16_be(pb + 62, volume.free_blocks),
     ];
-    if writes.iter().any(Option::is_none) {
+    if common.iter().any(Option::is_none) {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
-    // PBGetVInfo callers supply a VolumeParam, which ends at ioVFrBlk.
-    if !hierarchical {
+    if !hfs {
         return ppc_complete_pb(memory, pb, PPC_NO_ERR);
     }
     let writes = [
@@ -1132,6 +1402,7 @@ pub(super) fn ppc_pb_get_fcb_info(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     vfs_resources: &[PpcVfsResourceRecord],
     launched_app_path: Option<&str>,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     // Inside Macintosh: Files (1992), pp. 2-237--2-238: FCBPBRec selects an
     // open fork by ioRefNum when ioFCBIndx is zero, or enumerates open FCBs
@@ -1216,8 +1487,9 @@ pub(super) fn ppc_pb_get_fcb_info(
     let mut name = ppc_vfs_basename_bytes(&path);
     name.truncate(31);
     let flags = if is_resource_fork { 0x0200 } else { 0x0100 };
+    let volume_ref_num = ppc_volume_ref_num_for_path(vfs_volumes, vfs_directories, &path);
     let writes = [
-        memory.write_u16_be(pb + 22, PPC_BOOT_VOLUME_REF_NUM as u16),
+        memory.write_u16_be(pb + 22, volume_ref_num as u16),
         memory.write_u16_be(pb + 24, ref_num as u16),
         memory.write_u16_be(pb + 30, 0),
         memory.write_u32_be(pb + 32, ppc_synthetic_file_id(&path)),
@@ -1226,9 +1498,12 @@ pub(super) fn ppc_pb_get_fcb_info(
         memory.write_u32_be(pb + 40, logical_eof),
         memory.write_u32_be(pb + 44, logical_eof),
         memory.write_u32_be(pb + 48, position.min(logical_eof)),
-        memory.write_u16_be(pb + 52, PPC_BOOT_VOLUME_REF_NUM as u16),
+        memory.write_u16_be(pb + 52, volume_ref_num as u16),
         memory.write_u32_be(pb + 54, 0),
-        memory.write_u32_be(pb + 58, ppc_parent_dir_id_for_path(vfs_directories, &path)),
+        memory.write_u32_be(
+            pb + 58,
+            ppc_hfs_parent_dir_id_for_path(vfs_volumes, vfs_directories, volume_ref_num, &path),
+        ),
     ];
     if writes.iter().any(Option::is_none)
         || (name_ptr != 0 && !ppc_write_pstring_bytes(memory, name_ptr, &name))
@@ -1647,7 +1922,10 @@ pub(super) fn ppc_pb_resolve_file_id_ref(
     if name_ptr != 0 {
         let _ = ppc_write_pstring_bytes(memory, name_ptr, &name);
     }
-    let _ = memory.write_u32_be(pb + 48, ppc_parent_dir_id_for_path(vfs_directories, path));
+    let _ = memory.write_u32_be(
+        pb + 48,
+        ppc_hfs_parent_dir_id_for_path(vfs_volumes, vfs_directories, volume_ref, path),
+    );
     ppc_complete_pb(memory, pb, PPC_NO_ERR)
 }
 
@@ -1663,6 +1941,70 @@ pub(super) fn ppc_synthetic_file_id(path: &str) -> u32 {
 pub(super) fn ppc_parent_dir_id_for_path(vfs_directories: &[PpcVfsDirectory], path: &str) -> u32 {
     let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
     ppc_directory_id_for_path(vfs_directories, parent_path).unwrap_or(PPC_ROOT_DIR_ID)
+}
+
+/// The caller-visible parent ID of a VFS path: fsRtParID for a mounted
+/// volume's root, and fsRtDirID for an item at that root.
+/// Inside Macintosh: Files (1992), pp. 1-27 and 2-85.
+pub(super) fn ppc_hfs_parent_dir_id_for_path(
+    vfs_volumes: &[PpcVfsVolumeRecord],
+    vfs_directories: &[PpcVfsDirectory],
+    vref: i16,
+    path: &str,
+) -> u32 {
+    let parent_dir_id = ppc_parent_dir_id_for_path(vfs_directories, path);
+    match ppc_directory_id_for_path(vfs_directories, path) {
+        Some(dir_id) => process_hfs_directory_parent_id(vfs_volumes, vref, dir_id, parent_dir_id),
+        None => process_hfs_dir_id(vfs_volumes, vref, parent_dir_id),
+    }
+}
+
+/// The reference number of the volume that holds a VFS path.
+pub(super) fn ppc_volume_ref_num_for_path(
+    vfs_volumes: &[PpcVfsVolumeRecord],
+    vfs_directories: &[PpcVfsDirectory],
+    path: &str,
+) -> i16 {
+    process_volume_for_vfs_path(vfs_volumes, vfs_directories, path)
+        .map_or(PPC_BOOT_VOLUME_REF_NUM, |volume| volume.ref_num)
+}
+
+/// The mounted volume whose root is a VFS path, if any.
+pub(super) fn ppc_mounted_volume_with_root_path<'a>(
+    vfs_volumes: &'a [PpcVfsVolumeRecord],
+    vfs_directories: &[PpcVfsDirectory],
+    path: &str,
+) -> Option<&'a PpcVfsVolumeRecord> {
+    let dir_id = ppc_directory_id_for_path(vfs_directories, path)?;
+    vfs_volumes
+        .iter()
+        .find(|volume| volume.root_dir_id == dir_id && dir_id != PPC_ROOT_DIR_ID)
+}
+
+/// Resolve a caller's (vRefNum, dirID) to an internal directory ID. Directory
+/// IDs are scoped by volume, so fsRtDirID on a mounted volume, or on a working
+/// directory of one, selects that volume's root.
+/// Inside Macintosh: Files (1992), pp. 1-27, 2-85 and table 2-10.
+pub(super) fn ppc_resolve_volume_directory_id(
+    vfs_volumes: &[PpcVfsVolumeRecord],
+    working_directories: Option<&HashMap<i16, ProcessWorkingDirectory>>,
+    vref: i16,
+    dir_id: u32,
+    default_dir_id: u32,
+) -> u32 {
+    let resolved_dir_id = ppc_resolve_directory_id(vref, dir_id, default_dir_id);
+    if resolved_dir_id != PPC_ROOT_DIR_ID {
+        return resolved_dir_id;
+    }
+    if vfs_volumes.iter().any(|volume| volume.ref_num == vref) {
+        return process_volume_dir_id(vfs_volumes, vref, resolved_dir_id);
+    }
+    match working_directories.and_then(|directories| directories.get(&vref)) {
+        Some(directory) if dir_id == PPC_ROOT_DIR_ID => {
+            process_volume_dir_id(vfs_volumes, directory.volume_ref_num, resolved_dir_id)
+        }
+        _ => resolved_dir_id,
+    }
 }
 
 pub(super) fn ppc_get_finfo(
@@ -1725,6 +2067,7 @@ pub(super) fn ppc_h_finfo_path(
     requested_dir_id: u32,
     file_name_ptr: u32,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> Result<String, i16> {
     if !matches!(vref_num, 0 | PPC_BOOT_VOLUME_REF_NUM) {
         return Err(PPC_NSV_ERR);
@@ -1734,7 +2077,13 @@ pub(super) fn ppc_h_finfo_path(
     if name.is_empty() || name.contains('/') {
         return Err(PPC_BD_NAM_ERR);
     }
-    let dir_id = ppc_resolve_directory_id(vref_num, requested_dir_id, default_dir_id);
+    let dir_id = ppc_resolve_volume_directory_id(
+        vfs_volumes,
+        None,
+        vref_num,
+        requested_dir_id,
+        default_dir_id,
+    );
     let parent = ppc_directory_path_for_id(vfs_directories, dir_id).ok_or(PPC_DIR_NF_ERR)?;
     let requested_path = ppc_join_vfs_path(parent, &name);
     ppc_vfs_file_or_resource_path(vfs_files, vfs_resource_files, &requested_path).ok_or(PPC_FNF_ERR)
@@ -1747,6 +2096,7 @@ pub(super) fn ppc_h_get_finfo(
     vfs_files: &[PpcVfsFileRecord],
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let finfo_ptr = cpu.gpr[6];
     if finfo_ptr == 0 || !ppc_memory_can_write_bytes(memory, finfo_ptr, 16) {
@@ -1761,6 +2111,7 @@ pub(super) fn ppc_h_get_finfo(
         cpu.gpr[4],
         cpu.gpr[5],
         default_dir_id,
+        vfs_volumes,
     ) {
         Ok(path) => path,
         Err(err) => return err,
@@ -1783,6 +2134,7 @@ pub(super) fn ppc_h_set_finfo(
     vfs_files: &mut [PpcVfsFileRecord],
     vfs_resource_files: &mut [PpcVfsResourceFileRecord],
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let finfo_ptr = cpu.gpr[6];
     let Some((file_type, creator, finder_flags)) = ppc_read_finfo(memory, finfo_ptr) else {
@@ -1797,6 +2149,7 @@ pub(super) fn ppc_h_set_finfo(
         cpu.gpr[4],
         cpu.gpr[5],
         default_dir_id,
+        vfs_volumes,
     ) {
         Ok(path) => path,
         Err(err) => return err,
@@ -1821,13 +2174,14 @@ pub(super) fn ppc_fsp_get_finfo(
     vfs_directories: &[PpcVfsDirectory],
     vfs_files: &[PpcVfsFileRecord],
     vfs_resource_files: &[PpcVfsResourceFileRecord],
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let finfo_ptr = cpu.gpr[4];
     if finfo_ptr == 0 {
         return PPC_PARAM_ERR;
     }
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -1895,13 +2249,14 @@ pub(super) fn ppc_fsp_set_finfo(
     vfs_directories: &mut [PpcVfsDirectory],
     vfs_files: &mut [PpcVfsFileRecord],
     vfs_resource_files: &mut [PpcVfsResourceFileRecord],
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let finfo_ptr = cpu.gpr[4];
     if finfo_ptr == 0 {
         return PPC_PARAM_ERR;
     }
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -2051,15 +2406,28 @@ pub(super) fn ppc_resolved_fsspec_target_path(
     )
 }
 
+/// The internal directory named by an FSSpec's vRefNum and parID.
+/// Inside Macintosh: Files (1992), pp. 1-27 and 2-85.
+pub(super) fn ppc_fsspec_parent_dir_id(
+    memory: &mut PpcSectionMem,
+    vfs_volumes: &[PpcVfsVolumeRecord],
+    spec_ptr: u32,
+) -> Option<u32> {
+    let vref = memory.read_u16_be(spec_ptr)? as i16;
+    let dir_id = memory.read_u32_be(spec_ptr + 2)?;
+    Some(process_volume_dir_id(vfs_volumes, vref, dir_id))
+}
+
 pub(super) fn ppc_path_for_fsspec(
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
     spec_ptr: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> Result<String, i16> {
     if spec_ptr == 0 {
         return Err(PPC_PARAM_ERR);
     }
-    let Some(dir_id) = memory.read_u32_be(spec_ptr + 2) else {
+    let Some(dir_id) = ppc_fsspec_parent_dir_id(memory, vfs_volumes, spec_ptr) else {
         return Err(PPC_PARAM_ERR);
     };
     let Some(name_bytes) = ppc_read_pstring_bytes(memory, spec_ptr + 6) else {
@@ -2082,11 +2450,12 @@ pub(super) fn ppc_existing_path_for_fsspec(
     vfs_files: &[PpcVfsFileRecord],
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     spec_ptr: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> Result<String, i16> {
     if spec_ptr == 0 {
         return Err(PPC_PARAM_ERR);
     }
-    let Some(dir_id) = memory.read_u32_be(spec_ptr + 2) else {
+    let Some(dir_id) = ppc_fsspec_parent_dir_id(memory, vfs_volumes, spec_ptr) else {
         return Err(PPC_PARAM_ERR);
     };
     let Some(name_bytes) = ppc_read_pstring_bytes(memory, spec_ptr + 6) else {
@@ -2128,11 +2497,12 @@ pub(super) fn ppc_existing_data_path_for_fsspec(
     vfs_directories: &[PpcVfsDirectory],
     vfs_files: &[PpcVfsFileRecord],
     spec_ptr: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> Result<String, i16> {
     if spec_ptr == 0 {
         return Err(PPC_PARAM_ERR);
     }
-    let Some(dir_id) = memory.read_u32_be(spec_ptr + 2) else {
+    let Some(dir_id) = ppc_fsspec_parent_dir_id(memory, vfs_volumes, spec_ptr) else {
         return Err(PPC_PARAM_ERR);
     };
     let Some(name_bytes) = ppc_read_pstring_bytes(memory, spec_ptr + 6) else {
@@ -3145,6 +3515,7 @@ pub(super) fn ppc_fsp_open_df(
     files: &mut Vec<PpcFileRecord>,
     writable_refnums: &mut HashSet<u16>,
     next_file_ref_num: &mut i16,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let permission = cpu.gpr[4] as u8;
@@ -3152,8 +3523,13 @@ pub(super) fn ppc_fsp_open_df(
     if ref_num_out_ptr == 0 || !ppc_memory_can_write_bytes(memory, ref_num_out_ptr, 2) {
         return PPC_PARAM_ERR;
     }
-    let path = match ppc_existing_data_path_for_fsspec(memory, vfs_directories, vfs_files, spec_ptr)
-    {
+    let path = match ppc_existing_data_path_for_fsspec(
+        memory,
+        vfs_directories,
+        vfs_files,
+        spec_ptr,
+        vfs_volumes,
+    ) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -3195,6 +3571,7 @@ pub(super) fn ppc_fsp_open_rf(
     files: &mut Vec<PpcFileRecord>,
     writable_refnums: &mut HashSet<u16>,
     next_file_ref_num: &mut i16,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let permission = cpu.gpr[4] as u8;
@@ -3202,7 +3579,7 @@ pub(super) fn ppc_fsp_open_rf(
     if ref_num_out_ptr == 0 || !ppc_memory_can_write_bytes(memory, ref_num_out_ptr, 2) {
         return PPC_PARAM_ERR;
     }
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -3314,6 +3691,7 @@ pub(super) fn ppc_h_open(
     cpu: &PpcCpu,
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_files: &[PpcVfsFileRecord],
     files: &mut Vec<PpcFileRecord>,
     writable_refnums: &mut HashSet<u16>,
@@ -3339,6 +3717,7 @@ pub(super) fn ppc_h_open(
     ppc_open_data_fork_by_name(
         memory,
         vfs_directories,
+        vfs_volumes,
         vfs_files,
         files,
         writable_refnums,
@@ -3356,6 +3735,7 @@ pub(super) fn ppc_fs_open(
     cpu: &PpcCpu,
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_files: &[PpcVfsFileRecord],
     files: &mut Vec<PpcFileRecord>,
     writable_refnums: &mut HashSet<u16>,
@@ -3367,6 +3747,7 @@ pub(super) fn ppc_fs_open(
     ppc_open_data_fork_by_name(
         memory,
         vfs_directories,
+        vfs_volumes,
         vfs_files,
         files,
         writable_refnums,
@@ -3384,6 +3765,7 @@ pub(super) fn ppc_fs_open(
 pub(super) fn ppc_open_data_fork_by_name(
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_files: &[PpcVfsFileRecord],
     files: &mut Vec<PpcFileRecord>,
     writable_refnums: &mut HashSet<u16>,
@@ -3395,10 +3777,7 @@ pub(super) fn ppc_open_data_fork_by_name(
     permission: u8,
     ref_num_out_ptr: u32,
 ) -> i16 {
-    if !matches!(vref, 0 | PPC_BOOT_VOLUME_REF_NUM)
-        || ref_num_out_ptr == 0
-        || !ppc_memory_can_write_bytes(memory, ref_num_out_ptr, 2)
-    {
+    if ref_num_out_ptr == 0 || !ppc_memory_can_write_bytes(memory, ref_num_out_ptr, 2) {
         return PPC_PARAM_ERR;
     }
     let Some(name_bytes) = ppc_read_pstring_bytes(memory, name_ptr) else {
@@ -3408,14 +3787,32 @@ pub(super) fn ppc_open_data_fork_by_name(
     if name.is_empty() {
         return PPC_PARAM_ERR;
     }
-    let effective_dir_id = ppc_resolve_directory_id(vref, dir_id, default_dir_id);
-    let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, effective_dir_id) else {
-        return PPC_DIR_NF_ERR;
+    let absolute = match ppc_full_pathname_vfs_path(
+        vfs_directories,
+        vfs_volumes,
+        &decode_mac_roman(&name_bytes),
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
     };
-    let requested_path = ppc_join_vfs_path(parent_path, &name);
-    let path = ppc_vfs_file_index(vfs_files, &requested_path)
-        .map(|index| vfs_files[index].path.clone())
-        .or_else(|| ppc_vfs_file_path_by_suffix_or_unique_basename(vfs_files, &name));
+    let path = if let Some((path, _)) = absolute {
+        ppc_vfs_file_index(vfs_files, &path).map(|index| vfs_files[index].path.clone())
+    } else {
+        if !matches!(vref, 0 | PPC_BOOT_VOLUME_REF_NUM)
+            && vfs_volumes.iter().all(|volume| volume.ref_num != vref)
+        {
+            return PPC_PARAM_ERR;
+        }
+        let effective_dir_id =
+            ppc_resolve_volume_directory_id(vfs_volumes, None, vref, dir_id, default_dir_id);
+        let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, effective_dir_id) else {
+            return PPC_DIR_NF_ERR;
+        };
+        let requested_path = ppc_join_vfs_path(parent_path, &name);
+        ppc_vfs_file_index(vfs_files, &requested_path)
+            .map(|index| vfs_files[index].path.clone())
+            .or_else(|| ppc_vfs_file_path_by_suffix_or_unique_basename(vfs_files, &name))
+    };
     let Some(path) = path else {
         return PPC_FNF_ERR;
     };
@@ -3556,6 +3953,7 @@ pub(super) fn ppc_pb_open(
     let result = ppc_open_data_fork_by_name(
         memory,
         vfs_directories,
+        vfs_volumes,
         vfs_files,
         files,
         writable_refnums,
@@ -3956,11 +4354,12 @@ pub(super) fn ppc_fsp_create_res_file(
     vfs_files: &mut ProcessVfsFileRecords,
     vfs_resource_files: &mut ProcessVfsResourceFileRecords,
     last_resource_error: &mut i16,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) {
     let spec_ptr = cpu.gpr[3];
     let creator = cpu.gpr[4];
     let file_type = cpu.gpr[5];
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => {
             *last_resource_error = err;
@@ -4002,6 +4401,7 @@ pub(super) fn ppc_h_create_res_file(
     vfs_resource_files: &mut ProcessVfsResourceFileRecords,
     default_dir_id: u32,
     last_resource_error: &mut i16,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) {
     let vref = cpu.gpr[3] as u16 as i16;
     if !matches!(vref, 0 | PPC_BOOT_VOLUME_REF_NUM) {
@@ -4017,7 +4417,8 @@ pub(super) fn ppc_h_create_res_file(
         *last_resource_error = PPC_BD_NAM_ERR;
         return;
     }
-    let dir_id = ppc_resolve_directory_id(vref, cpu.gpr[4], default_dir_id);
+    let dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, cpu.gpr[4], default_dir_id);
     let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, dir_id) else {
         *last_resource_error = PPC_DIR_NF_ERR;
         return;
@@ -4069,10 +4470,11 @@ pub(super) fn ppc_fsp_open_res_file(
     next_file_ref_num: &mut i16,
     current_resource_refnum: &mut i16,
     last_resource_error: &mut i16,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let _permission = cpu.gpr[4] as u8;
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => {
             *last_resource_error = err;
@@ -4859,11 +5261,12 @@ pub(super) fn ppc_fsp_create(
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
     vfs_files: &mut ProcessVfsFileRecords,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let creator = cpu.gpr[4];
     let file_type = cpu.gpr[5];
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -4888,6 +5291,7 @@ pub(super) fn ppc_h_create(
     vfs_files: &mut ProcessVfsFileRecords,
     default_dir_id: u32,
     working_directories: &HashMap<i16, ProcessWorkingDirectory>,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     // Inside Macintosh: Files (1992), 2-169: HCreate identifies the parent
     // with a volume reference and directory ID, then supplies creator/type.
@@ -4915,6 +5319,7 @@ pub(super) fn ppc_h_create(
         cpu.gpr[5],
         cpu.gpr[6],
         cpu.gpr[7],
+        vfs_volumes,
     )
 }
 
@@ -4940,6 +5345,7 @@ pub(super) fn ppc_h_rename(
     resource_files: &mut Vec<PpcResourceFileRecord>,
     vfs_resources: &mut Vec<PpcVfsResourceRecord>,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     ppc_rename_by_name(
         memory,
@@ -4956,6 +5362,7 @@ pub(super) fn ppc_h_rename(
         cpu.gpr[5],
         cpu.gpr[6],
         false,
+        vfs_volumes,
     )
 }
 
@@ -4973,6 +5380,7 @@ pub(super) fn ppc_rename(
     resource_files: &mut Vec<PpcResourceFileRecord>,
     vfs_resources: &mut Vec<PpcVfsResourceRecord>,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     ppc_rename_by_name(
         memory,
@@ -4989,6 +5397,7 @@ pub(super) fn ppc_rename(
         cpu.gpr[3],
         cpu.gpr[5],
         true,
+        vfs_volumes,
     )
 }
 
@@ -5005,6 +5414,7 @@ pub(super) fn ppc_pb_rename_sync(
     resource_files: &mut Vec<PpcResourceFileRecord>,
     vfs_resources: &mut Vec<PpcVfsResourceRecord>,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     // Inside Macintosh Volume IV (1986), p. IV-154; Files (1992),
     // pp. 2-198--2-199. The common fields are ioNamePtr, ioVRefNum and
@@ -5045,6 +5455,7 @@ pub(super) fn ppc_pb_rename_sync(
         old_ptr,
         new_ptr,
         !hierarchical,
+        vfs_volumes,
     );
     ppc_complete_pb(memory, pb, result)
 }
@@ -5065,6 +5476,7 @@ fn ppc_rename_by_name(
     old_ptr: u32,
     new_ptr: u32,
     basic_pathnames: bool,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     // Basic and hierarchical file renames share fork and open-path updates.
     if !matches!(vref, 0 | PPC_BOOT_VOLUME_REF_NUM) {
@@ -5107,7 +5519,8 @@ fn ppc_rename_by_name(
     if new_name.contains([':', '/']) || matches!(new_name.as_str(), "." | "..") {
         return PPC_BD_NAM_ERR;
     }
-    let dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
+    let dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, requested_dir_id, default_dir_id);
     let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, dir_id) else {
         return PPC_DIR_NF_ERR;
     };
@@ -5236,6 +5649,7 @@ pub(super) fn ppc_pb_create(
     vfs_directories: &[PpcVfsDirectory],
     vfs_files: &mut ProcessVfsFileRecords,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let pb = cpu.gpr[3];
     if pb == 0 || !ppc_memory_can_write_bytes(memory, pb, 24) {
@@ -5268,6 +5682,7 @@ pub(super) fn ppc_pb_create(
         name_ptr,
         0,
         0,
+        vfs_volumes,
     );
     ppc_complete_pb(memory, pb, result)
 }
@@ -5278,6 +5693,7 @@ pub(super) fn ppc_create(
     vfs_directories: &[PpcVfsDirectory],
     vfs_files: &mut ProcessVfsFileRecords,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     // The non-hierarchical Create call resolves against the current directory.
     ppc_create_data_fork_by_name(
@@ -5290,6 +5706,7 @@ pub(super) fn ppc_create(
         cpu.gpr[3],
         cpu.gpr[5],
         cpu.gpr[6],
+        vfs_volumes,
     )
 }
 
@@ -5304,6 +5721,7 @@ pub(super) fn ppc_create_data_fork_by_name(
     name_ptr: u32,
     creator: u32,
     file_type: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     if !matches!(vref, 0 | PPC_BOOT_VOLUME_REF_NUM) {
         return PPC_NSV_ERR;
@@ -5315,7 +5733,8 @@ pub(super) fn ppc_create_data_fork_by_name(
     if name.is_empty() {
         return PPC_PARAM_ERR;
     }
-    let effective_dir_id = ppc_resolve_directory_id(vref, dir_id, default_dir_id);
+    let effective_dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, dir_id, default_dir_id);
     let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, effective_dir_id) else {
         return PPC_DIR_NF_ERR;
     };
@@ -5344,9 +5763,10 @@ pub(super) fn ppc_fsp_delete(
     vfs_resource_files: &mut ProcessVfsResourceFileRecords,
     resource_files: &mut Vec<PpcResourceFileRecord>,
     vfs_resources: &mut Vec<PpcVfsResourceRecord>,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -5374,6 +5794,7 @@ pub(super) fn ppc_delete_by_name(
     resource_files: &mut Vec<PpcResourceFileRecord>,
     vfs_resources: &mut Vec<PpcVfsResourceRecord>,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let (vref, dir_id, name_ptr, pb) = if matches!(
         operation,
@@ -5418,7 +5839,8 @@ pub(super) fn ppc_delete_by_name(
         if name.is_empty() {
             PPC_PARAM_ERR
         } else {
-            let effective_dir_id = ppc_resolve_directory_id(vref, dir_id, default_dir_id);
+            let effective_dir_id =
+                ppc_resolve_volume_directory_id(vfs_volumes, None, vref, dir_id, default_dir_id);
             if let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, effective_dir_id)
             {
                 let requested_path = ppc_join_vfs_path(parent_path, &name);
@@ -5547,9 +5969,11 @@ pub(super) fn ppc_dir_create(
     vfs_directories: &mut Vec<PpcVfsDirectory>,
     next_vfs_dir_id: &mut u32,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let vref = cpu.gpr[3] as u16 as i16;
-    let parent_dir_id = ppc_resolve_directory_id(vref, cpu.gpr[4], default_dir_id);
+    let parent_dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, cpu.gpr[4], default_dir_id);
     let directory_name_ptr = cpu.gpr[5];
     let created_dir_id_ptr = cpu.gpr[6];
     if directory_name_ptr == 0 || created_dir_id_ptr == 0 {
@@ -5597,6 +6021,7 @@ pub(super) fn ppc_fsp_dir_create(
     vfs_directories: &mut Vec<PpcVfsDirectory>,
     next_vfs_dir_id: &mut u32,
     default_dir_id: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let created_dir_id_ptr = cpu.gpr[5];
@@ -5610,7 +6035,8 @@ pub(super) fn ppc_fsp_dir_create(
     if directory_name.is_empty() {
         return PPC_PARAM_ERR;
     }
-    let parent_dir_id = ppc_resolve_directory_id(vref, requested_dir_id, default_dir_id);
+    let parent_dir_id =
+        ppc_resolve_volume_directory_id(vfs_volumes, None, vref, requested_dir_id, default_dir_id);
     let normalized_name = ppc_normalize_vfs_path(&decode_mac_roman(&directory_name));
     if normalized_name.is_empty() {
         return PPC_PARAM_ERR;
@@ -6284,6 +6710,7 @@ pub(super) fn ppc_resolve_alias(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     handles: &[PpcHandleRecord],
     aliases: &[PpcAliasRecord],
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let from_file_ptr = cpu.gpr[3];
     let alias_handle = cpu.gpr[4];
@@ -6305,6 +6732,7 @@ pub(super) fn ppc_resolve_alias(
         vfs_resource_files,
         from_file_ptr,
         alias_handle,
+        vfs_volumes,
     )
     .or_else(|| {
         aliases
@@ -6329,7 +6757,7 @@ pub(super) fn ppc_resolve_alias(
         memory,
         target_ptr,
         alias.target_vref,
-        alias.target_dir_id,
+        process_hfs_dir_id(vfs_volumes, alias.target_vref, alias.target_dir_id),
         &alias.target_name,
     ) || memory.write_u8(was_changed_ptr, 0).is_none()
     {
@@ -6488,6 +6916,7 @@ pub(super) fn ppc_resolve_alias_file(
     vfs_resource_files: &[PpcVfsResourceFileRecord],
     vfs_resources: &[PpcVfsResourceRecord],
     mount_flags: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> i16 {
     let spec_ptr = cpu.gpr[3];
     let resolve_alias_chains = cpu.gpr[4] != 0;
@@ -6502,7 +6931,7 @@ pub(super) fn ppc_resolve_alias_file(
     if target_is_folder_ptr == 0 || was_aliased_ptr == 0 {
         return PPC_PARAM_ERR;
     }
-    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+    let path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -6542,13 +6971,16 @@ pub(super) fn ppc_resolve_alias_file(
             alias.target_dir_id,
             &alias.target_name,
         );
-        target_is_folder =
-            ppc_fsspec_target_is_folder(vfs_directories, alias.target_dir_id, &alias.target_name);
+        target_is_folder = ppc_fsspec_target_is_folder(
+            vfs_directories,
+            process_volume_dir_id(vfs_volumes, alias.target_vref, alias.target_dir_id),
+            &alias.target_name,
+        );
         if !ppc_write_fsspec_parts(
             memory,
             spec_ptr,
             alias.target_vref,
-            alias.target_dir_id,
+            process_hfs_dir_id(vfs_volumes, alias.target_vref, alias.target_dir_id),
             &alias.target_name,
         ) {
             return PPC_PARAM_ERR;
@@ -6562,7 +6994,7 @@ pub(super) fn ppc_resolve_alias_file(
         if !resolve_alias_chains {
             break;
         }
-        current_path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr) {
+        current_path = match ppc_path_for_fsspec(memory, vfs_directories, spec_ptr, vfs_volumes) {
             Ok(path) => path,
             Err(err) => return err,
         };
@@ -6671,13 +7103,21 @@ fn ppc_relative_alias_target(
     resource_files: &[PpcVfsResourceFileRecord],
     from_file: u32,
     alias_handle: u32,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> Option<PpcAliasRecord> {
     let (vref, from_dir, _) = ppc_read_fsspec_parts(memory, from_file)?;
     if vref != PPC_BOOT_VOLUME_REF_NUM && vref != 0 {
         return None;
     }
-    let source =
-        ppc_existing_path_for_fsspec(memory, directories, files, resource_files, from_file).ok()?;
+    let source = ppc_existing_path_for_fsspec(
+        memory,
+        directories,
+        files,
+        resource_files,
+        from_file,
+        vfs_volumes,
+    )
+    .ok()?;
     let source_parent = ppc_directory_path_for_id(directories, from_dir)?;
     if !ppc_join_vfs_path(source_parent, ppc_vfs_basename(&source)).eq_ignore_ascii_case(&source) {
         return None;

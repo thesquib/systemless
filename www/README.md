@@ -29,8 +29,10 @@ query parameters) to select the Rust/WASM wgpu presenter. It works with both
 localhost and a browser exposing WebGPU and OffscreenCanvas. The existing
 WebGL/Canvas2D selection remains the default.
 
-The presenter uploads complete RGBA guest frames to a reusable wgpu texture
-and renders them without filtering or an extra sRGB conversion. It holds frame
+The presenter accepts complete RGBA frames, 8-bit indexed frames with their
+256-entry palette, and compact retained-image frames, and expands the indexed
+and compact kinds on the GPU, so the worker no longer converts them to full
+RGBA first. It renders without filtering or an extra sRGB conversion. It holds frame
 credit until asynchronous GPU completion, retaining at most the current frame
 and one newest pending frame. Unsupported WebGPU, startup failure, device loss,
 and failed submissions use the existing Canvas2D recovery path without restarting
@@ -46,7 +48,10 @@ PowerPC guests. Select the dispatch explicitly with
 `gpu_compute=adaptive|force|off`; `adaptive` uses the desktop heuristics and
 keeps small operations on the CPU, while `force` sends every supported
 operation to the GPU for equivalence checks. Compute works only in worker
-execution mode.
+execution mode. Catalogue entries may set `runtime.gpu_compute = true` after
+qualification to select adaptive compute without a URL option. Explicit
+`gpu_compute` options take precedence; `off` disables it and unknown values
+keep CPU rendering. The catalogue default is false.
 
 Guest memory stays authoritative. QuickDraw and QD3D results must be committed
 before the guest resumes, but WebGPU completes readback only on the event loop
@@ -58,10 +63,11 @@ run one at a time on the shared scratch buffers.
 
 `SharedArrayBuffer` requires a cross-origin isolated page. `public/_headers`
 sets `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: credentialless` for Cloudflare Pages. A local
+`Cross-Origin-Embedder-Policy: require-corp` for Cloudflare Pages. A local
 `trunk serve` does not send them, so compute reports itself unavailable there;
-serve `dist` with those headers instead. Browsers without `credentialless`
-support (Safari), without WebGPU, or without isolation keep CPU rendering.
+serve `dist` with those headers instead. Cross-origin catalogue thumbnails use
+anonymous CORS and require the asset server to return `Access-Control-Allow-Origin`.
+Browsers without WebGPU or without isolation keep CPU rendering.
 
 Failures never alter guest pixels: a declined operation falls back to the CPU,
 and a device loss, worker failure or reply timeout (5 s by default,

@@ -3589,7 +3589,9 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
         assert_eq!(probe.unsupported_import_index, None);
         assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
         assert_eq!(loaded.memory.read_u16_be(pb + 22), Some((-2i16) as u16));
-        assert_eq!(loaded.memory.read_u32_be(pb + 100), Some(42));
+        // A file at a mounted volume's root has parent fsRtDirID on that
+        // volume. Inside Macintosh: Files (1992), pp. 1-27 and 2-85.
+        assert_eq!(loaded.memory.read_u32_be(pb + 100), Some(PPC_ROOT_DIR_ID));
         assert_eq!(
             ppc_read_pstring_bytes(&mut loaded.memory, name_ptr),
             Some(b"Gridz\xaa CD:ToolBot Power Supply".to_vec())
@@ -6448,6 +6450,39 @@ fn pb_h_rename_sync_moves_both_forks_and_preserves_open_paths() {
             ppc_vfs_resource_index(&resources[0..1], 200, img_type, 1000, false),
             None
         );
+    }
+
+    #[test]
+    fn ppc_vfs_resource_index_searches_down_from_the_current_file() {
+        let pict = u32::from_be_bytes(*b"PICT");
+        let record = |ref_num: i16, res_id: i16| PpcVfsResourceRecord {
+            ref_num,
+            path: format!("File {ref_num}"),
+            res_type: pict,
+            res_id,
+            name: Vec::new(),
+            data: Vec::new().into(),
+            raw_data: None,
+            raw_attrs: None,
+            attrs: 0,
+            handle: 0,
+        };
+        let resources = vec![
+            record(133, 207),
+            record(139, 207),
+            record(140, 1),
+            record(141, 208),
+        ];
+
+        // The most recently opened file below the current one wins.
+        assert_eq!(ppc_vfs_resource_index(&resources, 140, pict, 207, false), Some(1));
+        // The current file still wins over everything else.
+        assert_eq!(ppc_vfs_resource_index(&resources, 133, pict, 207, false), Some(0));
+        // A file below the current one is preferred to one opened later.
+        assert_eq!(ppc_vfs_resource_index(&resources, 135, pict, 207, false), Some(0));
+        // Nothing lower in the chain: an open file is still found.
+        assert_eq!(ppc_vfs_resource_index(&resources, 140, pict, 208, false), Some(3));
+        assert_eq!(ppc_vfs_resource_index(&resources, 140, pict, 999, false), None);
     }
 
     #[test]
@@ -9638,6 +9673,7 @@ fn ppc_pb_get_fcb_info_reports_open_data_and_application_resource_forks() {
             &[],
             &[],
             Some("Escape Velocity"),
+            &[],
         ),
         PPC_NO_ERR
     );
@@ -9673,6 +9709,7 @@ fn ppc_pb_get_fcb_info_reports_open_data_and_application_resource_forks() {
             &resource_forks,
             &[],
             Some(resource_path),
+            &[],
         ),
         PPC_NO_ERR
     );
@@ -11324,7 +11361,7 @@ fn pb_get_cat_info_preserves_literal_slash_and_macroman_basename() {
         let files = loaded.vfs_files.clone();
         let resources = loaded.vfs_resource_files.clone();
         assert_eq!(
-            ppc_path_for_fsspec(&mut loaded.memory, &directories, spec_ptr),
+            ppc_path_for_fsspec(&mut loaded.memory, &directories, spec_ptr, &[]),
             Ok(path.clone())
         );
         assert_eq!(
@@ -11333,7 +11370,8 @@ fn pb_get_cat_info_preserves_literal_slash_and_macroman_basename() {
                 &directories,
                 &files,
                 &resources,
-                spec_ptr
+                spec_ptr,
+                &[],
             ),
             Ok(path.clone())
         );
@@ -11343,7 +11381,8 @@ fn pb_get_cat_info_preserves_literal_slash_and_macroman_basename() {
                     &mut loaded.memory,
                     &directories,
                     &files,
-                    spec_ptr
+                    spec_ptr,
+                    &[],
                 ),
                 Ok(path.clone())
             );
@@ -11744,6 +11783,7 @@ fn ppc_pb_get_fcb_info_reports_file_manager_resource_fork_under_its_own_folder()
             &resource_forks,
             &[],
             Some(path),
+            &[],
         ),
         PPC_NO_ERR
     );
@@ -11966,4 +12006,674 @@ fn pbdircreatesync_reports_missing_parent_bad_volume_and_bad_parameter() {
         ),
     );
     assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_PARAM_ERR));
+}
+
+#[test]
+fn pb_get_v_info_fills_only_the_64_byte_volume_param() {
+    for (symbol, hfs) in [(&b"PBGetVInfoSync"[..], false), (&b"PBHGetVInfoSync"[..], true)] {
+        let pef = synthetic_pef_with_import(symbol);
+        let mut loaded = load_pef_application(&pef).unwrap();
+        let pb = PPC_DATA_BASE + 0x1000;
+        // Bytes after the block stand for the caller's neighbouring data.
+        loaded.memory.add_region(pb, vec![0xa5; 0x100]);
+        for offset in 0..30 {
+            loaded.memory.write_u8(pb + offset, 0).unwrap();
+        }
+        loaded.cpu.gpr[3] = pb;
+
+        let probe = loaded.run_with_hle_imports(64);
+
+        assert_eq!(probe.unsupported_import_index, None);
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR), "hfs={hfs}");
+        let tail: Vec<u8> = (64..122).filter_map(|offset| loaded.memory.read_u8(pb + offset)).collect();
+        if hfs {
+            assert_eq!(&tail[..2], &[0x42, 0x44], "HVolumeParam carries ioVSigWord");
+        } else {
+            assert_eq!(tail, vec![0xa5; 58], "VolumeParam ends at offset 64");
+        }
+    }
+
+    // A caller that maps only the 64-byte block is served.
+    let pef = synthetic_pef_with_import(b"PBGetVInfoSync");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let pb = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(pb, vec![0; 64]);
+    loaded.cpu.gpr[3] = pb;
+    let _ = loaded.run_with_hle_imports(64);
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+}
+
+#[test]
+fn pb_get_finfo_reports_the_open_fork_reference_number_or_zero() {
+    let pef = synthetic_pef_with_import(b"PBGetFInfoSync");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    loaded
+        .default_dir_id
+        .with_mut(|default_dir_id| *default_dir_id = PPC_PREFERENCES_DIR_ID);
+    let path = "System Folder/Preferences/Boot Data";
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+            path: "System Folder/Preferences/Boot Data".to_string(),
+            data: b"boot".to_vec().into(),
+            creator: u32::from_be_bytes(*b"TEST"),
+            file_type: u32::from_be_bytes(*b"DATA"),
+            finder_flags: 0,
+            dirty: false,
+        });
+    let pb = PPC_DATA_BASE + 0x1000;
+    let name_ptr = pb + 128;
+    loaded.memory.add_region(pb, vec![0; 256]);
+    assert!(ppc_write_pstring_bytes(&mut loaded.memory, name_ptr, b"Boot Data"));
+    loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+    // The caller's block still holds a value from an earlier call.
+    loaded.memory.write_u16_be(pb + 24, 0x1234).unwrap();
+    loaded.cpu.gpr[3] = pb;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(loaded.memory.read_u16_be(pb + 24), Some(0), "the file is not open");
+
+    loaded.push_test_open_file(PpcFileRecord { ref_num: 7, path: path.to_string(), position: 0 });
+    loaded.memory.write_u16_be(pb + 24, 0x1234).unwrap();
+    loaded.cpu.pc = loaded.entry_pc;
+    loaded.cpu.lr = PPC_HALT_PC;
+    loaded.cpu.gpr[3] = pb;
+    let _ = loaded.run_with_hle_imports(64);
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(loaded.memory.read_u16_be(pb + 24), Some(7), "the data fork is open");
+    // An open file's name is returned as well.
+    assert!(ppc_write_pstring_bytes(&mut loaded.memory, name_ptr, b"BOOT DATA"));
+    loaded.cpu.pc = loaded.entry_pc;
+    loaded.cpu.lr = PPC_HALT_PC;
+    loaded.cpu.gpr[3] = pb;
+    let _ = loaded.run_with_hle_imports(64);
+    assert_eq!(
+        ppc_read_pstring_bytes(&mut loaded.memory, name_ptr),
+        Some(b"Boot Data".to_vec())
+    );
+}
+
+#[test]
+fn pb_get_finfo_by_name_leaves_the_callers_name_unchanged() {
+    let pef = synthetic_pef_with_import(b"PBGetFInfoSync");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    loaded
+        .default_dir_id
+        .with_mut(|default_dir_id| *default_dir_id = PPC_PREFERENCES_DIR_ID);
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+            path: "System Folder/Preferences/Boot Data".to_string(),
+            data: b"boot".to_vec().into(),
+            creator: u32::from_be_bytes(*b"TEST"),
+            file_type: u32::from_be_bytes(*b"DATA"),
+            finder_flags: 0,
+            dirty: false,
+        });
+    let pb = PPC_DATA_BASE + 0x1000;
+    let name_ptr = pb + 128;
+    loaded.memory.add_region(pb, vec![0; 256]);
+    // A lookup by name (ioFDirIndex zero) of a file that is not open: the
+    // name is input only, so its spelling, here a full pathname in another
+    // case, must survive.
+    let given = b"macintoshhd:system folder:preferences:BOOT DATA";
+    assert!(ppc_write_pstring_bytes(&mut loaded.memory, name_ptr, given));
+    loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+    loaded.memory.write_u16_be(pb + 28, 0).unwrap();
+    loaded.cpu.gpr[3] = pb;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(loaded.memory.read_u32_be(pb + 54), Some(4));
+    assert_eq!(ppc_read_pstring_bytes(&mut loaded.memory, name_ptr), Some(given.to_vec()));
+}
+
+#[test]
+fn full_pathnames_select_the_named_file_among_equal_leaf_names() {
+    // Three files share a leaf name, so only the directories in the full
+    // pathname can tell them apart.
+    let pef = synthetic_pef_with_import(b"FSOpen");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Disc/A/BOOT".to_string(),
+        data: b"a".to_vec().into(),
+        creator: u32::from_be_bytes(*b"TEST"),
+        file_type: u32::from_be_bytes(*b"DATA"),
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Disc/B/BOOT".to_string(),
+        data: b"bb".to_vec().into(),
+        creator: u32::from_be_bytes(*b"TEST"),
+        file_type: u32::from_be_bytes(*b"DATA"),
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Disc/C/BOOT".to_string(),
+        data: b"ccc".to_vec().into(),
+        creator: u32::from_be_bytes(*b"TEST"),
+        file_type: u32::from_be_bytes(*b"DATA"),
+        finder_flags: 0,
+        dirty: false,
+    });
+    let scratch = PPC_DATA_BASE + 0x1000;
+    let name_ptr = scratch + 16;
+    loaded.memory.add_region(scratch, vec![0; 128]);
+    assert!(ppc_write_pstring_bytes(
+        &mut loaded.memory,
+        name_ptr,
+        format!(
+            "{}:Disc:B:BOOT",
+            crate::trap::TrapDispatcher::boot_volume_name()
+        )
+        .as_bytes()
+    ));
+    loaded.cpu.gpr[3] = name_ptr;
+    loaded.cpu.gpr[4] = 0;
+    loaded.cpu.gpr[5] = scratch;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(loaded.files.len(), 1);
+    assert_eq!(loaded.files[0].path, "Disc/B/BOOT");
+
+    let pef = synthetic_pef_with_import(b"PBGetFInfoSync");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Disc/A/BOOT".to_string(),
+        data: b"a".to_vec().into(),
+        creator: u32::from_be_bytes(*b"TEST"),
+        file_type: u32::from_be_bytes(*b"DATA"),
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Disc/B/BOOT".to_string(),
+        data: b"bb".to_vec().into(),
+        creator: u32::from_be_bytes(*b"TEST"),
+        file_type: u32::from_be_bytes(*b"DATA"),
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Disc/C/BOOT".to_string(),
+        data: b"ccc".to_vec().into(),
+        creator: u32::from_be_bytes(*b"TEST"),
+        file_type: u32::from_be_bytes(*b"DATA"),
+        finder_flags: 0,
+        dirty: false,
+    });
+    let pb = PPC_DATA_BASE + 0x1000;
+    let name_ptr = pb + 128;
+    loaded.memory.add_region(pb, vec![0; 256]);
+    assert!(ppc_write_pstring_bytes(
+        &mut loaded.memory,
+        name_ptr,
+        format!(
+            "{}:Disc:C:BOOT",
+            crate::trap::TrapDispatcher::boot_volume_name()
+        )
+        .as_bytes()
+    ));
+    loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+    loaded.cpu.gpr[3] = pb;
+
+    let _ = loaded.run_with_hle_imports(64);
+
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR));
+    assert_eq!(
+        loaded.memory.read_u32_be(pb + 54),
+        Some(3),
+        "the file in folder C"
+    );
+}
+
+#[test]
+fn full_pathnames_are_authoritative_for_open_get_and_set_finfo() {
+    let boot = crate::trap::TrapDispatcher::boot_volume_name();
+    for import in [b"FSOpen".as_slice(), b"PBGetFInfoSync", b"PBSetFInfoSync"] {
+        for (name, expected, selected) in [
+            (format!("{boot}:Target:BOOT"), PPC_NO_ERR, true),
+            (format!("{boot}:Missing:BOOT"), PPC_FNF_ERR, false),
+            ("MissingVolume:Target:BOOT".to_string(), PPC_NSV_ERR, false),
+        ] {
+            let mut loaded = load_pef_application(&synthetic_pef_with_import(import)).unwrap();
+            for (path, length) in [
+                ("Target/BOOT".to_string(), 3),
+                (format!("Shadow/{boot}/Target/BOOT"), 9),
+                ("Other/BOOT".to_string(), 5),
+            ] {
+                loaded.push_test_vfs_file(PpcVfsFileRecord {
+                    path,
+                    data: vec![0; length].into(),
+                    creator: u32::from_be_bytes(*b"TEST"),
+                    file_type: u32::from_be_bytes(*b"DATA"),
+                    finder_flags: 0,
+                    dirty: false,
+                });
+            }
+            let shadow_id = PPC_FIRST_DYNAMIC_DIR_ID;
+            let mut directories = initial_ppc_vfs_directories();
+            directories.push(PpcVfsDirectory {
+                dir_id: shadow_id, parent_dir_id: PPC_ROOT_DIR_ID, path: "Shadow".into(),
+                creator: 0, file_type: 0, finder_flags: 0, dirty: false,
+            });
+            loaded.seed_vfs_directories(directories, PPC_ROOT_DIR_ID, shadow_id + 1);
+            loaded.default_dir_id.with_mut(|id| *id = shadow_id);
+            let pb = PPC_DATA_BASE + 0x1000;
+            let name_ptr = pb + 128;
+            loaded.memory.add_region(pb, vec![0; 512]);
+            assert!(ppc_write_pstring_bytes(
+                &mut loaded.memory,
+                name_ptr,
+                name.as_bytes()
+            ));
+            if import == b"FSOpen" {
+                loaded.cpu.gpr[3] = name_ptr;
+                loaded.cpu.gpr[4] = 0;
+                loaded.cpu.gpr[5] = pb;
+            } else {
+                loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+                loaded
+                    .memory
+                    .write_u32_be(pb + 32, u32::from_be_bytes(*b"NEW!"))
+                    .unwrap();
+                loaded.cpu.gpr[3] = pb;
+            }
+            let probe = loaded.run_with_hle_imports(64);
+            assert_eq!(probe.unsupported_import_index, None);
+            assert_eq!(
+                loaded.cpu.gpr[3],
+                ppc_i16_result(expected),
+                "{import:?}: {name}"
+            );
+            if import == b"FSOpen" {
+                assert_eq!(loaded.files.len(), usize::from(selected));
+                if selected {
+                    assert_eq!(loaded.files[0].path, "Target/BOOT");
+                }
+            } else if import == b"PBGetFInfoSync" && selected {
+                assert_eq!(loaded.memory.read_u32_be(pb + 54), Some(3));
+            } else if import == b"PBSetFInfoSync" {
+                for file in loaded.vfs_files.iter() {
+                    let changed = selected && file.path == "Target/BOOT";
+                    assert_eq!(
+                        file.file_type,
+                        u32::from_be_bytes(if changed { *b"NEW!" } else { *b"DATA" }),
+                        "{}",
+                        file.path
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn full_pathnames_use_the_named_mounted_volume_and_ignore_current_directory() {
+    for import in [b"FSOpen".as_slice(), b"PBGetFInfoSync"] {
+        let mut loaded = load_pef_application(&synthetic_pef_with_import(import)).unwrap();
+        loaded.push_test_vfs_file(PpcVfsFileRecord {
+            path: "Mounted/Folder/BOOT".into(),
+            data: vec![1, 2, 3, 4].into(),
+            creator: 0,
+            file_type: 0,
+            finder_flags: 0,
+            dirty: false,
+        });
+        let root_dir_id = PPC_FIRST_DYNAMIC_DIR_ID;
+            let mut directories = initial_ppc_vfs_directories();
+            directories.push(PpcVfsDirectory {
+                dir_id: root_dir_id, parent_dir_id: PPC_ROOT_DIR_ID, path: "Mounted".into(),
+                creator: 0, file_type: 0, finder_flags: 0, dirty: false,
+            });
+            loaded.seed_vfs_directories(directories, PPC_ROOT_DIR_ID, root_dir_id + 1);
+        loaded.seed_vfs_volumes(vec![PpcVfsVolumeRecord {
+            ref_num: -2,
+            name: "Disc Two".into(),
+            root_dir_id,
+            attributes: 0,
+            file_count: 1,
+            allocation_block_count: 1,
+            allocation_block_size: 512,
+            clump_size: 512,
+            free_blocks: 0,
+            bitmap_start: 0,
+            allocation_pointer: 0,
+            allocation_start: 0,
+            next_catalog_id: 100,
+            created_date: 0,
+            modified_date: 0,
+        }]);
+        loaded.default_dir_id.with_mut(|id| *id = 0xFFFF_FFFE);
+        let pb = PPC_DATA_BASE + 0x1000;
+        let name_ptr = pb + 128;
+        loaded.memory.add_region(pb, vec![0; 512]);
+        assert!(ppc_write_pstring_bytes(
+            &mut loaded.memory,
+            name_ptr,
+            b"disc two:Folder:BOOT"
+        ));
+        if import == b"FSOpen" {
+            loaded.cpu.gpr[3] = name_ptr;
+            loaded.cpu.gpr[4] = 0;
+            loaded.cpu.gpr[5] = pb;
+        } else {
+            loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+            loaded.cpu.gpr[3] = pb;
+        }
+        loaded.run_with_hle_imports(64);
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR), "{import:?}");
+        if import == b"FSOpen" {
+            assert_eq!(loaded.files[0].path, "Mounted/Folder/BOOT");
+        } else {
+            assert_eq!(loaded.memory.read_u32_be(pb + 54), Some(4));
+            assert_eq!(loaded.memory.read_u16_be(pb + 22), Some((-2i16) as u16));
+        }
+    }
+}
+
+const SPARE_VREF: i16 = -3;
+const SPARE_ROOT_DIR_ID: u32 = PPC_FIRST_DYNAMIC_DIR_ID;
+const SPARE_GAME_DIR_ID: u32 = PPC_FIRST_DYNAMIC_DIR_ID + 1;
+
+/// A mounted volume laid out as `mount_vfs_volume` lays it out: a top-level
+/// VFS directory named after the volume, holding a root-level game folder.
+fn load_with_spare_volume(import: &[u8]) -> PpcLoadedApp {
+    let mut loaded = load_pef_application(&synthetic_pef_with_import(import)).unwrap();
+    let mut directories = initial_ppc_vfs_directories();
+    for (dir_id, parent_dir_id, path) in [
+        (SPARE_ROOT_DIR_ID, PPC_ROOT_DIR_ID, "Spare"),
+        (SPARE_GAME_DIR_ID, SPARE_ROOT_DIR_ID, "Spare/Titanic"),
+        (SPARE_GAME_DIR_ID + 1, PPC_ROOT_DIR_ID, "Boot Folder"),
+    ] {
+        directories.push(PpcVfsDirectory {
+            dir_id,
+            parent_dir_id,
+            path: path.into(),
+            creator: PPC_DIRECTORY_CREATOR,
+            file_type: PPC_DIRECTORY_FILE_TYPE,
+            finder_flags: 0,
+            dirty: false,
+        });
+    }
+    loaded.seed_vfs_directories(directories, PPC_ROOT_DIR_ID, SPARE_GAME_DIR_ID + 2);
+    loaded.seed_vfs_volumes(vec![PpcVfsVolumeRecord {
+        ref_num: SPARE_VREF,
+        name: "Spare".into(),
+        root_dir_id: SPARE_ROOT_DIR_ID,
+        attributes: 0,
+        file_count: 1,
+        allocation_block_count: 1,
+        allocation_block_size: 512,
+        clump_size: 512,
+        free_blocks: 0,
+        bitmap_start: 0,
+        allocation_pointer: 0,
+        allocation_start: 0,
+        next_catalog_id: 100,
+        created_date: 0,
+        modified_date: 0,
+    }]);
+    loaded.push_test_vfs_file(PpcVfsFileRecord {
+        path: "Spare/Titanic/BOOTFILE".into(),
+        data: vec![1, 2, 3, 4].into(),
+        creator: 0,
+        file_type: 0,
+        finder_flags: 0,
+        dirty: false,
+    });
+    loaded
+        .memory
+        .add_region(PPC_DATA_BASE + 0x1000, vec![0; 0x400]);
+    loaded
+}
+
+/// Runs PBGetCatInfo and returns (result, name, ioVRefNum, ioDirID, parent).
+fn spare_pb_get_cat_info(
+    loaded: &mut PpcLoadedApp,
+    vref: i16,
+    dir_id: u32,
+    index: i16,
+    name: &[u8],
+) -> (i16, Vec<u8>, i16, u32, u32) {
+    let pb = PPC_DATA_BASE + 0x1000;
+    let name_ptr = pb + 0x200;
+    loaded.memory.write_u32_be(pb + 18, name_ptr).unwrap();
+    write_ppc_pstring(&mut loaded.memory, name_ptr, name);
+    loaded.memory.write_u16_be(pb + 22, vref as u16).unwrap();
+    loaded.memory.write_u16_be(pb + 28, index as u16).unwrap();
+    loaded.memory.write_u32_be(pb + 48, dir_id).unwrap();
+    loaded.memory.write_u32_be(pb + 100, 0xDEAD_BEEF).unwrap();
+    loaded.cpu.gpr[3] = pb;
+    run_test_import(loaded, PpcImportDispatcherTarget::PBGetCatInfo);
+    (
+        loaded.cpu.gpr[3] as i32 as i16,
+        ppc_read_pstring_bytes(&mut loaded.memory, name_ptr).unwrap(),
+        loaded.memory.read_u16_be(pb + 22).unwrap() as i16,
+        loaded.memory.read_u32_be(pb + 48).unwrap(),
+        loaded.memory.read_u32_be(pb + 100).unwrap(),
+    )
+}
+
+/// Runs FSMakeFSSpec and returns (result, vRefNum, parID, name).
+fn spare_fs_make_fsspec(
+    loaded: &mut PpcLoadedApp,
+    vref: i16,
+    dir_id: u32,
+    name: &[u8],
+) -> (i16, i16, u32, Vec<u8>) {
+    let name_ptr = PPC_DATA_BASE + 0x1300;
+    let spec = PPC_DATA_BASE + 0x1380;
+    write_ppc_pstring(&mut loaded.memory, name_ptr, name);
+    loaded.cpu.gpr[3] = vref as u16 as u32;
+    loaded.cpu.gpr[4] = dir_id;
+    loaded.cpu.gpr[5] = name_ptr;
+    loaded.cpu.gpr[6] = spec;
+    run_test_import(loaded, PpcImportDispatcherTarget::FSMakeFSSpec);
+    (
+        loaded.cpu.gpr[3] as i32 as i16,
+        loaded.memory.read_u16_be(spec).unwrap() as i16,
+        loaded.memory.read_u32_be(spec + 2).unwrap(),
+        ppc_read_pstring_bytes(&mut loaded.memory, spec + 6).unwrap(),
+    )
+}
+
+#[test]
+fn pb_get_cat_info_walks_from_a_mounted_folder_to_its_volume_root() {
+    // Inside Macintosh: Files (1992), pp. 1-27 and 2-85: every volume's root
+    // directory has dirID 2 (fsRtDirID), parent dirID 1 (fsRtParID) and the
+    // volume's name, so walking up from a root-level folder names the volume
+    // once. Titanic builds "Spare:Titanic:bootfile" this way (#6042).
+    let mut loaded = load_with_spare_volume(b"PBGetCatInfoSync");
+    let mut path = Vec::new();
+    let (mut vref, mut dir_id) = (SPARE_VREF, SPARE_GAME_DIR_ID);
+    let mut steps = Vec::new();
+    while dir_id != 1 {
+        let (result, name, out_vref, out_dir_id, parent) =
+            spare_pb_get_cat_info(&mut loaded, vref, dir_id, -1, b"");
+        assert_eq!(result, PPC_NO_ERR, "dir {dir_id}");
+        assert_eq!(
+            out_vref, SPARE_VREF,
+            "dir {dir_id} is on the mounted volume"
+        );
+        steps.push((out_dir_id, parent));
+        path.insert(0, decode_mac_roman(&name));
+        (vref, dir_id) = (out_vref, parent);
+        assert!(steps.len() <= 3, "walk did not reach fsRtParID: {steps:?}");
+    }
+    assert_eq!(steps, [(SPARE_GAME_DIR_ID, 2), (2, 1)]);
+    assert_eq!(path.join(":"), "Spare:Titanic");
+
+    // Named lookups relative to the mounted root use that volume's root.
+    let (result, name, out_vref, out_dir_id, parent) =
+        spare_pb_get_cat_info(&mut loaded, SPARE_VREF, 2, 0, b"Titanic");
+    assert_eq!(result, PPC_NO_ERR);
+    assert_eq!(name, b"Titanic");
+    assert_eq!(
+        (out_vref, out_dir_id, parent),
+        (SPARE_VREF, SPARE_GAME_DIR_ID, 2)
+    );
+
+    // The boot volume is unchanged.
+    let (result, name, out_vref, out_dir_id, parent) =
+        spare_pb_get_cat_info(&mut loaded, PPC_BOOT_VOLUME_REF_NUM, 2, -1, b"");
+    assert_eq!(result, PPC_NO_ERR);
+    assert_eq!(
+        name,
+        crate::trap::TrapDispatcher::boot_volume_name().as_bytes()
+    );
+    assert_eq!(
+        (out_vref, out_dir_id, parent),
+        (PPC_BOOT_VOLUME_REF_NUM, 2, 1)
+    );
+    let (result, _, out_vref, out_dir_id, parent) =
+        spare_pb_get_cat_info(&mut loaded, PPC_BOOT_VOLUME_REF_NUM, 2, 0, b"Boot Folder");
+    assert_eq!(result, PPC_NO_ERR);
+    assert_eq!(
+        (out_vref, out_dir_id, parent),
+        (PPC_BOOT_VOLUME_REF_NUM, SPARE_GAME_DIR_ID + 1, 2)
+    );
+}
+
+#[test]
+fn fs_make_fsspec_reports_mounted_volume_roots_as_fs_rt_dir_id() {
+    let mut loaded = load_with_spare_volume(b"FSMakeFSSpec");
+    for (vref, dir_id, name, expected) in [
+        (
+            SPARE_VREF,
+            2,
+            b"Titanic".as_slice(),
+            (SPARE_VREF, 2, b"Titanic".as_slice()),
+        ),
+        (SPARE_VREF, 2, b"", (SPARE_VREF, 1, b"Spare")),
+        (0, 0, b"Spare:Titanic", (SPARE_VREF, 2, b"Titanic")),
+        (0, 0, b"Spare:", (SPARE_VREF, 1, b"Spare")),
+        (
+            0,
+            0,
+            b"Spare:Titanic:bootfile",
+            (SPARE_VREF, SPARE_GAME_DIR_ID, b"BOOTFILE"),
+        ),
+        (
+            SPARE_VREF,
+            2,
+            b":Titanic:bootfile",
+            (SPARE_VREF, SPARE_GAME_DIR_ID, b"BOOTFILE"),
+        ),
+    ] {
+        let (result, out_vref, out_dir_id, out_name) =
+            spare_fs_make_fsspec(&mut loaded, vref, dir_id, name);
+        let label = decode_mac_roman(name);
+        assert_eq!(result, PPC_NO_ERR, "{label}");
+        assert_eq!(
+            (out_vref, out_dir_id, out_name.as_slice()),
+            expected,
+            "{label}"
+        );
+    }
+
+    // The FSSpec of the root-level folder opens files beneath it.
+    let (_, vref, dir_id, _) = spare_fs_make_fsspec(&mut loaded, 0, 0, b"Spare:Titanic");
+    let (result, _, out_dir_id, _) = spare_fs_make_fsspec(&mut loaded, vref, dir_id, b"Titanic");
+    assert_eq!((result, out_dir_id), (PPC_NO_ERR, 2));
+    let (result, _, game_dir_id, _) =
+        spare_pb_get_cat_info_dir(&mut loaded, vref, dir_id, b"Titanic");
+    assert_eq!((result, game_dir_id), (PPC_NO_ERR, SPARE_GAME_DIR_ID));
+}
+
+fn spare_pb_get_cat_info_dir(
+    loaded: &mut PpcLoadedApp,
+    vref: i16,
+    dir_id: u32,
+    name: &[u8],
+) -> (i16, i16, u32, u32) {
+    let (result, _, out_vref, out_dir_id, parent) =
+        spare_pb_get_cat_info(loaded, vref, dir_id, 0, name);
+    (result, out_vref, out_dir_id, parent)
+}
+
+#[test]
+fn h_open_resolves_files_relative_to_a_mounted_volume_root() {
+    let mut loaded = load_with_spare_volume(b"HOpen");
+    let scratch = PPC_DATA_BASE + 0x1000;
+    let ref_num_out_ptr = scratch + 0x100;
+    for (vref, dir_id, name) in [
+        (SPARE_VREF, 2, b":Titanic:bootfile".as_slice()),
+        (SPARE_VREF, SPARE_GAME_DIR_ID, b"bootfile"),
+        (0, 0, b"Spare:Titanic:bootfile"),
+    ] {
+        write_ppc_pstring(&mut loaded.memory, scratch, name);
+        loaded.cpu.gpr[3] = vref as u16 as u32;
+        loaded.cpu.gpr[4] = dir_id;
+        loaded.cpu.gpr[5] = scratch;
+        loaded.cpu.gpr[6] = 1;
+        loaded.cpu.gpr[7] = ref_num_out_ptr;
+        run_test_import(&mut loaded, PpcImportDispatcherTarget::HOpen);
+        let label = decode_mac_roman(name);
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR), "{label}");
+        assert_eq!(
+            loaded.files.last().unwrap().path,
+            "Spare/Titanic/BOOTFILE",
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn get_process_information_reports_an_app_on_a_mounted_volume() {
+    // processAppSpec names the volume that holds the application, so its
+    // parent ID can be followed on that volume. Inside Macintosh: Processes
+    // (1994), pp. 2-23 to 2-25; Files (1992), pp. 1-27 and 2-85.
+    for (app_path, expected_dir_id) in [
+        ("Spare/Titanic/Titanic", SPARE_GAME_DIR_ID),
+        ("Spare/Launcher", PPC_ROOT_DIR_ID),
+    ] {
+        let mut loaded = load_with_spare_volume(b"GetProcessInformation");
+        loaded.push_test_vfs_file(PpcVfsFileRecord {
+            path: app_path.into(),
+            data: Vec::new().into(),
+            creator: u32::from_be_bytes(*b"TEST"),
+            file_type: u32::from_be_bytes(*b"APPL"),
+            finder_flags: 0,
+            dirty: false,
+        });
+        loaded.set_launched_app_path(app_path);
+        let psn_ptr = PPC_DATA_BASE + 0x1000;
+        let info_ptr = PPC_DATA_BASE + 0x1100;
+        let spec_ptr = PPC_DATA_BASE + 0x1200;
+        loaded
+            .memory
+            .write_u32_be(psn_ptr, ProcessSerialNumber::CURRENT.high)
+            .unwrap();
+        loaded
+            .memory
+            .write_u32_be(psn_ptr + 4, ProcessSerialNumber::CURRENT.low)
+            .unwrap();
+        loaded.memory.write_u16_be(info_ptr, 60).unwrap();
+        loaded.memory.write_u32_be(info_ptr + 4, 0).unwrap();
+        loaded.memory.write_u32_be(info_ptr + 56, spec_ptr).unwrap();
+        loaded.cpu.gpr[3] = psn_ptr;
+        loaded.cpu.gpr[4] = info_ptr;
+        run_test_import(
+            &mut loaded,
+            PpcImportDispatcherTarget::GetProcessInformation,
+        );
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_NO_ERR), "{app_path}");
+        assert_eq!(
+            loaded.memory.read_u16_be(spec_ptr),
+            Some(SPARE_VREF as u16),
+            "{app_path}"
+        );
+        assert_eq!(
+            loaded.memory.read_u32_be(spec_ptr + 2),
+            Some(expected_dir_id),
+            "{app_path}"
+        );
+    }
 }

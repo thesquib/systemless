@@ -9,7 +9,7 @@ use super::{
     ppc_process_heap_alloc, ppc_quickdraw_read_pixel, ppc_quickdraw_write_raw_pixel,
     ppc_res_type_text, ppc_rgb555_to_clut_index, qd3d_collision_trace_enabled,
     qd3d_dump_frame_enabled, qd3d_text, qd3d_trace_enabled, qd3d_trimesh_trace_enabled, BLR,
-    PpcCpu, PpcImportAction, PpcSectionMem, PpcVfsDirectory, PpcVfsFileRecord,
+    PpcCpu, PpcImportAction, PpcSectionMem, PpcVfsDirectory, PpcVfsFileRecord, PpcVfsVolumeRecord,
     ppc_i16_result, PPC_MEM_FULL_ERR, PPC_NO_ERR, PPC_PARAM_ERR,
 };
 use crate::memory::GuestWritableSpan;
@@ -1135,7 +1135,7 @@ pub struct PpcQ3ShaderUvTransformRecord {
     pub matrix: [[f32; 3]; 3],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PpcQ3ShaderBoundaryRecord {
     pub shader: u32,
     pub u_boundary: u32,
@@ -1593,6 +1593,69 @@ impl PpcQ3SoftwareFrontBufferSurface {
     pub fn pixel_relative_offset(&self, point: (i32, i32)) -> Option<usize> {
         ppc_q3_front_buffer_pixel_relative_offset(self.front_buffer, point)
     }
+
+    /// `write_pixel`, with the report of a span store held in `run` while the
+    /// stores stay adjacent. The caller reports the last run with
+    /// [`PpcQ3UnreportedRun::finish`] before anything but this surface's own
+    /// pixel reads and writes can observe guest memory.
+    pub(crate) fn write_pixel_in_run(
+        &self,
+        memory: &mut PpcSectionMem,
+        point: (i32, i32),
+        color: u16,
+        run: &mut PpcQ3UnreportedRun,
+    ) -> bool {
+        if self.front_buffer.depth != 8 {
+            if let (Some(span), Some(offset)) = (self.span, self.pixel_relative_offset(point)) {
+                if run.words != 0 && run.first + run.words * 2 != offset {
+                    run.report(memory, span);
+                }
+                if memory
+                    .write_u16_be_in_span_unreported(span, offset, color)
+                    .is_none()
+                {
+                    return false;
+                }
+                if run.words == 0 {
+                    run.first = offset;
+                }
+                run.words += 1;
+                return true;
+            }
+        }
+        if let Some(span) = self.span {
+            run.report(memory, span);
+        }
+        self.write_pixel(memory, point, color)
+    }
+}
+
+/// Adjacent span words stored by a software primitive and not yet reported to
+/// the guest-memory observers.
+#[derive(Default)]
+pub(crate) struct PpcQ3UnreportedRun {
+    first: usize,
+    words: usize,
+}
+
+impl PpcQ3UnreportedRun {
+    fn report(&mut self, memory: &mut PpcSectionMem, span: GuestWritableSpan) {
+        if self.words != 0 {
+            memory.report_span_write(span, self.first, self.words);
+            self.words = 0;
+        }
+    }
+
+    /// Report whatever a finished fill of `surface` still holds.
+    pub(crate) fn finish(
+        &mut self,
+        memory: &mut PpcSectionMem,
+        surface: PpcQ3SoftwareFrontBufferSurface,
+    ) {
+        if let Some(span) = surface.span {
+            self.report(memory, span);
+        }
+    }
 }
 
 // --- QuickDraw 3D Software Rasterizer & Depth Buffer ---
@@ -1667,7 +1730,7 @@ pub fn ppc_q3_color_finite((red, green, blue): (f32, f32, f32)) -> bool {
     red.is_finite() && green.is_finite() && blue.is_finite()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PpcQ3SoftwareTexture {
     pub image_base: u32,
     pub valid_size: u32,
@@ -2075,13 +2138,19 @@ pub fn ppc_q3_software_geometric_normal(
     ppc_q3_vector3d_normalized_value(normal)
 }
 
-pub fn ppc_q3_software_transform_normal(
-    normal: (f32, f32, f32),
-    local_to_world: [[f32; 4]; 4],
-) -> Option<(f32, f32, f32)> {
-    let normal_matrix = ppc_q3_matrix4x4_invert_values(local_to_world)
+/// The matrix that carries normals from local to world space: the inverse
+/// transpose, or the matrix itself when it has no inverse. Callers with many
+/// normals under one transform compute it once.
+pub fn ppc_q3_software_normal_matrix(local_to_world: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    ppc_q3_matrix4x4_invert_values(local_to_world)
         .map(ppc_q3_matrix4x4_transpose_values)
-        .unwrap_or(local_to_world);
+        .unwrap_or(local_to_world)
+}
+
+pub fn ppc_q3_software_transform_normal_by(
+    normal: (f32, f32, f32),
+    normal_matrix: [[f32; 4]; 4],
+) -> Option<(f32, f32, f32)> {
     ppc_q3_vector3d_normalized_value(ppc_q3_vector3d_transform_values(normal, normal_matrix))
 }
 
@@ -2201,8 +2270,7 @@ pub fn ppc_q3_gpu_texture_from_software(
     let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4)?);
     for y in 0..texture.height {
         if let Some(row) = ppc_q3_gpu_texture_row(memory, texture, y) {
-            // Borrow only this conversion's visible row. Guest writes between
-            // frames remain observable; no texture cache or extra scratch copy.
+            // Borrow only this conversion's visible row, with no scratch copy.
             if !ppc_q3_gpu_texture_fast_16_row(&mut rgba, row, texture) {
                 for bytes in row.chunks_exact(texture.pixel_bytes as usize) {
                     let mut pixel = [0; 4];
@@ -2325,6 +2393,134 @@ fn q3_convert_16_row<const FORMAT: u8, const LITTLE: bool>(rgba: &mut Vec<u8>, r
             255
         };
     }
+}
+
+/// GPU textures converted in earlier frames. An entry is reused only while
+/// every source row it was converted from is a single ordinary readable slice
+/// holding the same bytes, so a cached conversion can never hide a guest write.
+#[derive(Debug, Default)]
+pub struct PpcQ3GpuTextureCache {
+    entries: HashMap<(PpcQ3SoftwareTexture, Option<PpcQ3ShaderBoundaryRecord>), PpcQ3GpuTextureCacheEntry>,
+    frame: u64,
+}
+
+// A clone converts afresh: the cache only saves work, and copying converted
+// textures with every application clone would cost more than it saves.
+impl Clone for PpcQ3GpuTextureCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug)]
+struct PpcQ3GpuTextureCacheEntry {
+    source: Vec<u8>,
+    texture: PpcQ3GpuTexture,
+    used: u64,
+}
+
+impl PpcQ3GpuTextureCache {
+    /// Start a frame, forgetting textures that the last two frames did not use.
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+        let frame = self.frame;
+        self.entries.retain(|_, entry| entry.used + 2 >= frame);
+    }
+
+    /// The conversion `ppc_q3_gpu_texture_from_software` would return now.
+    pub fn texture(
+        &mut self,
+        memory: &mut PpcSectionMem,
+        texture: PpcQ3SoftwareTexture,
+        shader_boundary: Option<PpcQ3ShaderBoundaryRecord>,
+    ) -> Option<PpcQ3GpuTexture> {
+        let key = (texture, shader_boundary);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if ppc_q3_gpu_texture_source_matches(memory, texture, &entry.source) {
+                entry.used = self.frame;
+                return Some(entry.texture.clone());
+            }
+        }
+        let converted = ppc_q3_gpu_texture_from_software(memory, texture, shader_boundary);
+        match (&converted, ppc_q3_gpu_texture_source(memory, texture)) {
+            (Some(converted), Some(source)) => {
+                self.entries.insert(
+                    key,
+                    PpcQ3GpuTextureCacheEntry { source, texture: converted.clone(), used: self.frame },
+                );
+            }
+            _ => {
+                self.entries.remove(&key);
+            }
+        }
+        converted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Every row the conversion reads, when each is one ordinary readable slice:
+/// exactly the bytes that determine the converted texture.
+fn ppc_q3_gpu_texture_source(memory: &mut PpcSectionMem, texture: PpcQ3SoftwareTexture) -> Option<Vec<u8>> {
+    let mut source = Vec::new();
+    for y in 0..texture.height {
+        source.extend_from_slice(ppc_q3_gpu_texture_row(memory, texture, y)?);
+    }
+    Some(source)
+}
+
+fn ppc_q3_gpu_texture_source_matches(
+    memory: &mut PpcSectionMem,
+    texture: PpcQ3SoftwareTexture,
+    source: &[u8],
+) -> bool {
+    // One lookup for the whole image when it lies in a single mapping: each
+    // row is then a slice of these same bytes.
+    if let Some((image, row_len)) = ppc_q3_gpu_texture_image(memory, texture) {
+        let rows = image.chunks(texture.row_bytes as usize).map(|row| &row[..row_len]);
+        return source.len() == row_len * texture.height as usize
+            && rows.zip(source.chunks_exact(row_len)).all(|(row, stored)| row == stored);
+    }
+    let mut offset = 0;
+    for y in 0..texture.height {
+        let Some(row) = ppc_q3_gpu_texture_row(memory, texture, y) else {
+            return false;
+        };
+        if source.get(offset..offset + row.len()) != Some(row) {
+            return false;
+        }
+        offset += row.len();
+    }
+    offset == source.len()
+}
+
+/// Every row `ppc_q3_gpu_texture_row` would return, as one borrowed span from
+/// the first row's start to the last row's end, with the row length. `None`
+/// when any row would be refused or the span is not one readable slice.
+fn ppc_q3_gpu_texture_image(
+    memory: &mut PpcSectionMem,
+    texture: PpcQ3SoftwareTexture,
+) -> Option<(&[u8], usize)> {
+    if !(1..=4).contains(&texture.pixel_bytes) || texture.height == 0 {
+        return None;
+    }
+    let row_len = texture.width.checked_mul(texture.pixel_bytes)?;
+    if row_len == 0 || row_len > texture.row_bytes {
+        return None;
+    }
+    // Row starts grow with y, so the last row's bounds imply every row's.
+    let last = (texture.height - 1).checked_mul(texture.row_bytes)?;
+    let end = texture.image_offset.checked_add(last)?.checked_add(row_len)?;
+    if end > texture.valid_size {
+        return None;
+    }
+    let base = texture.image_base.checked_add(texture.image_offset)?;
+    base.checked_add(last)?.checked_add(row_len)?;
+    let image = memory.readable_bytes(base, usize::try_from(last.checked_add(row_len)?).ok()?)?;
+    Some((image, row_len as usize))
 }
 
 fn ppc_q3_gpu_texture_row(
@@ -3110,54 +3306,117 @@ impl PpcQ3SoftwareDepthBuffer {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct PpcQ3SoftwarePointProjector {
+    local_to_world: [[f32; 4]; 4],
+    camera: Option<Option<([[f32; 4]; 4], [[f32; 4]; 4])>>,
+    camera_record: Option<PpcQ3CameraRecord>,
+    screen_left: f32,
+    screen_top: f32,
+    screen_width: f32,
+    screen_height: f32,
+    include_view_direction: bool,
+}
+
+impl PpcQ3SoftwarePointProjector {
+    pub fn new(
+        command: &PpcQ3SceneTriMeshCommand,
+        front_buffer: PpcFrontBuffer,
+        viewport: PpcQ3ViewportRect,
+        include_view_direction: bool,
+    ) -> Self {
+        let camera = command.camera.map(|camera| {
+            let world_to_view = ppc_q3_camera_world_to_view_matrix(camera.placement)?;
+            let view_to_frustum = ppc_q3_camera_raster_projection_matrix(&camera)?;
+            Some((world_to_view, view_to_frustum))
+        });
+        let screen_viewport = if command.camera.is_some() {
+            viewport
+        } else {
+            PpcQ3ViewportRect::full(front_buffer)
+        };
+        let max_x = screen_viewport.right.saturating_sub(1) as f32;
+        let max_y = screen_viewport.bottom.saturating_sub(1) as f32;
+        Self {
+            local_to_world: command.local_to_world,
+            camera,
+            camera_record: command.camera,
+            screen_left: screen_viewport.left as f32,
+            screen_top: screen_viewport.top as f32,
+            screen_width: (max_x - screen_viewport.left as f32).max(0.0),
+            screen_height: (max_y - screen_viewport.top as f32).max(0.0),
+            include_view_direction,
+        }
+    }
+
+    pub fn project(&self, point: (f32, f32, f32)) -> Option<PpcQ3SoftwareProjectedVertex> {
+        let world = ppc_q3_point3d_transform_values(point, self.local_to_world);
+        let view_direction = self
+            .include_view_direction
+            .then(|| ppc_q3_software_view_direction(self.camera_record, world))
+            .flatten();
+        let (projected, fog_depth, clip) = match self.camera {
+            Some(Some((world_to_view, view_to_frustum))) => {
+                let view = ppc_q3_point3d_transform_values(world, world_to_view);
+                let mut clip = ppc_q3_point3d_transform_4d_values(view, view_to_frustum);
+                // QuickDraw 3D exposes frustum depth in [-1, 0], with the hither
+                // plane at 0.  Keep that guest-visible matrix authentic, then remap
+                // depth to the software rasterizer's OpenGL-style [-1, 1] interval.
+                clip.2 = (-2.0_f32).mul_add(clip.2, -clip.3);
+                (
+                    ppc_q3_software_clip_to_projected(clip)?,
+                    -view.2,
+                    Some(clip),
+                )
+            }
+            Some(None) => return None,
+            None => (world, world.2, None),
+        };
+        if !ppc_q3_point_finite(projected) || !fog_depth.is_finite() {
+            return None;
+        }
+
+        let (normalized_x, normalized_y) = if let Some(camera) = self.camera_record {
+            let viewport_x = (projected.0 + 1.0) * 0.5;
+            let viewport_y = (projected.1 + 1.0) * 0.5;
+            (
+                camera.viewport_origin.0 + viewport_x * camera.viewport_width,
+                // QD3D camera viewport origins are the upper-left corner of the pane.
+                camera.viewport_origin.1 - camera.viewport_height
+                    + viewport_y * camera.viewport_height,
+            )
+        } else {
+            (projected.0, projected.1)
+        };
+        let screen_x = self.screen_left + (normalized_x + 1.0) * 0.5 * self.screen_width;
+        let screen_y = self.screen_top + (1.0 - ((normalized_y + 1.0) * 0.5)) * self.screen_height;
+        Some(PpcQ3SoftwareProjectedVertex {
+            x: screen_x,
+            y: screen_y,
+            z: projected.2,
+            clip,
+            world,
+            view_direction,
+            fog_depth,
+            uv: None,
+            diffuse: None,
+            ambient_coefficient: None,
+            normal: None,
+            specular_color: None,
+            specular_control: None,
+            highlight_state: None,
+            vertex_alpha: None,
+        })
+    }
+}
+
 pub fn ppc_q3_software_project_point(
     command: &PpcQ3SceneTriMeshCommand,
     front_buffer: PpcFrontBuffer,
     viewport: PpcQ3ViewportRect,
     point: (f32, f32, f32),
 ) -> Option<PpcQ3SoftwareProjectedVertex> {
-    let world = ppc_q3_point3d_transform_values(point, command.local_to_world);
-    let view_direction = ppc_q3_software_view_direction(command.camera, world);
-    let (projected, fog_depth, clip) = if let Some(camera) = command.camera {
-        let world_to_view = ppc_q3_camera_world_to_view_matrix(camera.placement)?;
-        let view_to_frustum = ppc_q3_camera_raster_projection_matrix(&camera)?;
-        let view = ppc_q3_point3d_transform_values(world, world_to_view);
-        let mut clip = ppc_q3_point3d_transform_4d_values(view, view_to_frustum);
-        // QuickDraw 3D exposes frustum depth in [-1, 0], with the hither
-        // plane at 0.  Keep that guest-visible matrix authentic, then remap
-        // depth to the software rasterizer's OpenGL-style [-1, 1] interval.
-        clip.2 = (-2.0_f32).mul_add(clip.2, -clip.3);
-        (
-            ppc_q3_software_clip_to_projected(clip)?,
-            -view.2,
-            Some(clip),
-        )
-    } else {
-        (world, world.2, None)
-    };
-    if !ppc_q3_point_finite(projected) || !fog_depth.is_finite() {
-        return None;
-    }
-
-    let (screen_x, screen_y) =
-        ppc_q3_software_projected_to_screen(projected, command.camera, front_buffer, viewport);
-    Some(PpcQ3SoftwareProjectedVertex {
-        x: screen_x,
-        y: screen_y,
-        z: projected.2,
-        clip,
-        world,
-        view_direction,
-        fog_depth,
-        uv: None,
-        diffuse: None,
-        ambient_coefficient: None,
-        normal: None,
-        specular_color: None,
-        specular_control: None,
-        highlight_state: None,
-        vertex_alpha: None,
-    })
+    PpcQ3SoftwarePointProjector::new(command, front_buffer, viewport, true).project(point)
 }
 
 pub fn ppc_q3_software_view_direction(
@@ -3281,6 +3540,15 @@ pub fn ppc_q3_software_clip_projected_triangle(
             PPC_Q3_SOFTWARE_DEPTH_FAR,
             false,
         );
+    }
+
+    // A triangle inside every plane passes each clip below unchanged: no edge
+    // crosses a plane, so each pass keeps the three vertices in order.
+    if vertices
+        .iter()
+        .all(|vertex| vertex.clip.is_some_and(ppc_q3_software_clip_inside_frustum))
+    {
+        return vertices.to_vec();
     }
 
     let mut clipped = vertices.to_vec();
@@ -3944,6 +4212,43 @@ pub fn ppc_q3_write_software_depth_material_output_pixel(
     ppc_q3_write_software_material_output_pixel(memory, surface, point, material, output)
 }
 
+/// `ppc_q3_write_software_depth_material_output_pixel` for a fill that
+/// reports its span stores in runs.
+#[allow(clippy::too_many_arguments)]
+fn ppc_q3_write_software_depth_material_output_pixel_in_run(
+    memory: &mut PpcSectionMem,
+    surface: PpcQ3SoftwareFrontBufferSurface,
+    depth_buffer: &mut PpcQ3SoftwareDepthBuffer,
+    point: PpcQ3SoftwareProjectedPoint,
+    material: &PpcQ3SoftwareMaterialSample,
+    output: PpcQ3SoftwareMaterialOutput,
+    write_depth: bool,
+    run: &mut PpcQ3UnreportedRun,
+) -> bool {
+    if point.x < 0 || point.y < 0 {
+        return false;
+    }
+    let (x, y) = (point.x as u32, point.y as u32);
+    let depth_visible = if write_depth {
+        depth_buffer.test_and_update(x, y, point.z)
+    } else {
+        depth_buffer.test(x, y, point.z)
+    };
+    if !depth_visible {
+        return false;
+    }
+    let opacity = ppc_q3_software_blend_opacity(material, output.opacity, point.vertex_alpha);
+    let transparency = ppc_q3_software_effective_transparency(material.transparency, opacity);
+    let color = ppc_q3_software_material_output_pixel_color(
+        memory,
+        surface,
+        (point.x, point.y),
+        output.color,
+        transparency,
+    );
+    surface.write_pixel_in_run(memory, (point.x, point.y), color, run)
+}
+
 pub fn ppc_q3_write_software_material_output_pixel(
     memory: &mut PpcSectionMem,
     surface: PpcQ3SoftwareFrontBufferSurface,
@@ -4081,6 +4386,9 @@ pub fn ppc_q3_draw_software_triangle(
     };
 
     let mut pixels = 0usize;
+    // Nothing between two pixels of this fill observes guest memory except
+    // the fill's own reads, so adjacent stores are reported as one range.
+    let mut run = PpcQ3UnreportedRun::default();
     let area_f = area as f32;
     let (mut row_edge_weights, edge_x_steps, edge_y_steps) =
         ppc_q3_software_triangle_edge_walker(vertices, min_x, min_y);
@@ -4097,15 +4405,36 @@ pub fn ppc_q3_draw_software_triangle(
             let weight0 = w0 as f32 / area_f;
             let weight1 = w1 as f32 / area_f;
             let weight2 = w2 as f32 / area_f;
+            // Interpolation and shading only read guest memory, and every
+            // style writes at this position and depth, so a pixel the depth
+            // buffer already rejects is skipped before either.
+            let z = ppc_q3_software_interpolate_depth(&vertices, [weight0, weight1, weight2]);
+            if x < 0 || y < 0 || !depth_buffer.test(x as u32, y as u32, z) {
+                continue;
+            }
             let perspective_weights =
                 ppc_q3_software_perspective_weights(&vertices, [weight0, weight1, weight2]);
-            let point = ppc_q3_software_interpolate_projected_point_with_weights(
-                &vertices,
-                [weight0, weight1, weight2],
-                perspective_weights,
-                x,
-                y,
-            );
+            let point = match interpolation_style {
+                // Flat and vertex lighting were evaluated before the loop;
+                // a pixel reads only its texture coordinates and fog depth,
+                // and in the vertex style its alpha.
+                PPC_Q3_INTERPOLATION_STYLE_NONE | PPC_Q3_INTERPOLATION_STYLE_VERTEX => {
+                    ppc_q3_software_interpolate_texture_and_fog_point(
+                        &vertices,
+                        z,
+                        perspective_weights,
+                        x,
+                        y,
+                    )
+                }
+                _ => ppc_q3_software_interpolate_projected_point_with_weights(
+                    &vertices,
+                    [weight0, weight1, weight2],
+                    perspective_weights,
+                    x,
+                    y,
+                ),
+            };
             let (write_point, output, needs_texture_and_fog) = match interpolation_style {
                 PPC_Q3_INTERPOLATION_STYLE_NONE => {
                     let (flat_point, output) =
@@ -4167,7 +4496,7 @@ pub fn ppc_q3_draw_software_triangle(
             } else {
                 output
             };
-            if ppc_q3_write_software_depth_material_output_pixel(
+            if ppc_q3_write_software_depth_material_output_pixel_in_run(
                 memory,
                 surface,
                 depth_buffer,
@@ -4175,6 +4504,7 @@ pub fn ppc_q3_draw_software_triangle(
                 material,
                 output,
                 write_depth,
+                &mut run,
             ) {
                 pixels = pixels.saturating_add(1);
             }
@@ -4183,6 +4513,7 @@ pub fn ppc_q3_draw_software_triangle(
         row_edge_weights[1] += edge_y_steps[1];
         row_edge_weights[2] += edge_y_steps[2];
     }
+    run.finish(memory, surface);
     pixels
 }
 
@@ -4367,6 +4698,65 @@ pub fn ppc_q3_software_interpolate_projected_point_with_weights(
     }
 }
 
+/// The depth `ppc_q3_software_interpolate_projected_point_with_weights`
+/// gives a pixel, alone.
+#[inline]
+fn ppc_q3_software_interpolate_depth(
+    vertices: &[PpcQ3SoftwareProjectedPoint; 3],
+    weights: [f32; 3],
+) -> f32 {
+    let [a, b, c] = vertices;
+    let [affine_weight0, affine_weight1, affine_weight2] = weights;
+    affine_weight0.mul_add(a.z, affine_weight1.mul_add(b.z, affine_weight2 * c.z))
+}
+
+/// `ppc_q3_software_interpolate_projected_point_with_weights` for a pixel
+/// whose lighting is already known: the position, depth, texture
+/// coordinates, fog depth and alpha it would compute, and nothing else. The
+/// lighting inputs are left empty and must not be read.
+fn ppc_q3_software_interpolate_texture_and_fog_point(
+    vertices: &[PpcQ3SoftwareProjectedPoint; 3],
+    z: f32,
+    perspective_weights: [f32; 3],
+    x: i32,
+    y: i32,
+) -> PpcQ3SoftwareProjectedPoint {
+    let [a, b, c] = vertices;
+    let [weight0, weight1, weight2] = perspective_weights;
+    PpcQ3SoftwareProjectedPoint {
+        x,
+        y,
+        raster_position: None,
+        z,
+        reciprocal_w: 0.0,
+        world: (0.0, 0.0, 0.0),
+        view_direction: None,
+        fog_depth: weight0.mul_add(
+            a.fog_depth,
+            weight1.mul_add(b.fog_depth, weight2 * c.fog_depth),
+        ),
+        uv: match (a.uv, b.uv, c.uv) {
+            (Some(uv_a), Some(uv_b), Some(uv_c)) => Some((
+                weight0.mul_add(uv_a.0, weight1.mul_add(uv_b.0, weight2 * uv_c.0)),
+                weight0.mul_add(uv_a.1, weight1.mul_add(uv_b.1, weight2 * uv_c.1)),
+            )),
+            _ => None,
+        },
+        diffuse: None,
+        ambient_coefficient: None,
+        normal: None,
+        specular_color: None,
+        specular_control: None,
+        highlight_state: None,
+        vertex_alpha: match (a.vertex_alpha, b.vertex_alpha, c.vertex_alpha) {
+            (Some(alpha_a), Some(alpha_b), Some(alpha_c)) => {
+                Some(weight0.mul_add(alpha_a, weight1.mul_add(alpha_b, weight2 * alpha_c)))
+            }
+            _ => None,
+        },
+    }
+}
+
 pub fn ppc_q3_software_perspective_weights(
     vertices: &[PpcQ3SoftwareProjectedPoint; 3],
     weights: [f32; 3],
@@ -4471,12 +4861,12 @@ pub fn ppc_q3_software_is_backfacing(
 pub fn ppc_q3_software_triangle_is_backfacing(
     orientation_style: u32,
     camera: Option<PpcQ3CameraRecord>,
-    local_to_world: [[f32; 4]; 4],
+    normal_matrix: [[f32; 4]; 4],
     face_normal: Option<(f32, f32, f32)>,
     vertices: &[PpcQ3SoftwareProjectedPoint],
 ) -> bool {
     if let (Some(camera), Some(normal), Some(vertex)) = (camera, face_normal, vertices.first()) {
-        if let Some(normal) = ppc_q3_software_transform_normal(normal, local_to_world) {
+        if let Some(normal) = ppc_q3_software_transform_normal_by(normal, normal_matrix) {
             let toward_eye = if matches!(camera.projection, PpcQ3CameraProjection::Orthographic { .. }) {
                 ppc_q3_vector3d_sub(camera.placement.camera_location, camera.placement.point_of_interest)
             } else {
@@ -5897,6 +6287,9 @@ pub fn ppc_q3_copy_or_zero(
     if dest_ptr == 0 {
         return false;
     }
+    if ppc_q3_copy_or_zero_whole(memory, source_ptr, dest_ptr, byte_count) {
+        return true;
+    }
     for offset in 0..byte_count {
         let byte = if source_ptr == 0 {
             0
@@ -5906,6 +6299,56 @@ pub fn ppc_q3_copy_or_zero(
         if memory.write_u8(dest_ptr + offset, byte).is_none() {
             return false;
         }
+    }
+    true
+}
+
+/// Store the byte loop's result in bulk when it cannot differ: the destination
+/// is one ordinary mapping that accepts the whole range, and any source is one
+/// ordinary mapping disjoint from it, so no store can change a byte still to
+/// be read. Changes nothing and returns false otherwise.
+fn ppc_q3_copy_or_zero_whole(
+    memory: &mut PpcSectionMem,
+    source_ptr: u32,
+    dest_ptr: u32,
+    byte_count: u32,
+) -> bool {
+    let len = byte_count as usize;
+    let Some(dest_end) = dest_ptr.checked_add(byte_count) else {
+        return false;
+    };
+    // Ordinary mappings own their bytes, so with an ordinary source disjoint
+    // addresses cannot alias; shared mappings can, and keep the byte loop.
+    if memory.readable_bytes(dest_ptr, len).is_none() {
+        return false;
+    }
+    if source_ptr != 0 {
+        let Some(source_end) = source_ptr.checked_add(byte_count) else {
+            return false;
+        };
+        if (source_ptr < dest_end && dest_ptr < source_end)
+            || memory.readable_bytes(source_ptr, len).is_none()
+        {
+            return false;
+        }
+    }
+    // One destination region is writable throughout or not at all, so either
+    // the first chunk is refused, changing nothing, or every chunk is stored.
+    let mut chunk = [0u8; 4096];
+    let mut offset = 0;
+    while offset < len {
+        let size = (len - offset).min(chunk.len());
+        if source_ptr != 0 {
+            let Some(bytes) = memory.readable_bytes(source_ptr + offset as u32, size) else {
+                return false;
+            };
+            chunk[..size].copy_from_slice(bytes);
+        }
+        if memory.write_bytes(dest_ptr + offset as u32, &chunk[..size]).is_none() {
+            debug_assert_eq!(offset, 0, "a destination region refused a later chunk");
+            return false;
+        }
+        offset += size;
     }
     true
 }
@@ -7598,7 +8041,9 @@ pub fn ppc_q3_camera_view_to_frustum_matrix(record: &PpcQ3CameraRecord) -> Optio
 // Keep the rasterizer's clip coordinates at w = -view_z. Its clipping
 // tolerances and interpolation already use this scale; guest API getters
 // separately preserve Apple's 1/yon normalization above.
-fn ppc_q3_camera_raster_projection_matrix(record: &PpcQ3CameraRecord) -> Option<[[f32; 4]; 4]> {
+pub(super) fn ppc_q3_camera_raster_projection_matrix(
+    record: &PpcQ3CameraRecord,
+) -> Option<[[f32; 4]; 4]> {
     if !ppc_q3_camera_record_valid(record) {
         return None;
     }
@@ -10473,10 +10918,17 @@ pub(crate) fn ppc_q3_fsspec_storage_new(
     vfs_files: &[PpcVfsFileRecord],
     heap_cursor: &mut u32,
     last_mem_error: &mut i16,
+    vfs_volumes: &[PpcVfsVolumeRecord],
 ) -> u32 {
     let spec_ptr = cpu.gpr[3];
-    let Ok(path) = ppc_existing_path_for_fsspec(memory, vfs_directories, vfs_files, &[], spec_ptr)
-    else {
+    let Ok(path) = ppc_existing_path_for_fsspec(
+        memory,
+        vfs_directories,
+        vfs_files,
+        &[],
+        spec_ptr,
+        vfs_volumes,
+    ) else {
         *last_mem_error = PPC_NO_ERR;
         return 0;
     };
@@ -14093,7 +14545,27 @@ pub fn dispatch_q3_view_end_rendering_import(
     current_gworld: u32,
     q3_error_state: &mut PpcQ3ErrorState,
     allow_idle_state_only_fast_forward: bool,
+    present_pacing: Option<PpcQ3PresentPacing<'_>>,
 ) -> PpcImportAction {
+    let view = cpu.gpr[3];
+    // Only the outermost EndRendering of an uncancelled frame presents.
+    let completes_frame = q3_views
+        .iter()
+        .find(|record| record.view == view)
+        .is_some_and(|record| record.rendering_depth == 1 && !record.cancelled);
+    let draw_context = view_draw_context(q3_views, view);
+    let present_pacing = present_pacing.filter(|_| completes_frame);
+    let present_kind = present_pacing.as_ref().map(|pacing| {
+        ppc_q3_present_kind(q3_views, q3_draw_contexts, view, pacing.is_window_port)
+    });
+    let mut present_pacing = present_pacing;
+    if let (Some(pacing), Some(kind)) = (present_pacing.as_mut(), present_kind) {
+        if let Some(wait) = ppc_q3_present_wait(pacing, draw_context, kind) {
+            // Block in EndRendering, before the frame is consumed: the
+            // runner re-enters this import when the clock resumes.
+            return PpcImportAction::Yield(wait);
+        }
+    }
     let completed_frames_before = q3_completed_frames.len();
     let state_only_batches_before = q3_state_only_completed_frame_batches.len();
     let state_only_last_batch_frames_before = q3_state_only_completed_frame_batches
@@ -14117,6 +14589,13 @@ pub fn dispatch_q3_view_end_rendering_import(
         current_gworld,
         q3_error_state,
     );
+    // Only a completed frame is a present; any other status leaves the frame
+    // unpresented.
+    if let (Some(pacing), Some(kind)) = (present_pacing, present_kind) {
+        if result == PPC_Q3_VIEW_STATUS_DONE {
+            ppc_q3_record_present(pacing, draw_context, kind);
+        }
+    }
     if result == PPC_Q3_VIEW_STATUS_DONE && q3_completed_frames.len() > completed_frames_before {
         // Complete the import, then let the host commit the frame before guest
         // code can dispose its resources, reuse immediate arrays, or read pixels.
@@ -14137,6 +14616,195 @@ pub fn dispatch_q3_view_end_rendering_import(
         PpcImportAction::ReturnWithExtraCycles(result, PPC_Q3_IDLE_STATE_ONLY_FRAME_EXTRA_CYCLES)
     } else {
         PpcImportAction::Return(result)
+    }
+}
+
+fn view_draw_context(q3_views: &[PpcQ3ViewStateRecord], view: u32) -> u32 {
+    q3_views
+        .iter()
+        .find(|record| record.view == view)
+        .map(|record| record.draw_context)
+        .unwrap_or(0)
+}
+
+/// Offset of `doubleBufferState` in TQ3DrawContextData: clearImageMethod,
+/// clearImageColor (ARGB), pane, paneState, mask (TQ3Bitmap), maskState,
+/// doubleBufferState. QuickDraw 3D 1.5.4 Reference, "Draw Context Data".
+pub const PPC_Q3_DRAW_CONTEXT_DOUBLE_BUFFER_STATE_OFFSET: u32 = 64;
+
+/// How a view's draw context presents a completed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PpcQ3PresentKind {
+    /// A double-buffered Macintosh draw context on a visible window or the
+    /// screen front buffer: EndRendering copies the back buffer to the screen.
+    Window,
+    /// A double-buffered Macintosh draw context on an offscreen port.
+    Offscreen,
+    /// A single-buffered Macintosh draw context.
+    SingleBuffered,
+    /// A pixmap draw context (always offscreen memory).
+    Pixmap,
+    /// No draw context, or one this model does not recognize.
+    Unknown,
+}
+
+impl PpcQ3PresentKind {
+    pub const ALL: [Self; 5] = [
+        Self::Window,
+        Self::Offscreen,
+        Self::SingleBuffered,
+        Self::Pixmap,
+        Self::Unknown,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::Offscreen => "offscreen",
+            Self::SingleBuffered => "single",
+            Self::Pixmap => "pixmap",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Per-process state for the "present waits for the next tick" model.
+///
+/// QuickDraw 3D itself defines no vertical-retrace wait: a double-buffered
+/// EndRendering updates the front buffer and only Q3View_Sync blocks
+/// (QuickDraw 3D 1.5.4 Reference, Q3View_EndRendering / Q3View_Sync). Guest
+/// time here advances by executed instructions while the renderer is host
+/// work, so an uncapped render loop completes several frames per tick. This
+/// state lets the runner model a retrace-locked accelerator instead: a
+/// window present to a draw context that already presented in the current
+/// tick blocks in EndRendering until the next tick, then presents. The model
+/// is opt-in: with `enabled` false (the default) EndRendering neither waits
+/// nor records presents.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PpcQ3PresentPacingState {
+    /// Whether window presents are paced. Set at launch from
+    /// `SYSTEMLESS_QD3D_PRESENT_VSYNC`.
+    pub enabled: bool,
+    /// Draw context and the tick of its most recent present.
+    pub last_present_ticks: Vec<(u32, u32)>,
+    /// Draw context whose present is blocked waiting for the next tick.
+    pub waiting: Option<u32>,
+    /// Completed presents by [`PpcQ3PresentKind`].
+    pub presents: [u64; 5],
+    /// Presents that waited for a tick boundary, by [`PpcQ3PresentKind`].
+    pub parks: [u64; 5],
+}
+
+impl PpcQ3PresentPacingState {
+    pub fn presents_of(&self, kind: PpcQ3PresentKind) -> u64 {
+        self.presents[kind.index()]
+    }
+
+    pub fn parks_of(&self, kind: PpcQ3PresentKind) -> u64 {
+        self.parks[kind.index()]
+    }
+}
+
+/// Clock and policy for one EndRendering call under present pacing.
+pub struct PpcQ3PresentPacing<'a> {
+    pub state: &'a mut PpcQ3PresentPacingState,
+    /// When false, presents are counted but never wait.
+    pub park_enabled: bool,
+    /// Virtual TickCount at this import.
+    pub tick: u32,
+    /// Guest cycles from this import to the next tick boundary.
+    pub cycles_until_next_tick: u64,
+    pub is_window_port: &'a dyn Fn(u32) -> bool,
+}
+
+pub fn ppc_q3_present_kind(
+    q3_views: &[PpcQ3ViewStateRecord],
+    q3_draw_contexts: &[PpcQ3DrawContextRecord],
+    view: u32,
+    is_window_port: &dyn Fn(u32) -> bool,
+) -> PpcQ3PresentKind {
+    let draw_context = view_draw_context(q3_views, view);
+    let Some(record) = q3_draw_contexts
+        .iter()
+        .find(|record| draw_context != 0 && record.draw_context == draw_context)
+    else {
+        return PpcQ3PresentKind::Unknown;
+    };
+    match record.draw_context_type {
+        PPC_Q3_DRAW_CONTEXT_TYPE_PIXMAP => PpcQ3PresentKind::Pixmap,
+        PPC_Q3_DRAW_CONTEXT_TYPE_MACINTOSH => {
+            let double_buffered = ppc_q3_read_u32_from_slice(
+                &record.data,
+                PPC_Q3_DRAW_CONTEXT_DOUBLE_BUFFER_STATE_OFFSET,
+            )
+            .is_some_and(|state| state != 0);
+            if !double_buffered {
+                return PpcQ3PresentKind::SingleBuffered;
+            }
+            match ppc_q3_read_u32_from_slice(&record.data, PPC_Q3_MAC_DRAW_CONTEXT_PORT_OFFSET) {
+                Some(port) if port != 0 && is_window_port(port) => PpcQ3PresentKind::Window,
+                Some(port) if port != 0 => PpcQ3PresentKind::Offscreen,
+                _ => PpcQ3PresentKind::Unknown,
+            }
+        }
+        _ => PpcQ3PresentKind::Unknown,
+    }
+}
+
+/// Returns the guest cycles a completing present must block before it may
+/// present, if any. Only a window present to a draw context that already
+/// presented in the current tick waits; the first present in a tick never
+/// does. The caller yields with the result: the runner ends the slice at the
+/// tick boundary (or earlier, at the slice limit) and re-enters the import,
+/// which asks again.
+pub fn ppc_q3_present_wait(
+    pacing: &mut PpcQ3PresentPacing<'_>,
+    draw_context: u32,
+    kind: PpcQ3PresentKind,
+) -> Option<u64> {
+    if !pacing.park_enabled || kind != PpcQ3PresentKind::Window {
+        return None;
+    }
+    let state = &mut *pacing.state;
+    let presented_this_tick = state
+        .last_present_ticks
+        .iter()
+        .any(|(context, tick)| *context == draw_context && *tick == pacing.tick);
+    if !presented_this_tick {
+        return None;
+    }
+    if state.waiting != Some(draw_context) {
+        state.waiting = Some(draw_context);
+        state.parks[kind.index()] = state.parks[kind.index()].saturating_add(1);
+    }
+    Some(pacing.cycles_until_next_tick.max(1))
+}
+
+/// Records one completed present.
+pub fn ppc_q3_record_present(
+    pacing: PpcQ3PresentPacing<'_>,
+    draw_context: u32,
+    kind: PpcQ3PresentKind,
+) {
+    let state = pacing.state;
+    state.presents[kind.index()] = state.presents[kind.index()].saturating_add(1);
+    if state.waiting == Some(draw_context) {
+        state.waiting = None;
+    }
+    if kind != PpcQ3PresentKind::Window {
+        return;
+    }
+    match state
+        .last_present_ticks
+        .iter_mut()
+        .find(|(context, _)| *context == draw_context)
+    {
+        Some(entry) => entry.1 = pacing.tick,
+        None => state.last_present_ticks.push((draw_context, pacing.tick)),
     }
 }
 
@@ -16976,3 +17644,81 @@ fn ppc_write_c_string(memory: &mut PpcSectionMem, ptr: u32, bytes: &[u8]) -> Opt
     Some(())
 }
 
+#[cfg(test)]
+mod reduced_interpolation_tests {
+    use super::*;
+
+    /// The reduced interpolation gives a pixel the same depth, texture
+    /// coordinates, fog depth and alpha as the full one, bit for bit, with
+    /// and without the optional vertex attributes.
+    #[test]
+    fn texture_and_fog_point_matches_the_full_interpolation() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut unit = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for case in 0..20_000 {
+            let with_uv = case % 2 == 0;
+            let with_alpha = case % 3 != 0;
+            let mut vertex = || PpcQ3SoftwareProjectedPoint {
+                x: 0,
+                y: 0,
+                raster_position: None,
+                z: unit(),
+                reciprocal_w: 0.01 + unit(),
+                world: (unit() * 900.0, unit() * 900.0, unit() * 900.0),
+                view_direction: Some((unit(), unit(), 0.1 + unit())),
+                fog_depth: unit() * 2000.0,
+                uv: with_uv.then(|| (unit() * 4.0 - 2.0, unit() * 4.0 - 2.0)),
+                diffuse: Some((unit(), unit(), unit())),
+                ambient_coefficient: Some(unit()),
+                normal: Some((unit(), unit(), 0.1 + unit())),
+                specular_color: Some((unit(), unit(), unit())),
+                specular_control: Some(unit() * 40.0),
+                highlight_state: Some(true),
+                vertex_alpha: with_alpha.then(|| unit()),
+            };
+            let vertices = [vertex(), vertex(), vertex()];
+            let (first, second) = (unit(), unit());
+            let weights = [first * second, first * (1.0 - second), 1.0 - first];
+            let perspective = ppc_q3_software_perspective_weights(&vertices, weights);
+            let (x, y) = (case % 640, case % 480);
+
+            let full = ppc_q3_software_interpolate_projected_point_with_weights(
+                &vertices,
+                weights,
+                perspective,
+                x,
+                y,
+            );
+            let z = ppc_q3_software_interpolate_depth(&vertices, weights);
+            let reduced = ppc_q3_software_interpolate_texture_and_fog_point(
+                &vertices,
+                z,
+                perspective,
+                x,
+                y,
+            );
+
+            assert_eq!(z.to_bits(), full.z.to_bits(), "case {case}");
+            assert_eq!((reduced.x, reduced.y), (full.x, full.y));
+            assert_eq!(reduced.z.to_bits(), full.z.to_bits());
+            assert_eq!(reduced.fog_depth.to_bits(), full.fog_depth.to_bits(), "case {case}");
+            assert_eq!(
+                reduced.uv.map(|(u, v)| (u.to_bits(), v.to_bits())),
+                full.uv.map(|(u, v)| (u.to_bits(), v.to_bits())),
+                "case {case}"
+            );
+            assert_eq!(
+                reduced.vertex_alpha.map(f32::to_bits),
+                full.vertex_alpha.map(f32::to_bits),
+                "case {case}"
+            );
+            assert_eq!(reduced.uv.is_some(), with_uv);
+            assert_eq!(reduced.vertex_alpha.is_some(), with_alpha);
+        }
+    }
+}

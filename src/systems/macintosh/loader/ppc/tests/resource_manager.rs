@@ -819,7 +819,8 @@ fn lowercase_named_resource_imports_decode_c_names_and_preserve_scope() {
                 handle: 0,
             }
         }));
-        for (current, expected) in [(9, Some(9)), (11, (!current_only).then_some(7))] {
+        // From refnum 11 the chain reaches 9 before 7.
+        for (current, expected) in [(9, Some(9)), (11, (!current_only).then_some(9))] {
             loaded.set_current_resource_refnum(current);
             loaded.cpu.pc = loaded.entry_pc;
             loaded.cpu.lr = PPC_HALT_PC;
@@ -909,4 +910,20 @@ fn lowercase_getresinfo_writes_a_c_name_and_prevalidates_outputs() {
             assert_eq!(loaded.memory.read_u32_be(name_ptr), Some(0xa3a3a3a3));
         }
     }
+}
+
+#[test]
+fn hle_import_runner_lm_get_drvq_hdr_returns_low_memory_queue_address() {
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "LMGetDrvQHdr"),
+        PpcImportDispatcherTarget::GetDrvQHdr
+    );
+    let pef = synthetic_pef_with_import(b"LMGetDrvQHdr");
+    let mut loaded = load_pef_application(&pef).unwrap();
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(loaded.cpu.gpr[3], crate::memory::globals::addr::DRV_Q_HDR);
 }

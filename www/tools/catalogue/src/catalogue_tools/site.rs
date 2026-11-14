@@ -126,8 +126,9 @@ pub fn rust_games(c: &CompiledCatalogue) -> Result<String> {
         )?;
         write!(
             out,
-            "settings: GameSettings {{ worker: {}, arrows_as_numpad: {}, show_menu_bar: {}, screen_depth: {:?}, addressing_24_bit: {}, screen_size: {:?}, application_partition_size: {:?}, executable_path: {:?}, remove_paths: {}, file_mappings: &[{}], key_mappings: &[{}], launch_modifiers: &[{}], runtime_pacing: RuntimePacing {{max_ticks_per_paint: {}, reset_slack_ticks: {}, cpu_mhz: {}, adaptive_min_cpu_mhz: {:?}}},",
+            "settings: GameSettings {{ worker: {}, gpu_compute: {}, arrows_as_numpad: {}, show_menu_bar: {}, screen_depth: {:?}, addressing_24_bit: {}, screen_size: {:?}, application_partition_size: {:?}, executable_path: {:?}, remove_paths: {}, file_mappings: &[{}], key_mappings: &[{}], launch_modifiers: &[{}], runtime_pacing: RuntimePacing {{max_ticks_per_paint: {}, reset_slack_ticks: {}, cpu_mhz: {}, adaptive_min_cpu_mhz: {:?}}},",
             r.worker,
+            r.gpu_compute,
             e.controls.arrows_as_numpad,
             r.show_menu_bar,
             r.screen_depth,
@@ -361,7 +362,7 @@ pub fn pages(
         }
     }
     let absolute = |p: &str| -> String { origin.join(p).expect("validated route").to_string() };
-    let default_image = absolute("/assets/icons/systemless-mascot.png");
+    let default_image = absolute("/assets/icons/systemless-icon.png");
     let mut files = BTreeMap::new();
     for (path, robots) in [("/", "index,follow"), ("/next", "noindex,nofollow")] {
         let mut home = format!(
@@ -421,7 +422,7 @@ pub fn pages(
             e.year
         );
         let mut body = format!(
-            "<p><a href=\"/\">Systemless game library</a></p><h1>{}</h1><p>{}</p><p>{}, {}</p><img src=\"{}\" alt=\"{} gameplay\">",
+            "<p><a href=\"/\">Systemless game library</a></p><h1>{}</h1><p>{}</p><p>{}, {}</p><img crossorigin=\"anonymous\" src=\"{}\" alt=\"{} gameplay\">",
             escape(&e.title),
             escape(&e.summary),
             escape(&e.developer),
@@ -540,6 +541,11 @@ pub fn write_pages(
     output: &Path,
     origin: &str,
 ) -> Result<()> {
+    // Native clients consume the same resolved, versioned catalogue as the site.
+    crate::catalogue_tools::catalogue::atomic_write(
+        &output.join("catalogue.json"),
+        &serde_json::to_vec(c)?,
+    )?;
     let approved_ids: Vec<_> = c
         .entries
         .iter()
