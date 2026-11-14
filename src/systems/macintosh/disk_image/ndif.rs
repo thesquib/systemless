@@ -18,7 +18,7 @@ fn u32_at(b: &[u8], off: usize) -> u32 {
 }
 
 pub(super) fn decode(data: &[u8], bcem: &[u8]) -> Result<Vec<u8>, String> {
-    if bcem.len() < HEADER_BYTES || (bcem.len() - HEADER_BYTES) % ENTRY_BYTES != 0 {
+    if bcem.len() < HEADER_BYTES || !(bcem.len() - HEADER_BYTES).is_multiple_of(ENTRY_BYTES) {
         return Err("NDIF block table has an invalid length".into());
     }
     let sectors = u64::from(u32_at(bcem, SECTOR_COUNT_OFFSET));
