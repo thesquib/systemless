@@ -2857,7 +2857,7 @@ fn expand_installer_maker_payload(
 }
 
 /// Where an installer's per-language folder lands in the shared application tree.
-// shortcut: US only and inferred from the catalog layout, parse the installer's actions when another title needs it.
+// Only the US locale is handled, inferred from the catalog layout rather than the installer's actions.
 fn vise_locale_overlay_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix("US/")?;
     let rest = rest.strip_prefix("RSRC/").unwrap_or(rest);
@@ -8207,6 +8207,30 @@ mod tests {
         assert_eq!(payload.files.len(), 1);
         assert_eq!(payload.files[0].data, archive);
         assert!(payload.skipped_disk_image_errors[0].contains("Locked.sit"));
+    }
+
+    #[test]
+    fn invalid_compact_pro_archive_is_kept_as_an_opaque_file() {
+        // A Compact Pro header whose valid directory lists no entries.
+        let mut archive = vec![1, 1, 0, 0, 0, 0, 0, 8];
+        archive.extend_from_slice(&0x00be_26edu32.to_be_bytes());
+        archive.extend_from_slice(&[0, 0, 0]);
+        let payload = payload_from_forks(
+            "Disc/Extras/Empty.cpt",
+            archive.clone(),
+            Vec::new(),
+            *b"PACT",
+            *b"CPCT",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].data, archive);
+        assert!(payload
+            .skipped_disk_image_errors
+            .iter()
+            .any(|err| err.contains("Compact Pro archive") && err.contains("Empty.cpt")));
     }
 
     #[test]
