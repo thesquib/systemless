@@ -1168,7 +1168,6 @@ pub struct ProcessFileSystemState {
     pub(crate) vfs_directories: SharedProcessValue<Vec<ProcessVfsDirectory>>,
     pub(crate) next_vfs_dir_id: SharedProcessValue<u32>,
     pub(crate) default_dir_id: SharedProcessValue<u32>,
-    pub(crate) native_vfs_catalogue_published: Option<PublishedNativeVfsCatalogue>,
     pub(crate) classic_vfs_metadata: SharedProcessValue<HashMap<String, ProcessVfsMetadata>>,
     pub(crate) classic_locked_files: SharedProcessValue<HashSet<String>>,
     pub(crate) classic_next_vfs_file_id: SharedProcessValue<u32>,
@@ -1198,7 +1197,6 @@ impl Default for ProcessFileSystemState {
             vfs_directories: SharedProcessValue::default(),
             next_vfs_dir_id: SharedProcessValue::from_value(0),
             default_dir_id: SharedProcessValue::from_value(0),
-            native_vfs_catalogue_published: None,
             classic_vfs_metadata: SharedProcessValue::default(),
             classic_locked_files: SharedProcessValue::default(),
             classic_next_vfs_file_id: SharedProcessValue::from_value(32),
@@ -1420,25 +1418,15 @@ impl ProcessFileSystemState {
     /// therefore do not participate in this compatibility pass. Files (1992),
     /// pp. 2-27--2-29 and 2-85.
     pub(crate) fn publish_native_vfs_catalogue(&mut self) {
-        // This runs after every execution slice, so it must not allocate per file.
-        let metadata_len = self.classic_vfs_metadata.with_mut(|metadata| metadata.len());
-        let unchanged = self.native_vfs_catalogue_published.as_ref().is_some_and(|published| {
-            published.matches(
-                &self.vfs_directories,
-                self.vfs_files
-                    .iter()
-                    .map(|file| (&file.path, file.file_type, file.creator, file.finder_flags))
-                    .chain(self.vfs_resource_files.iter().map(|file| {
-                        (&file.path, file.file_type, file.creator, file.finder_flags)
-                    })),
-                metadata_len,
-            )
-        });
-        let mut parent_dir_ids = HashMap::<&str, u32>::new();
-        let directories = &*self.vfs_directories;
+        // This runs after every execution slice, so it must stay linear in the
+        // number of files: look parents up in one case-folded index rather than
+        // scanning every directory per file.
+        let parent_dir_ids = process_vfs_parent_dir_index(&self.vfs_directories);
+        let mut parent_key = String::new();
+        // Publication needs metadata only; cloning records copies their fork bytes.
         let files = self.vfs_files.iter().map(|file| {
             (
-                &file.path,
+                file.path.as_str(),
                 file.file_type,
                 file.creator,
                 file.finder_flags,
@@ -1447,27 +1435,24 @@ impl ProcessFileSystemState {
         });
         let resource_files = self.vfs_resource_files.iter().map(|file| {
             (
-                &file.path,
+                file.path.as_str(),
                 file.file_type,
                 file.creator,
                 file.finder_flags,
                 file.dirty,
             )
         });
-        for (path, file_type, creator, finder_flags, dirty) in files.chain(resource_files) {
-            if path.is_empty() || (unchanged && !dirty) {
-                continue;
-            }
-            let parent_path = path
-                .rsplit_once('/')
-                .map(|(parent, _)| parent)
-                .unwrap_or("");
-            let parent_dir_id = *parent_dir_ids
-                .entry(parent_path)
-                .or_insert_with(|| process_vfs_parent_dir_id(directories, path));
-            self.classic_next_vfs_file_id.with_mut(|next_file_id| {
-                self.classic_next_vfs_timestamp.with_mut(|next_timestamp| {
-                    self.classic_vfs_metadata.with_mut(|metadata| {
+        self.classic_next_vfs_file_id.with_mut(|next_file_id| {
+            self.classic_next_vfs_timestamp.with_mut(|next_timestamp| {
+                self.classic_vfs_metadata.with_mut(|metadata| {
+                    for (path, file_type, creator, finder_flags, dirty) in
+                        files.chain(resource_files)
+                    {
+                        if path.is_empty() {
+                            continue;
+                        }
+                        let parent_dir_id =
+                            process_vfs_parent_dir_id(&parent_dir_ids, &mut parent_key, path);
                         publish_native_vfs_metadata(
                             metadata,
                             next_file_id,
@@ -1479,29 +1464,10 @@ impl ProcessFileSystemState {
                             finder_flags,
                             dirty,
                         );
-                    });
+                    }
                 });
             });
-        }
-        if !unchanged {
-            let published = PublishedNativeVfsCatalogue {
-                directories: self
-                    .vfs_directories
-                    .iter()
-                    .map(|directory| (directory.path.clone(), directory.dir_id))
-                    .collect(),
-                files: self
-                    .vfs_files
-                    .iter()
-                    .map(|file| (file.path.clone(), file.file_type, file.creator, file.finder_flags))
-                    .chain(self.vfs_resource_files.iter().map(|file| {
-                        (file.path.clone(), file.file_type, file.creator, file.finder_flags)
-                    }))
-                    .collect(),
-                metadata_len: self.classic_vfs_metadata.with_mut(|metadata| metadata.len()),
-            };
-            self.native_vfs_catalogue_published = Some(published);
-        }
+        });
         let deleted_paths = self.deleted_vfs_file_paths.clone();
         for path in deleted_paths {
             // Delete removes the native records immediately. A queued host
@@ -1631,57 +1597,32 @@ impl ProcessFileSystemState {
     }
 }
 
-/// What the last full catalogue pass published, so unchanged slices can skip it.
-#[derive(Clone, Debug)]
-pub(crate) struct PublishedNativeVfsCatalogue {
-    directories: Vec<(String, u32)>,
-    files: Vec<(String, u32, u32, u16)>,
-    metadata_len: usize,
-}
-
-impl PublishedNativeVfsCatalogue {
-    fn matches<'a>(
-        &self,
-        directories: &[ProcessVfsDirectory],
-        files: impl Iterator<Item = (&'a String, u32, u32, u16)>,
-        metadata_len: usize,
-    ) -> bool {
-        self.metadata_len == metadata_len
-            && self.directories.len() == directories.len()
-            && self
-                .directories
-                .iter()
-                .zip(directories)
-                .all(|((path, dir_id), directory)| {
-                    *dir_id == directory.dir_id && *path == directory.path
-                })
-            && files
-                .map(Some)
-                .chain(std::iter::once(None))
-                .zip(self.files.iter().map(Some).chain(std::iter::once(None)))
-                .all(|pair| match pair {
-                    (Some((path, file_type, creator, flags)), Some(old)) => {
-                        *path == old.0
-                            && file_type == old.1
-                            && creator == old.2
-                            && flags == old.3
-                    }
-                    (None, None) => true,
-                    _ => false,
-                })
+/// Directory IDs keyed by ASCII-lowercased path. Where several directories
+/// match one path case-insensitively, the first in table order wins, as a
+/// linear `eq_ignore_ascii_case` search would find.
+fn process_vfs_parent_dir_index(directories: &[ProcessVfsDirectory]) -> HashMap<String, u32> {
+    let mut index = HashMap::with_capacity(directories.len());
+    for directory in directories {
+        index
+            .entry(directory.path.to_ascii_lowercase())
+            .or_insert(directory.dir_id);
     }
+    index
 }
 
-fn process_vfs_parent_dir_id(directories: &[ProcessVfsDirectory], path: &str) -> u32 {
+fn process_vfs_parent_dir_id(
+    parent_dir_ids: &HashMap<String, u32>,
+    key: &mut String,
+    path: &str,
+) -> u32 {
     let parent_path = path
         .rsplit_once('/')
         .map(|(parent, _)| parent)
         .unwrap_or("");
-    directories
-        .iter()
-        .find(|directory| directory.path.eq_ignore_ascii_case(parent_path))
-        .map(|directory| directory.dir_id)
-        .unwrap_or(2)
+    key.clear();
+    key.push_str(parent_path);
+    key.make_ascii_lowercase();
+    parent_dir_ids.get(key.as_str()).copied().unwrap_or(2)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1697,6 +1638,8 @@ fn publish_native_vfs_metadata(
     touch: bool,
 ) {
     let timestamp = *next_timestamp;
+    // Look up before inserting: almost every call finds an existing entry, and
+    // `entry` would allocate an owned key for each one.
     if !metadata.contains_key(path) {
         let file_id = *next_file_id;
         *next_file_id = next_file_id.saturating_add(1);
@@ -14116,6 +14059,133 @@ mod tests {
     }
 
     #[test]
+    fn native_catalogue_finds_parents_case_insensitively_with_the_first_match() {
+        let directory = |dir_id, path: &str| ProcessVfsDirectory {
+            dir_id,
+            parent_dir_id: 2,
+            path: path.into(),
+            creator: 0,
+            file_type: 0,
+            finder_flags: 0,
+            dirty: false,
+        };
+        let file = |path: &str, dirty| ProcessVfsFileRecord {
+            path: path.into(),
+            data: Vec::new().into(),
+            creator: 0,
+            file_type: u32::from_be_bytes(*b"TEXT"),
+            finder_flags: 0,
+            dirty,
+        };
+        let mut state = ProcessFileSystemState::default();
+        state.vfs_directories.with_mut(|directories| {
+            directories.extend([
+                directory(20, "Disc/Data"),
+                // A second directory equal to the first ignoring case loses.
+                directory(21, "DISC/DATA"),
+                directory(22, "Disc/Data/Movies"),
+            ]);
+        });
+        for path in [
+            "disc/data/Clip",
+            "Disc/Data/MOVIES/Intro",
+            "Loose",
+            "Missing/File",
+        ] {
+            state.vfs_files.push(file(path, false));
+        }
+        state.vfs_files.push(file("Disc/Data/Saved", true));
+        state.publish_native_vfs_catalogue();
+
+        let parent = |state: &ProcessFileSystemState, path: &str| {
+            state.classic_vfs_metadata[path].parent_dir_id
+        };
+        assert_eq!(parent(&state, "disc/data/Clip"), 20);
+        assert_eq!(parent(&state, "Disc/Data/MOVIES/Intro"), 22);
+        assert_eq!(parent(&state, "Loose"), 2);
+        assert_eq!(parent(&state, "Missing/File"), 2);
+
+        // Republishing keeps file IDs and creation dates, and touches only
+        // dirty files.
+        let before = (*state.classic_vfs_metadata).clone();
+        state.publish_native_vfs_catalogue();
+        for (path, metadata) in state.classic_vfs_metadata.iter() {
+            let previous = &before[path];
+            assert_eq!(metadata.file_id, previous.file_id, "{path}");
+            assert_eq!(metadata.created_date, previous.created_date, "{path}");
+            if path == "Disc/Data/Saved" {
+                assert!(metadata.modified_date > previous.modified_date);
+            } else {
+                assert_eq!(metadata.modified_date, previous.modified_date, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_catalogue_parent_index_matches_the_linear_case_insensitive_search() {
+        // The index must agree with the linear `eq_ignore_ascii_case` search it
+        // replaced, including non-ASCII names, which neither folds, and paths
+        // that repeat across mounted volumes or differ only by case.
+        fn linear_parent_dir_id(directories: &[ProcessVfsDirectory], path: &str) -> u32 {
+            let parent_path = path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .unwrap_or("");
+            directories
+                .iter()
+                .find(|directory| directory.path.eq_ignore_ascii_case(parent_path))
+                .map(|directory| directory.dir_id)
+                .unwrap_or(2)
+        }
+        let directories = [
+            (30, ""),
+            (31, "Titanic"),
+            (32, "TITANIC"),
+            (33, "Titanic/Data"),
+            (34, "Spare/Data"),
+            (35, "Spare/Caf\u{e9}"),
+            (36, "Spare/CAF\u{c9}"),
+            (37, "Spare/\u{2022}Folder"),
+            (38, "Spare/Data"),
+            (39, "Spare/Mac Roman \u{a5}/Sub"),
+        ]
+        .map(|(dir_id, path)| ProcessVfsDirectory {
+            dir_id,
+            parent_dir_id: 2,
+            path: path.into(),
+            creator: 0,
+            file_type: 0,
+            finder_flags: 0,
+            dirty: false,
+        });
+        let index = process_vfs_parent_dir_index(&directories);
+        let mut key = String::new();
+        for path in [
+            "Loose",
+            "/Rooted",
+            "titanic/File",
+            "TITANIC/File",
+            "Titanic/data/Clip",
+            "spare/DATA/Saved",
+            "Spare/Caf\u{e9}/Menu",
+            "Spare/caf\u{e9}/Menu",
+            "Spare/CAF\u{c9}/Menu",
+            "Spare/Caf\u{c9}/Menu",
+            "spare/\u{2022}folder/Item",
+            "SPARE/MAC ROMAN \u{a5}/SUB/Item",
+            "Spare/Mac Roman \u{a5}/Sub/",
+            "Missing/File",
+            "",
+        ] {
+            assert_eq!(
+                process_vfs_parent_dir_id(&index, &mut key, path),
+                linear_parent_dir_id(&directories, path),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn native_catalogue_preserves_recreated_file_after_pending_delete() {
         let mut state = ProcessFileSystemState::default();
         let path = "Pilots/Test Pilot";
@@ -16072,40 +16142,5 @@ mod tests {
         assert!(ctx.menu_tracking().is_none());
         assert_eq!(ctx.menu_tracking_snapshot(), None);
         assert_eq!(ctx.with_menu_tracking_ref(|s| s.is_some()), false);
-    }
-}
-
-#[cfg(test)]
-mod published_native_vfs_catalogue_tests {
-    use super::*;
-
-    #[test]
-    fn matches_only_identical_catalogues() {
-        let path = "Games/App".to_string();
-        let other = "Games/Other".to_string();
-        let published = PublishedNativeVfsCatalogue {
-            directories: Vec::new(),
-            files: vec![(path.clone(), 1, 2, 3)],
-            metadata_len: 1,
-        };
-        let check = |files: &[(&String, u32, u32, u16)], metadata_len| {
-            published.matches(&[], files.iter().copied(), metadata_len)
-        };
-        assert!(check(&[(&path, 1, 2, 3)], 1));
-        assert!(!check(&[(&path, 9, 2, 3)], 1), "type change");
-        assert!(!check(&[(&other, 1, 2, 3)], 1), "renamed file");
-        assert!(!check(&[(&path, 1, 2, 3), (&other, 1, 2, 3)], 1), "added file");
-        assert!(!check(&[], 1), "removed file");
-        assert!(!check(&[(&path, 1, 2, 3)], 0), "metadata removed");
-        let directory = ProcessVfsDirectory {
-            dir_id: 7,
-            parent_dir_id: 2,
-            path: "Games".to_string(),
-            creator: 0,
-            file_type: 0,
-            finder_flags: 0,
-            dirty: false,
-        };
-        assert!(!published.matches(&[directory], std::iter::once((&path, 1, 2, 3)), 1));
     }
 }
