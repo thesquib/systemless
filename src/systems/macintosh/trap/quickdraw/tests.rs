@@ -1788,6 +1788,45 @@
         assert_ne!(*d.current_gdevice, 0);
     }
 
+    /// Spectre opens a GrafPort in uninitialized stack memory, then draws a
+    /// picture into it. Stale grafProcs must not become picture callbacks.
+    #[test]
+    fn open_port_clears_stale_bottlenecks_before_draw_picture() {
+        let (mut d, mut cpu, mut bus) = setup();
+        let port_ptr = 0x300000u32;
+        bus.write_bytes(port_ptr, &[0xAA; 108]);
+        bus.write_long(port_ptr + 104, 0x350400);
+        bus.write_bytes(0x350400, &[0; 52]);
+        bus.write_long(0x350400 + 36, 0x360000); // getPicProc
+        bus.write_long(TEST_SP, port_ptr);
+        d.dispatch_quickdraw(true, 0x06F, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        // IM:I I-163: colrBit, patStretch, picSave, rgnSave, polySave and
+        // grafProcs all start cleared.
+        let mut tail = [0xEE; 20];
+        for (i, byte) in tail.iter_mut().enumerate() {
+            *byte = bus.read_byte(port_ptr + 88 + i as u32);
+        }
+        assert_eq!(tail, [0; 20]);
+
+        let picture = [
+            0, 0, 0, 0, 0, 0, 0, 4, 0, 4, 0x11, 1, 0x1e, 0xa0, 0, 150, 0xff,
+        ];
+        bus.write_bytes(0x350100, &picture);
+        bus.write_long(0x350200, 0x350100);
+        bus.write_bytes(0x350300, &[0, 0, 0, 0, 0, 4, 0, 4]);
+        cpu.write_reg(Register::PC, 0x340002);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, 0x350300);
+        bus.write_long(TEST_SP + 4, 0x350200);
+        d.dispatch_quickdraw(true, 0x0F6, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cpu.read_reg(Register::PC), 0x340002);
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+    }
+
     #[test]
     fn test_init_port() {
         let (mut d, mut cpu, mut bus) = setup();
@@ -8862,6 +8901,62 @@
         let (drawn, _) = crate::trap::pict::draw_picture(&mut bus, picture, 0, 0, 1, 2, (screen, 1, 8, 1, 1), &clut, 0, None);
         assert!(drawn);
         assert_eq!(bus.read_byte(screen) & 0xc0, 0xc0);
+    }
+
+    #[test]
+    fn picture_recording_keeps_erase_copybits_and_lines_in_drawing_order() {
+        // OpenPicture hides the pen and saves each drawing call as an opcode
+        // (Inside Macintosh Volume I, I-189). A button image built from an
+        // EraseRect, a CopyBits label and LineTo bevels must replay all of
+        // them in order, not just the bitmap transfer.
+        let (mut d, mut cpu, mut bus) = setup_with_port();
+        d.current_port.set(0x181000);
+        setup_copybits_through_port_bottleneck(&mut bus, 0);
+        bus.write_word(0x181000 + 12, 2); // two-row port
+        let frame = bus.alloc(8);
+        write_rect(&mut bus, frame, 0, 0, 2, 8);
+        bus.write_long(TEST_SP, frame);
+        d.dispatch_quickdraw(true, 0x0F3, &mut cpu, &mut bus).unwrap().unwrap();
+        let handle = bus.read_long(TEST_SP + 4);
+
+        let erase = bus.alloc(8);
+        write_rect(&mut bus, erase, 0, 0, 2, 8);
+        bus.write_long(TEST_SP, erase);
+        cpu.write_reg(Register::A7, TEST_SP);
+        d.dispatch_quickdraw(true, 0x0A3, &mut cpu, &mut bus).unwrap().unwrap();
+
+        setup_copybits_through_port_bottleneck(&mut bus, 0);
+        bus.write_word(0x181000 + 12, 2);
+        cpu.write_reg(Register::A7, TEST_SP);
+        d.dispatch_quickdraw(true, 0x0EC, &mut cpu, &mut bus).unwrap().unwrap();
+
+        for (trap, h, v) in [(0x093, 0, 1), (0x091, 7, 1)] {
+            bus.write_word(TEST_SP, v);
+            bus.write_word(TEST_SP + 2, h);
+            cpu.write_reg(Register::A7, TEST_SP);
+            d.dispatch_quickdraw(true, trap, &mut cpu, &mut bus).unwrap().unwrap();
+        }
+        cpu.write_reg(Register::A7, TEST_SP);
+        d.dispatch_quickdraw(true, 0x0F4, &mut cpu, &mut bus).unwrap().unwrap();
+
+        let picture = bus.read_long(handle);
+        let size = bus.read_word(picture) as usize;
+        let data = bus.read_bytes(picture, size);
+        assert!(matches!(crate::trap::pict::picture_stream_progress(&data), crate::trap::pict::PictureStreamProgress::Complete(end) if end == size));
+        let find = |opcode: u16| {
+            (14..size - 1)
+                .step_by(2)
+                .find(|&i| u16::from_be_bytes([data[i], data[i + 1]]) == opcode)
+                .unwrap_or_else(|| panic!("opcode ${opcode:04X} missing"))
+        };
+        assert!(find(0x0032) < find(0x0098), "EraseRect precedes the transfer");
+
+        let screen = bus.alloc(2);
+        bus.write_bytes(screen, &[0x55, 0x55]);
+        let clut = *d.device_clut;
+        let (drawn, _) = crate::trap::pict::draw_picture(&mut bus, picture, 0, 0, 2, 8, (screen, 1, 8, 2, 1), &clut, 0, None);
+        assert!(drawn);
+        assert_eq!(bus.read_bytes(screen, 2), [0x80, 0xFF]);
     }
 
     #[test]
@@ -16661,6 +16756,54 @@ fn copy_bits_converts_between_direct_color_depths() {
         assert!(result.unwrap().is_ok());
         assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 2);
         assert_ne!(bus.read_long(TEST_SP + 2), 0);
+    }
+
+    #[test]
+    fn getpixpat_returns_independent_copy_that_survives_dispospixpat() {
+        // Imaging With QuickDraw (1994), pp. 4-88 and 4-103: GetPixPat
+        // returns a newly allocated pixel pattern that the caller releases
+        // with DisposePixPat. Apeiron fills its playfield with
+        // GetPixPat/FillCRect/DisposPixPat at the start of every life, so
+        // the second GetPixPat for the same ID must still see the pattern.
+        let (mut d, mut cpu, mut bus) = setup();
+        let template = make_raw_color_pixpat_handle(&mut bus);
+        let ppat_bytes = bus.read_bytes(bus.read_long(template), 128);
+        let resource_ptr = d.install_test_resource(&mut bus, *b"ppat", 130, &ppat_bytes);
+
+        macro_rules! get_pix_pat {
+            () => {{
+                cpu.write_reg(Register::A7, TEST_SP);
+                bus.write_word(TEST_SP, 130);
+                assert!(d.dispatch_quickdraw(true, 0x20C, &mut cpu, &mut bus).unwrap().is_ok());
+                bus.read_long(TEST_SP + 2)
+            }};
+        }
+
+        let first = get_pix_pat!();
+        assert_ne!(first, 0);
+        let first_record = bus.read_long(first);
+        assert_ne!(first_record, resource_ptr);
+        assert_eq!(bus.read_bytes(first_record, 128), ppat_bytes);
+
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, first);
+        assert!(d.dispatch_quickdraw(true, 0x208, &mut cpu, &mut bus).unwrap().is_ok());
+
+        assert!(
+            bus.get_alloc_size(resource_ptr).is_some(),
+            "DisposPixPat must release the caller's copy, not the 'ppat' resource block"
+        );
+
+        let second = get_pix_pat!();
+        assert_ne!(second, 0);
+        let second_record = bus.read_long(second);
+        assert_ne!(second_record, 0);
+        assert_ne!(second_record, resource_ptr);
+        assert_eq!(
+            bus.read_bytes(second_record, 128),
+            ppat_bytes,
+            "DisposPixPat of the first pattern must not release the 'ppat' resource"
+        );
     }
 
     // ==================== Color Icon Traps ====================
