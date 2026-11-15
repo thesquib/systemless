@@ -199,8 +199,8 @@ impl Drop for FramePhaseTimer {
 }
 
 /// Initial screen dimensions, taken from the active machine profile
-/// (800x600 8bpp by default, overridable through `SYSTEMLESS_SCREEN_WIDTH`
-/// and `SYSTEMLESS_SCREEN_HEIGHT`).
+/// (800x600 8bpp by default, overridable through `--screen-size` or
+/// `SYSTEMLESS_SCREEN_WIDTH` and `SYSTEMLESS_SCREEN_HEIGHT`).
 fn initial_screen_width() -> u32 {
     u32::from(
         systemless::systems::macintosh::machine_profile::reference_machine_profile().screen_width,
@@ -385,6 +385,11 @@ struct Cli {
     #[arg(long, value_name = "BITS", value_parser = parse_screen_depth)]
     screen_depth: Option<u16>,
 
+    /// Guest screen size in pixels, such as 640x480 (defaults to 800x600).
+    /// Same as setting SYSTEMLESS_SCREEN_WIDTH and SYSTEMLESS_SCREEN_HEIGHT
+    #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = parse_screen_size)]
+    screen_size: Option<ScreenSize>,
+
     /// Override automatic window sizing with an integer physical-pixel scale
     #[arg(long, value_name = "N", value_parser = parse_display_scale)]
     display_scale: Option<u32>,
@@ -442,6 +447,29 @@ fn parse_screen_depth(value: &str) -> Result<u16, String> {
         "8" => Ok(8),
         _ => Err("screen depth must be 1, 2, 4, or 8".to_string()),
     }
+}
+
+/// A guest screen size from `--screen-size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenSize {
+    width: u16,
+    height: u16,
+}
+
+fn parse_screen_size(value: &str) -> Result<ScreenSize, String> {
+    const MESSAGE: &str = "screen size must be WIDTHxHEIGHT, such as 640x480, \
+                           with each side from 1 through 65535";
+    let (width, height) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| MESSAGE.to_string())?;
+    let side = |text: &str| match text.parse::<u16>() {
+        Ok(0) | Err(_) => Err(MESSAGE.to_string()),
+        Ok(side) => Ok(side),
+    };
+    Ok(ScreenSize {
+        width: side(width)?,
+        height: side(height)?,
+    })
 }
 
 fn parse_display_scale(value: &str) -> Result<u32, String> {
@@ -1084,6 +1112,16 @@ struct App {
 }
 
 impl App {
+    /// Apply launch options to the serial (non-threaded) runtime driver, the
+    /// default desktop path. The threaded runtime owner receives the same
+    /// options through `RuntimeConfig`.
+    fn configure_serial_driver(&mut self, gpu: bool, mounts: &[PathBuf]) {
+        if let Some(driver) = self.driver.as_mut() {
+            driver.gpu = gpu;
+            driver.mounts = mounts.to_vec();
+        }
+    }
+
     #[cfg(test)]
     fn new(
         game_path: PathBuf,
@@ -3561,9 +3599,7 @@ fn run_gui(
     app.use_software = use_software;
     app.gpu_fallback = gpu_fallback;
     app.wgpu_wake = Some(event_loop.create_proxy());
-    if let Some(driver) = app.driver.as_mut() {
-        driver.gpu = use_wgpu;
-    }
+    app.configure_serial_driver(use_wgpu, &config.mounts);
     #[cfg(target_os = "windows")]
     {
         app.gpu_wake = Some(event_loop.create_proxy());
@@ -3960,6 +3996,16 @@ fn main() {
     let cli = Cli::parse()
         .validate_renderer()
         .unwrap_or_else(|error| error.exit());
+    if let Some(size) = cli.screen_size {
+        // The machine profile reads these once, on first use, so they must be
+        // set before anything builds a session. An explicit CLI size takes
+        // precedence over one inherited from the environment.
+        // SAFETY: the runner has not started and no worker threads exist yet.
+        unsafe {
+            std::env::set_var("SYSTEMLESS_SCREEN_WIDTH", size.width.to_string());
+            std::env::set_var("SYSTEMLESS_SCREEN_HEIGHT", size.height.to_string());
+        }
+    }
     if !cli.prefer_classic_68k {
         // SAFETY: the runner has not started and no worker threads exist yet.
         unsafe { std::env::set_var("SYSTEMLESS_PREFER_POWERPC", "1") };
@@ -4852,6 +4898,38 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_a_screen_size_and_rejects_malformed_ones() {
+        let cli = Cli::try_parse_from(["systemless", "game.sit"]).unwrap();
+        assert_eq!(cli.screen_size, None);
+        for value in ["640x480", "640X480"] {
+            let cli = Cli::try_parse_from(["systemless", "--screen-size", value, "game.sit"])
+                .expect("screen size should parse");
+            assert_eq!(
+                cli.screen_size,
+                Some(ScreenSize {
+                    width: 640,
+                    height: 480
+                })
+            );
+        }
+        for value in [
+            "640",
+            "640x",
+            "x480",
+            "0x480",
+            "640x0",
+            "640x480x8",
+            "-640x480",
+            "65536x480",
+        ] {
+            let arg = format!("--screen-size={value}");
+            let error = Cli::try_parse_from(["systemless", arg.as_str(), "game.sit"])
+                .expect_err("malformed screen size should be rejected");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{value}");
+        }
+    }
+
+    #[test]
     fn cli_accepts_two_bit_screen_depth() {
         let cli = Cli::try_parse_from(["systemless", "--screen-depth", "2", "game.sit"])
             .expect("two-bit display depth should parse");
@@ -4941,6 +5019,18 @@ mod tests {
             queued_stereo_bytes: queued.clone(),
         }));
         (runner, queued)
+    }
+
+    /// `--mount` reaches the default (serial) desktop runtime, not only the
+    /// threaded one: without it a windowed launch loads GAME alone.
+    #[test]
+    fn serial_desktop_driver_receives_mount_volumes() {
+        let mut app = App::new(PathBuf::from("dummy"), false, true, false, 8);
+        let mounts = vec![PathBuf::from("/disc.iso"), PathBuf::from("/second disc")];
+        app.configure_serial_driver(true, &mounts);
+        let driver = app.driver.as_ref().expect("serial runtime driver");
+        assert_eq!(driver.mounts, mounts);
+        assert!(driver.gpu);
     }
 
     #[test]

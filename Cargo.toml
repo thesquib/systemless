@@ -1,6 +1,6 @@
 [package]
 name = "systemless"
-version = "0.122.1"
+version = "0.124.0"
 edition = "2021"
 rust-version = "1.93"
 # Emulator code is GPL-3.0-or-later.
@@ -107,6 +107,9 @@ test-support = ["wgpu?/counters"]
 debug = []
 # Debugger socket transport (Unix-domain sockets). Implies `debug`.
 debug-server = ["debug"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.54", optional = true, features = [
