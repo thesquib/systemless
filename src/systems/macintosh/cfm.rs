@@ -185,13 +185,6 @@ pub(crate) enum CfmOperation {
 }
 
 impl CfmOperation {
-    pub(crate) fn id(self) -> CfmLoadId {
-        match self {
-            Self::Load(load) => load.id,
-            Self::Resource(call) => call.id,
-        }
-    }
-
     /// Whether `id` is this load's connection or a dependency it connected.
     pub(crate) fn covers(self, id: CfmLoadId) -> bool {
         match self {
