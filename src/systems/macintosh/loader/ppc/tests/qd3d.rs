@@ -13491,6 +13491,82 @@ fn hle_import_runner_merges_q3_trimesh_attributes_with_group_material() {
 }
 
 #[test]
+fn q3_texels_read_through_a_span_match_routed_reads() {
+    let mut bytes = vec![0u8; 0x400];
+    let mut state = 0x9e37_79b9u32;
+    for byte in &mut bytes {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (state >> 24) as u8;
+    }
+    let mut memory = PpcSectionMem::new();
+    memory.add_region(0x2000, bytes);
+    for (pixel_type, pixel_bytes) in [
+        (PPC_Q3_PIXEL_TYPE_RGB16, 2),
+        (PPC_Q3_PIXEL_TYPE_ARGB16, 2),
+        (PPC_Q3_PIXEL_TYPE_RGB16_565, 2),
+        (PPC_Q3_PIXEL_TYPE_RGB24, 3),
+        (PPC_Q3_PIXEL_TYPE_RGB32, 4),
+        (PPC_Q3_PIXEL_TYPE_ARGB32, 4),
+    ] {
+        for byte_order in [PPC_Q3_ENDIAN_BIG, PPC_Q3_ENDIAN_LITTLE] {
+            // An odd image offset and row stride put texels at odd addresses;
+            // the last texel ends exactly at the storage's valid size.
+            let (width, height, row_bytes, image_offset) = (7u32, 5u32, 7 * pixel_bytes + 3, 5u32);
+            let valid_size = image_offset + (height - 1) * row_bytes + width * pixel_bytes;
+            let texture = PpcQ3SoftwareTexture {
+                image_base: 0x2001,
+                valid_size,
+                image_offset,
+                width,
+                height,
+                row_bytes,
+                pixel_type,
+                byte_order,
+                pixel_bytes,
+            };
+            let span = ppc_q3_software_texture_span(&mut memory, texture);
+            assert!(span.is_some(), "plain guest memory takes a span");
+            for y in 0..=height {
+                for x in 0..=width {
+                    assert_eq!(
+                        ppc_q3_software_texture_pixel_at_in(&mut memory, texture, span, x, y),
+                        ppc_q3_software_texture_pixel_at(&mut memory, texture, x, y),
+                        "{pixel_type} {byte_order} ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+    // Storage that straddles two regions takes no span; its texels are read
+    // through the routed fallback.
+    memory.add_region(0x4000, vec![0x12; 0x10]);
+    memory.add_region(0x4010, vec![0x34; 0x10]);
+    let texture = PpcQ3SoftwareTexture {
+        image_base: 0x4000,
+        valid_size: 0x20,
+        image_offset: 0,
+        width: 8,
+        height: 2,
+        row_bytes: 16,
+        pixel_type: PPC_Q3_PIXEL_TYPE_RGB16,
+        byte_order: PPC_Q3_ENDIAN_BIG,
+        pixel_bytes: 2,
+    };
+    let span = ppc_q3_software_texture_span(&mut memory, texture);
+    assert!(span.is_none(), "a range across two regions takes no span");
+    for (x, y) in [(0, 0), (7, 0), (0, 1), (7, 1)] {
+        let routed = ppc_q3_software_texture_pixel_at(&mut memory, texture, x, y);
+        assert!(routed.is_some(), "({x}, {y}) is readable");
+        assert_eq!(ppc_q3_software_texture_pixel_at_in(&mut memory, texture, span, x, y), routed);
+    }
+    assert_ne!(
+        ppc_q3_software_texture_pixel_at(&mut memory, texture, 0, 0),
+        ppc_q3_software_texture_pixel_at(&mut memory, texture, 0, 1),
+        "the rows come from different regions"
+    );
+}
+
+#[test]
 fn hle_import_runner_submits_q3_trimesh_before_stale_retained_memberships() {
     let view = PPC_Q3_OBJECT_BASE;
     let group = PPC_Q3_OBJECT_BASE + PPC_Q3_OBJECT_STRIDE;
@@ -28793,4 +28869,79 @@ fn q3_present_pacing_does_not_block_an_unfinished_nested_end_rendering() {
     );
     assert_eq!(state.presents_of(PpcQ3PresentKind::Window), 1);
     assert_eq!(state.parks, [0; 5]);
+}
+
+/// Software span stores reported from the run that holds their bytes reach
+/// the guest-memory observers exactly as `report_span_write` would report the
+/// same stores: the same calls, addresses and bytes, in the same order.
+#[test]
+fn q3_span_runs_report_their_stored_bytes_as_report_span_write_would() {
+    use crate::memory::NOTE_WRITE_LOG;
+
+    const BASE: u32 = 0x0040_0000;
+    let front_buffer = PpcFrontBuffer {
+        base_addr: BASE,
+        row_bytes: 400,
+        width: 200,
+        height: 2,
+        depth: 16,
+    };
+    // A run longer than two report chunks, one interrupted by a gap, and one
+    // on the next row.
+    let runs: [(i32, std::ops::Range<i32>); 3] = [(0, 0..150), (0, 160..170), (1, 0..10)];
+    let color = |y: i32, x: i32| (y as u16) << 12 | x as u16;
+    let fresh = || {
+        let mut memory = PpcSectionMem::new();
+        memory.add_region(BASE, vec![0; 800]);
+        memory
+    };
+    let logged = |memory: &mut PpcSectionMem, fill: &dyn Fn(&mut PpcSectionMem)| {
+        NOTE_WRITE_LOG.set(Some(Vec::new()));
+        fill(memory);
+        NOTE_WRITE_LOG.take().expect("log")
+    };
+
+    let mut stored = fresh();
+    let surface = PpcQ3SoftwareFrontBufferSurface::new(&mut stored, front_buffer, None);
+    let span = surface.span.expect("front-buffer span");
+    let reported = logged(&mut stored, &|memory| {
+        let mut run = PpcQ3UnreportedRun::default();
+        for (y, xs) in runs.clone() {
+            for x in xs {
+                assert!(surface.write_pixel_in_run(memory, (x, y), color(y, x), &mut run));
+            }
+        }
+        run.finish(memory, surface);
+    });
+
+    let mut read_back = fresh();
+    let expected = logged(&mut read_back, &|memory| {
+        for (y, xs) in runs.clone() {
+            let first = y as usize * 400 + xs.start as usize * 2;
+            for x in xs.clone() {
+                memory
+                    .write_u16_be_in_span_unreported(span, y as usize * 400 + x as usize * 2, color(y, x))
+                    .expect("span store");
+            }
+            memory.report_span_write(span, first, xs.len());
+        }
+    });
+
+    assert_eq!(
+        reported.iter().map(|(address, bytes)| (*address, bytes.len())).collect::<Vec<_>>(),
+        [
+            (BASE, 128),
+            (BASE + 128, 128),
+            (BASE + 256, 44),
+            (BASE + 320, 20),
+            (BASE + 400, 20)
+        ]
+    );
+    assert_eq!(reported, expected);
+    let bytes = |memory: &mut PpcSectionMem| {
+        let mut bytes = vec![0; 800];
+        memory.read_bytes_into(BASE, &mut bytes).expect("front buffer");
+        bytes
+    };
+    assert_eq!(bytes(&mut stored), bytes(&mut read_back));
 }

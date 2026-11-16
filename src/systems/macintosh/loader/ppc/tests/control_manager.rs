@@ -297,6 +297,12 @@ fn popup_control_exposes_its_menu_resource_through_private_data() {
     let menu = loaded.memory.read_u32_be(menu_handle).unwrap();
     assert_eq!(loaded.memory.read_u16_be(menu), Some(143));
     assert_eq!(loaded.memory.read_u16_be(data + 4), Some(143));
+    let menu_list_handle = ppc_current_menu_list(&mut loaded.memory);
+    let definition = ppc_menu_list_definition(&mut loaded.memory, menu_list_handle).unwrap();
+    assert!(definition
+        .hierarchical
+        .iter()
+        .any(|entry| entry.handle == menu_handle));
 }
 
 #[test]

@@ -833,17 +833,7 @@ pub(crate) fn dispatch_supported_import(
         return Some(action);
     }
 
-    // The lowercase C entry points convert in place around the Pascal routine,
-    // as the InterfaceLib glue does.
-    let c_string_font_input = matches!(
-        binding.dispatcher_target,
-        PpcImportDispatcherTarget::GetFNumC
-            | PpcImportDispatcherTarget::StringWidthC
-    );
-    if c_string_font_input {
-        dispatch_stdc::ppc_c2pstr(cpu, memory);
-    }
-    let font_action =
+    if let Some(action) =
         dispatch_fonts::dispatch_font_import(dispatch_fonts::PpcFontDispatchContext {
             binding,
             cpu,
@@ -865,11 +855,8 @@ pub(crate) fn dispatch_supported_import(
             handles,
             current_resource_refnum: *current_resource_refnum,
             last_resource_error,
-        });
-    if c_string_font_input {
-        dispatch_stdc::ppc_p2cstr(cpu, memory);
-    }
-    if let Some(action) = font_action {
+        })
+    {
         return Some(action);
     }
 
@@ -1608,7 +1595,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::TempTopMem
         | PpcImportDispatcherTarget::PurgeMem
         | PpcImportDispatcherTarget::PurgeMemSys
-        | PpcImportDispatcherTarget::SetMemErr
+        | PpcImportDispatcherTarget::LMSetMemErr
         | PpcImportDispatcherTarget::MemError => {
             unreachable!("memory imports return through dispatch_memory_import")
         }
@@ -2356,9 +2343,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::GetAppFont
         | PpcImportDispatcherTarget::GetDefFontSize
         | PpcImportDispatcherTarget::GetFontName
-        | PpcImportDispatcherTarget::GetFontNameC
-        | PpcImportDispatcherTarget::GetFNumC
-        | PpcImportDispatcherTarget::StringWidthC => {
+        | PpcImportDispatcherTarget::GetFontNameCString => {
             unreachable!("Font Manager imports return through dispatch_font_import")
         }
         PpcImportDispatcherTarget::DMGetDisplayIDByGDevice
@@ -2542,9 +2527,9 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::SVersion
         | PpcImportDispatcherTarget::EqualString
         | PpcImportDispatcherTarget::EqualCString
-        | PpcImportDispatcherTarget::RelStringC
         | PpcImportDispatcherTarget::UpperCString
         | PpcImportDispatcherTarget::ScreenRes
+        | PpcImportDispatcherTarget::RelCString
         | PpcImportDispatcherTarget::RelString
         | PpcImportDispatcherTarget::InitEditionPackVersion
         | PpcImportDispatcherTarget::StuffHex
@@ -2564,6 +2549,7 @@ pub(crate) fn dispatch_supported_import(
         PpcImportDispatcherTarget::TextWidth
         | PpcImportDispatcherTarget::TruncString
         | PpcImportDispatcherTarget::StringWidth
+        | PpcImportDispatcherTarget::StringWidthCString
         | PpcImportDispatcherTarget::CharWidth
         | PpcImportDispatcherTarget::GetFontInfo
         | PpcImportDispatcherTarget::StdText
@@ -2573,6 +2559,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::FontMetrics
         | PpcImportDispatcherTarget::FMSwapFont
         | PpcImportDispatcherTarget::GetFNum
+        | PpcImportDispatcherTarget::GetFNumCString
         | PpcImportDispatcherTarget::FontToScript
         | PpcImportDispatcherTarget::SetPreserveGlyph
         | PpcImportDispatcherTarget::GetPreserveGlyph
@@ -3553,6 +3540,25 @@ pub(crate) fn dispatch_supported_import(
             Some(PpcImportAction::Return(ppc_i16_result(error)))
         }
         PpcImportDispatcherTarget::ReturnNoErr => Some(PpcImportAction::Return(0)),
+        PpcImportDispatcherTarget::PPCOpenSync => {
+            // PPCToolbox.h: PPCOpenPBRec.portRefNum at offset 38.
+            let _ = memory.write_u16_be(cpu.gpr[3].wrapping_add(38), 1);
+            Some(PpcImportAction::Return(ppc_i16_result(ppc_complete_pb(
+                memory,
+                cpu.gpr[3],
+                PPC_NO_ERR,
+            ))))
+        }
+        PpcImportDispatcherTarget::PPCCloseSync => Some(PpcImportAction::Return(ppc_i16_result(
+            ppc_complete_pb(memory, cpu.gpr[3], PPC_NO_ERR),
+        ))),
+        PpcImportDispatcherTarget::GetSpecificHighLevelEvent => {
+            // No high-level-event port is registered: noPortErr, as the 68K trap reports.
+            if cpu.gpr[5] != 0 {
+                let _ = memory.write_u16_be(cpu.gpr[5], (-903i16) as u16);
+            }
+            Some(PpcImportAction::Return(0))
+        }
         PpcImportDispatcherTarget::ReturnOne => Some(PpcImportAction::Return(1)),
         PpcImportDispatcherTarget::NewOTNotifyUPP => {
             // OpenTransport.h (Universal Interfaces 3.4.1): on classic PowerPC

@@ -887,8 +887,8 @@ pub(super) fn dispatch_memory_import(
             };
             Some(PpcImportAction::ReturnPreserve)
         }
-        PpcImportDispatcherTarget::SetMemErr => {
-            *last_mem_error = cpu.gpr[3] as u16 as i16;
+        PpcImportDispatcherTarget::LMSetMemErr => {
+            *last_mem_error = cpu.gpr[3] as i16;
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::MemError => {

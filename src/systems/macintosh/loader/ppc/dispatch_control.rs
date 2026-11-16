@@ -1093,8 +1093,8 @@ pub(super) fn ppc_dispatch_legacy_control(
             }
             // TrackControl keeps control until the button is released; a caller that
             // resumes early sees the held button as a second click.
-            // shortcut: releasing outside the control still counts as a hit, compare the
-            // release point when a title depends on cancelling by dragging away.
+            // Releasing outside the control still counts as a hit; dragging away
+            // does not cancel.
             let is_popup = controls
                 .iter()
                 .any(|record| record.handle == cpu.gpr[3] && (1008..=1023).contains(&record.proc_id));

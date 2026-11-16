@@ -468,12 +468,7 @@ pub(super) fn ppc_pb_get_cat_info(
     } else {
         entry.name.clone()
     };
-    // With ioFDirIndex zero ioNamePtr is input only, and callers reuse the buffer
-    // holding a full path. Inside Macintosh: Files (1992), p. 2-191.
-    if fdir_index != 0
-        && name_ptr != 0
-        && !ppc_write_pstring_bytes(memory, name_ptr, &output_name)
-    {
+    if name_ptr != 0 && !ppc_write_pstring_bytes(memory, name_ptr, &output_name) {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     }
     // ioVRefNum is input-only here: callers enumerating by index reuse the block
@@ -2377,7 +2372,7 @@ pub(super) fn ppc_resolved_fsspec_target_path(
         return None;
     };
     let name = decode_mac_roman(name_bytes);
-    let normalized_name = crate::trap::TrapDispatcher::normalize_hfs_lookup_path(&name);
+    let normalized_name = crate::trap::TrapDispatcher::normalize_hfs_path(&name);
     if normalized_name.is_empty() {
         return None;
     }
@@ -6801,7 +6796,8 @@ pub(super) fn ppc_get_alias_info(
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    ppc_write_pstring_bytes(memory, out, &name);
+    // theString is a Str63.
+    ppc_write_pstring_bytes(memory, out, &name[..name.len().min(63)]);
     PPC_NO_ERR
 }
 

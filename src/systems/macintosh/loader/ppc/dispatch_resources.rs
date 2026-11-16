@@ -907,7 +907,7 @@ fn ppc_get_icon_suite(
 }
 
 /// A FamRec with one 12-point association and no width, kerning or style tables.
-/// shortcut: fixed metrics for every family, read the built-in face's metrics if a guest lays out with them.
+/// Every family gets the same fixed metrics rather than its built-in face's.
 pub(super) fn ppc_synthetic_fond_bytes(font_id: i16) -> Vec<u8> {
     let mut fond = vec![0; 60];
     fond[2..4].copy_from_slice(&font_id.to_be_bytes());

@@ -516,7 +516,7 @@ fn ppc_standard_file_draw_folder_menu(
     gworlds: &[PpcGWorldRecord],
     tracking: &PpcStandardFileGetTrackingState,
 ) {
-    // shortcut: rows past the dialog's bottom edge are not shown, scroll the menu if a title nests deeper.
+    // Rows past the dialog's bottom edge are not shown; the menu does not scroll.
     let rows = (PPC_STANDARD_FILE_GET_FOLDER_MENU_RECT.2 - PPC_STANDARD_FILE_GET_FOLDER_MENU_RECT.0)
         / PPC_STANDARD_FILE_GET_FOLDER_MENU_ROW_HEIGHT;
     let rows = tracking.folder_chain.len().min(rows as usize) as i16;

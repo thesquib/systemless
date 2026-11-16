@@ -1456,7 +1456,10 @@ use super::*;
         let back_window = PPC_DATA_BASE + 0x4000;
         loaded.memory.add_region(back_window, vec![0; PPC_CGRAF_PORT_SIZE as usize]);
         loaded.memory.write_u8(back_window + PPC_CWINDOW_VISIBLE_OFFSET, 1).unwrap();
-        loaded.toolbox_startup.port_palettes.insert(back_window, (palette_handle, 0));
+        loaded.memory.write_u32_be(
+            back_window + PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET,
+            palette_handle,
+        ).unwrap();
         loaded.window_list.push(back_window);
         loaded.event_queue.clear();
         loaded.cpu.gpr[3] = palette_handle;

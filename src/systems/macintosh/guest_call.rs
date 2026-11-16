@@ -3415,7 +3415,7 @@ impl SharedGuestCallStack {
     pub(crate) fn is_cfm_load_pending(&self, id: CfmLoadId) -> bool {
         self.0.borrow().frames.values().any(|frame| {
             frame.operation.as_ref().is_some_and(
-                |operation| matches!(operation, ManagerContinuation::Cfm(cfm) if cfm.id() == id),
+                |operation| matches!(operation, ManagerContinuation::Cfm(cfm) if cfm.covers(id)),
             )
         })
     }
