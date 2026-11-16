@@ -329,6 +329,7 @@ pub(super) fn dispatch_dialog_import(
                     controls,
                     param_text,
                     dialog,
+                    0,
                     vfs_resources,
                     current_resource_refnum,
                     last_resource_error,
@@ -375,6 +376,7 @@ pub(super) fn dispatch_dialog_import(
                     controls,
                     param_text,
                     dialog,
+                    0,
                     vfs_resources,
                     current_resource_refnum,
                     last_resource_error,
@@ -1128,6 +1130,21 @@ pub(super) fn dispatch_dialog_import(
                     quickdraw_text_size,
                     *quickdraw_fore_color,
                 );
+                // TESetSelect highlights the new selection immediately.
+                if ppc_window_is_visible(memory, params.dialog_ptr()) {
+                    let _ = ppc_draw_dialog(
+                        window_list,
+                        param_text,
+                        memory,
+                        handles,
+                        controls,
+                        gworlds,
+                        screen_clut,
+                        vfs_resources,
+                        current_resource_refnum,
+                        params.dialog_ptr(),
+                    );
+                }
             }
             Some(PpcImportAction::ReturnPreserve)
         }
@@ -1889,6 +1906,14 @@ fn ppc_dispatch_dialog_compatibility(
                         current_resource_refnum,
                         dialog,
                     );
+                    // DialogSelect brackets its redraw with BeginUpdate and
+                    // EndUpdate, so the dialog is validated afterwards.
+                    // Macintosh Toolbox Essentials (1992), p. 6-128.
+                    let update_rgn = memory
+                        .read_u32_be(dialog.wrapping_add(PPC_CWINDOW_UPDATE_RGN_OFFSET))
+                        .unwrap_or(0);
+                    let _ = ppc_set_empty_rgn(memory, update_rgn);
+                    event_queue.retain(|event| !(event.what == 6 && event.message == dialog));
                     ppc_begin_dialog_callbacks(
                         cpu,
                         memory,
@@ -2097,6 +2122,7 @@ fn ppc_dispatch_dialog_compatibility(
                 },
             );
             ppc_offset_ditl_items(&mut appended_bytes, &appended_items, dv, dh);
+            let current_items_len = current_items.len();
             let total_count = current_items.len().saturating_add(appended_items.len());
             let mut combined = current_bytes;
             combined.extend_from_slice(appended_bytes.get(2..).unwrap_or_default());
@@ -2112,6 +2138,37 @@ fn ppc_dispatch_dialog_compatibility(
             if result == PPC_NO_ERR {
                 if let Some(ptr) = memory.read_u32_be(handle) {
                     let _ = memory.write_bytes(ptr, &combined);
+                }
+                // AppendDITL creates the appended items' controls and handles as NewDialog does.
+                ppc_initialize_dialog_items(
+                    process_memory_manager,
+                    memory,
+                    heap_cursor,
+                    heap_limit,
+                    last_mem_error,
+                    handles,
+                    controls,
+                    param_text,
+                    params.dialog_ptr(),
+                    current_items_len,
+                    vfs_resources,
+                    current_resource_refnum,
+                    last_resource_error,
+                );
+                // The native renderer targets the screen; a hidden dialog draws when shown.
+                if ppc_window_is_visible(memory, params.dialog_ptr()) {
+                    let _ = ppc_draw_dialog(
+                        window_list,
+                        param_text,
+                        memory,
+                        handles,
+                        controls,
+                        gworlds,
+                        screen_clut,
+                        vfs_resources,
+                        current_resource_refnum,
+                        params.dialog_ptr(),
+                    );
                 }
             }
             PpcImportAction::ReturnPreserve
@@ -2130,6 +2187,101 @@ fn ppc_dispatch_dialog_compatibility(
             };
             let (retained, count_minus_one) =
                 crate::dialog_manager::shorten_ditl_counts(items.len(), params.number_items());
+            // Removed items take their Dialog Manager-created controls with them.
+            let visible = ppc_window_is_visible(memory, params.dialog_ptr());
+            for item in items.iter().skip(retained) {
+                let base_type = dialog_item_base_type(item.item_type);
+                if visible {
+                    let _ = ppc_paint_window_background_bounds(
+                        memory,
+                        gworlds,
+                        params.dialog_ptr(),
+                        // Edit text frames are drawn outside the item's rect.
+                        (
+                            item.rect.0.saturating_sub(4),
+                            item.rect.1.saturating_sub(4),
+                            item.rect.2.saturating_add(4),
+                            item.rect.3.saturating_add(4),
+                        ),
+                        // Assumes a white content color; a dctb that customizes it is not read.
+                        PpcRgbColor {
+                            red: 0xffff,
+                            green: 0xffff,
+                            blue: 0xffff,
+                        },
+                    );
+                }
+                if matches!(
+                    base_type,
+                    DIALOG_ITEM_BUTTON
+                        | DIALOG_ITEM_CHECKBOX
+                        | DIALOG_ITEM_RADIO
+                        | DIALOG_ITEM_RESOURCE_CONTROL
+                ) && item.handle != 0
+                {
+                    let mut allocator = PpcProcessAllocatorView {
+                        memory_manager: process_memory_manager,
+                    };
+                    ppc_dispose_control(
+                        Some(&mut allocator),
+                        None,
+                        memory,
+                        heap_cursor,
+                        heap_limit,
+                        last_mem_error,
+                        handles,
+                        controls,
+                        item.handle,
+                    );
+                }
+            }
+            // The dialog's TERec borrows the active edit item's text handle;
+            // release it before that handle is disposed, as CloseDialog does.
+            let edit_field_ptr = params.dialog_ptr().wrapping_add(DIALOG_EDIT_FIELD_OFFSET);
+            if memory
+                .read_u16_be(edit_field_ptr)
+                .is_some_and(|field| field != u16::MAX && usize::from(field) >= retained)
+            {
+                let te_handle_ptr = params.dialog_ptr().wrapping_add(DIALOG_TEXT_HANDLE_OFFSET);
+                let te_handle = memory.read_u32_be(te_handle_ptr).unwrap_or(0);
+                if let Some(te_ptr) = ppc_te_record_ptr(memory, te_handle) {
+                    let _ = memory.write_u32_be(te_ptr + PPC_TE_HTEXT_OFFSET, 0);
+                    let mut allocator = PpcProcessAllocatorView {
+                        memory_manager: process_memory_manager,
+                    };
+                    ppc_te_dispose(
+                        Some(&mut allocator),
+                        None,
+                        memory,
+                        heap_cursor,
+                        heap_limit,
+                        last_mem_error,
+                        handles,
+                        te_handle,
+                    );
+                }
+                let _ = memory.write_u32_be(te_handle_ptr, 0);
+                let _ = memory.write_u16_be(edit_field_ptr, u16::MAX);
+                let _ = memory
+                    .write_u16_be(params.dialog_ptr().wrapping_add(DIALOG_EDIT_OPEN_OFFSET), 0);
+            }
+            for item in items.iter().skip(retained) {
+                if crate::dialog_manager::is_dialog_item_disposable_text(item.item_type)
+                    && item.handle != 0
+                {
+                    let mut allocator = PpcProcessAllocatorView {
+                        memory_manager: process_memory_manager,
+                    };
+                    let _ = allocator.dispose_handle(
+                        memory,
+                        heap_cursor,
+                        heap_limit,
+                        last_mem_error,
+                        handles,
+                        item.handle,
+                    );
+                }
+            }
             let end = if retained == 0 {
                 2
             } else {
@@ -3174,6 +3326,7 @@ fn ppc_new_alert_dialog(
             controls,
             param_text,
             dialog,
+            0,
             vfs_resources,
             current_resource_refnum,
             last_resource_error,
@@ -3368,6 +3521,7 @@ fn ppc_get_new_dialog(
             controls,
             param_text,
             dialog,
+            0,
             vfs_resources,
             current_resource_refnum,
             last_resource_error,
@@ -3587,6 +3741,7 @@ fn ppc_initialize_dialog_items(
     controls: &mut Vec<PpcControlRecord>,
     _param_text: &SharedProcessDialogText,
     dialog: u32,
+    first_item: usize,
     vfs_resources: &mut [PpcVfsResourceRecord],
     current_resource_refnum: i16,
     last_resource_error: &mut i16,
@@ -3615,7 +3770,7 @@ fn ppc_initialize_dialog_items(
     // its live handle, and uses Control Manager records owned by the dialog
     // for buttons, checkboxes, radio buttons, and resource-defined controls.
     let mut first_edit = None;
-    for (item_index, item) in items.into_iter().enumerate() {
+    for (item_index, item) in items.into_iter().enumerate().skip(first_item) {
         let base_type = dialog_item_base_type(item.item_type);
         let mut missing_resource = false;
         let item_handle = match base_type {
@@ -3781,7 +3936,9 @@ fn ppc_initialize_dialog_items(
             first_edit = Some((item_index, item_handle, item.rect));
         }
     }
-    if let Some((item_index, item_handle, rect)) = first_edit {
+    let edit_open = first_item > 0
+        && memory.read_u16_be(dialog + DIALOG_EDIT_OPEN_OFFSET).unwrap_or(0) != 0;
+    if let Some((item_index, item_handle, rect)) = first_edit.filter(|_| !edit_open) {
         let mut allocator = PpcProcessAllocatorView {
             memory_manager: process_memory_manager,
         };

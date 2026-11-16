@@ -2655,7 +2655,7 @@ fn payload_from_forks(
         });
     }
 
-    match crate::disk_image::extract_dc42_or_hfs(&data) {
+    match crate::disk_image::extract_forked_image(&data, &rsrc) {
         Ok(Some(image)) => {
             if crate::runner::trace_load_enabled() {
                 eprintln!(
@@ -4085,7 +4085,7 @@ impl ExecutableCandidate {
             !is_registration_executable(&self.name),
             !executable_name_has_role(&self.name, "editor"),
             !self.is_demo,
-            !is_system_folder_path(&self.name),
+            !is_system_folder_path(&self.name) && !is_bonus_content_path(&self.name),
             self.name
                 .rsplit_once('/')
                 .and_then(|(parent, app)| parent.rsplit('/').next().map(|folder| (folder, app)))
@@ -4340,7 +4340,7 @@ struct PpcCfmLibraryCandidate {
     path: String,
     fragment_index: usize,
     name: String,
-    bytes: Vec<u8>,
+    bytes: crate::cfm::CfmFragmentBytes,
     offset: u32,
     length: u32,
 }
@@ -4449,10 +4449,11 @@ pub(super) fn discover_ppc_cfm_library_fragments_with_locations(
             let Some(length) = u32::try_from(range.len()).ok() else {
                 continue;
             };
-            let Some(bytes) = data_file.data.get(range) else {
+            let Some(bytes) = crate::cfm::CfmFragmentBytes::from_fork_range(&data_file.data, range)
+            else {
                 continue;
             };
-            let Some(pef_header) = parse_pef_header(bytes) else {
+            let Some(pef_header) = parse_pef_header(&bytes) else {
                 continue;
             };
             if pef_header.architecture != ARCH_POWERPC {
@@ -4462,7 +4463,7 @@ pub(super) fn discover_ppc_cfm_library_fragments_with_locations(
                 path: resource_file.path.clone(),
                 fragment_index,
                 name: fragment.name,
-                bytes: bytes.to_vec(),
+                bytes,
                 offset,
                 length,
             });
@@ -4775,6 +4776,15 @@ fn fourcc_lossy(value: [u8; 4]) -> String {
 fn is_system_folder_path(path: &str) -> bool {
     path.split(['/', ':'])
         .any(|component| component.eq_ignore_ascii_case("System Folder"))
+}
+
+// Publisher CDs ship unrelated applications in folders such as "Other Goodies".
+fn is_bonus_content_path(path: &str) -> bool {
+    path.rsplit_once('/').is_some_and(|(parent, _)| {
+        parent
+            .split('/')
+            .any(|component| executable_name_has_role(component, "goodies"))
+    })
 }
 
 fn is_stuffit_archive(bytes: &[u8]) -> bool {
@@ -7771,7 +7781,7 @@ mod tests {
             fragments,
             vec![PpcCfmLibraryFragment {
                 name: "SDL".to_string(),
-                bytes: pef,
+                bytes: pef.into(),
             }]
         );
     }
@@ -7880,7 +7890,7 @@ mod tests {
         assert_eq!(names, ["InputSprocketDeferLib", "InputSprocketGlobals"]);
         assert!(fragments
             .iter()
-            .all(|fragment| fragment.bytes.as_slice() == pef.as_slice()));
+            .all(|fragment| *fragment.bytes == *pef));
         // CFM still permits an application's own sibling container to shadow
         // the installed runtime, without hiding either helper.
         assert_eq!(
@@ -8076,7 +8086,7 @@ mod tests {
         let fragments = discover_ppc_cfm_library_fragments(&vfs);
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].name, "SDL");
-        assert_eq!(fragments[0].bytes, first_pef);
+        assert_eq!(*fragments[0].bytes, *first_pef);
     }
 
     #[test]
@@ -8222,6 +8232,30 @@ mod tests {
             .skipped_disk_image_errors
             .iter()
             .any(|err| err.contains("Compact Pro archive") && err.contains("Empty.cpt")));
+    }
+
+    #[test]
+    fn executable_selection_prefers_application_over_bonus_content() {
+        let rsrc = make_single_resource_fork_bytes(*b"CODE", 0, &[0; 128]);
+        let names = ["Disc/Other Goodies/Tool", "Disc/Game"];
+        for order in [names, [names[1], names[0]]] {
+            let mut selected = None;
+            for name in order {
+                maybe_select_executable_with_preference(
+                    &mut selected,
+                    name,
+                    &[],
+                    &rsrc,
+                    true,
+                    0,
+                    *b"TEST",
+                    1,
+                    false,
+                    None,
+                );
+            }
+            assert_eq!(selected.unwrap().name, "Disc/Game");
+        }
     }
 
     #[test]

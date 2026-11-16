@@ -51,8 +51,28 @@ pub(super) fn dispatch_toolbox_import(
             }
             Some(PpcImportAction::ReturnPreserve)
         }
+        PpcImportDispatcherTarget::ScreenRes => {
+            // void ScreenRes(short *scrnHRes, short *scrnVRes): the emulated
+            // display is 72 dpi in both directions.
+            let _ = memory.write_u16_be(cpu.gpr[3], 72);
+            let _ = memory.write_u16_be(cpu.gpr[4], 72);
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::EqualCString => {
             Some(PpcImportAction::Return(ppc_equal_c_string(cpu, memory)))
+        }
+        PpcImportDispatcherTarget::RelCString => {
+            // short relstring(const char *, const char *, Boolean caseSens,
+            // Boolean diacSens): the C glue for RelString.
+            let left = ppc_read_bounded_c_string(memory, cpu.gpr[3])?;
+            let right = ppc_read_bounded_c_string(memory, cpu.gpr[4])?;
+            let result = crate::text_utils::evaluate_rel_string(
+                &left,
+                &right,
+                cpu.gpr[5] & 0xff != 0,
+                cpu.gpr[6] & 0xff != 0,
+            );
+            Some(PpcImportAction::Return(ppc_i16_result(result)))
         }
         PpcImportDispatcherTarget::RelString => {
             let left = ppc_read_pstring_bytes(memory, cpu.gpr[3])?;
@@ -66,23 +86,6 @@ pub(super) fn dispatch_toolbox_import(
                 diac_sensitive,
             );
             Some(PpcImportAction::Return(ppc_i16_result(result)))
-        }
-        PpcImportDispatcherTarget::RelStringC => {
-            let left = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[3], 255);
-            let right = super::dispatch_stdc::ppc_std_c_string(memory, cpu.gpr[4], 255);
-            Some(PpcImportAction::Return(ppc_i16_result(
-                crate::text_utils::evaluate_rel_string(
-                    &left,
-                    &right,
-                    cpu.gpr[5] & 0xff != 0,
-                    cpu.gpr[6] & 0xff != 0,
-                ),
-            )))
-        }
-        PpcImportDispatcherTarget::ScreenRes => {
-            let _ = memory.write_u16_be(cpu.gpr[3], 72);
-            let _ = memory.write_u16_be(cpu.gpr[4], 72);
-            Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::InitEditionPackVersion => {
             // As with the classic _Pack11 InitEditionPack path, initialization
