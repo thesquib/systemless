@@ -1,6 +1,10 @@
 //! Bounded, read-only decoding of NDIF (Disk Copy 6) images. The `bcem`
 //! resource maps disk sectors to chunks stored in the data fork.
-//! Layout: <https://github.com/libyal/libmodi/blob/main/documentation/Mac%20OS%20disk%20image%20types.asciidoc>
+//! Layout: a 128-byte header with the disk's sector count as a big-endian
+//! u32 at offset 68, then 12-byte entries of big-endian u32s: the start
+//! sector in the high 24 bits and the chunk type in the low 8 bits, the
+//! chunk's data fork offset, and its stored length. Each chunk ends where
+//! the next entry starts; a 0xFF entry at the sector count ends the table.
 
 const MAX_DISK_BYTES: u64 = 1024 * 1024 * 1024;
 const SECTOR_BYTES: u64 = 512;
@@ -26,9 +30,9 @@ pub(super) fn decode(data: &[u8], bcem: &[u8]) -> Result<Vec<u8>, String> {
     if disk_len == 0 || disk_len > MAX_DISK_BYTES {
         return Err("NDIF disk size exceeds the 1 GiB extraction limit".into());
     }
-    let mut output = vec![0; disk_len as usize];
     let entries: Vec<&[u8]> = bcem[HEADER_BYTES..].chunks_exact(ENTRY_BYTES).collect();
     let sector_of = |e: &[u8]| u64::from(u32_at(e, 0) >> 8);
+    let mut chunks = Vec::with_capacity(entries.len());
     let mut expected = 0;
     for pair in entries.windows(2) {
         let (entry, next) = (pair[0], pair[1]);
@@ -38,33 +42,41 @@ pub(super) fn decode(data: &[u8], bcem: &[u8]) -> Result<Vec<u8>, String> {
         }
         expected = end;
         let kind = entry[3];
-        if kind == CHUNK_END {
-            return Err("NDIF chunk follows table terminator".into());
-        }
-        let dst = &mut output[(start * SECTOR_BYTES) as usize..(end * SECTOR_BYTES) as usize];
-        if kind == CHUNK_ZERO {
-            continue;
-        }
-        let offset = u64::from(u32_at(entry, 4));
-        let stored = offset + u64::from(u32_at(entry, 8));
-        if stored > data.len() as u64 {
-            return Err("NDIF chunk exceeds the data fork".into());
-        }
-        let source = &data[offset as usize..stored as usize];
-        match kind {
-            CHUNK_RAW => {
-                if source.len() != dst.len() {
+        let len = ((end - start) * SECTOR_BYTES) as usize;
+        let source = match kind {
+            CHUNK_END => return Err("NDIF chunk follows table terminator".into()),
+            CHUNK_ZERO => &[][..],
+            CHUNK_RAW | CHUNK_ADC => {
+                let offset = u64::from(u32_at(entry, 4));
+                let stored = offset + u64::from(u32_at(entry, 8));
+                if stored > data.len() as u64 {
+                    return Err("NDIF chunk exceeds the data fork".into());
+                }
+                let source = &data[offset as usize..stored as usize];
+                if kind == CHUNK_RAW && source.len() != len {
                     return Err("NDIF raw chunk length mismatch".into());
                 }
-                dst.copy_from_slice(source);
+                source
             }
-            CHUNK_ADC => expand_adc(source, dst)?,
             _ => return Err(format!("unsupported NDIF chunk type 0x{kind:02x}")),
-        }
+        };
+        chunks.push((kind, len, source));
     }
     let last = entries.last().ok_or("NDIF block table has no chunks")?;
     if last[3] != CHUNK_END || sector_of(last) != sectors || expected != sectors {
         return Err("NDIF block table does not cover the disk".into());
+    }
+    // The whole table is validated first; the output then grows per chunk.
+    let mut output = Vec::new();
+    for (kind, len, source) in chunks {
+        let start = output.len();
+        output.resize(start + len, 0);
+        let dst = &mut output[start..];
+        match kind {
+            CHUNK_RAW => dst.copy_from_slice(source),
+            CHUNK_ADC => expand_adc(source, dst)?,
+            _ => {}
+        }
     }
     Ok(output)
 }
