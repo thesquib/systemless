@@ -36,7 +36,7 @@ fn enqueue_palette_updates(
             {
                 continue;
             }
-            let associated = ppc_window_palette_handle(memory, startup, window);
+            let associated = ppc_window_palette_handle(startup, window);
             let palette = if associated == 0 {
                 startup.application_palette
             } else {

@@ -2003,7 +2003,7 @@ fn failed_mem_fragment_load_removes_dependencies_it_connected() {
     let fragment = synthetic_pef_with_library_import(b"DepLib", b"DepSymbol");
     let library = PpcCfmLibraryFragment {
         name: "DepLib".to_string(),
-        bytes: synthetic_pef_with_exports(),
+        bytes: synthetic_pef_with_exports().into(),
     };
     let calls = SharedGuestCallStack::default();
     let owner = PpcProcessMemoryManager::with_heap(PPC_HEAP_BASE, PPC_HEAP_BASE + 0x100000);
@@ -2053,7 +2053,7 @@ fn dependency_and_fragment_initializer_blocks_share_one_released_scratch() {
     // it a dependency with its own initializer.
     let library = PpcCfmLibraryFragment {
         name: "InterfaceLib".to_string(),
-        bytes: synthetic_pef_with_initializer(),
+        bytes: synthetic_pef_with_initializer().into(),
     };
     let calls = SharedGuestCallStack::default();
     let worker = calls.create_task().unwrap();
@@ -2146,7 +2146,7 @@ fn fragment_after_an_exempted_dependency_uses_the_raised_allocation_limit() {
         let fragment = synthetic_pef();
         let library = PpcCfmLibraryFragment {
             name: "InterfaceLib".to_string(),
-            bytes: synthetic_pef(),
+            bytes: synthetic_pef().into(),
         };
         let calls = SharedGuestCallStack::default();
         let owner = PpcProcessMemoryManager::with_heap(PPC_HEAP_BASE, PPC_HEAP_BASE + 0x100000);
