@@ -681,32 +681,6 @@ fn close_window_removes_process_membership_without_native_gworld_metadata() {
 
 
 #[test]
-fn new_cwindow_leaves_bytes_after_caller_storage_record_alone() {
-    let pef = synthetic_pef_with_import(b"NewCWindow");
-    let mut loaded = load_pef_application(&pef).unwrap();
-    let scratch = PPC_DATA_BASE + 0x1000;
-    let storage_ptr = scratch + 0x100;
-    loaded.memory.add_region(scratch, vec![0; 0x300]);
-    ppc_write_rect(&mut loaded.memory, scratch, 20, 10, 260, 330).unwrap();
-    let tail = storage_ptr + PPC_CWINDOW_RECORD_SIZE;
-    loaded.memory.write_u16_be(tail, 0x0065).unwrap();
-    loaded.cpu.gpr[3] = storage_ptr;
-    loaded.cpu.gpr[4] = scratch;
-    loaded.cpu.gpr[5] = scratch + 8;
-    loaded.cpu.gpr[6] = 0;
-    loaded.cpu.gpr[7] = 0;
-    loaded.cpu.gpr[8] = u32::MAX;
-    loaded.cpu.gpr[9] = 0;
-    loaded.cpu.gpr[10] = 0;
-
-    let probe = loaded.run_with_hle_imports(64);
-
-    assert_eq!(probe.unsupported_import_index, None);
-    assert_eq!(loaded.cpu.gpr[3], storage_ptr);
-    assert_eq!(loaded.memory.read_u16_be(tail), Some(0x0065));
-}
-
-#[test]
 fn hle_import_runner_handles_new_cwindow_allocation() {
     let pef = synthetic_pef_with_import(b"NewCWindow");
     let mut loaded = load_pef_application(&pef).unwrap();
@@ -2746,6 +2720,107 @@ fn hle_import_runner_handles_new_cwindow_caller_storage() {
 }
 
 #[test]
+fn new_cwindow_leaves_bytes_after_caller_cwindow_record_untouched() {
+    // Super Othello passes a 156-byte CWindowRecord to GetNewCWindow; the
+    // WIND title scratch that followed it was zeroed by a DialogRecord-sized
+    // clear, so the window lost its "Super Othello" title.
+    let pef = synthetic_pef_with_import(b"NewCWindow");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let scratch = PPC_DATA_BASE + 0x1000;
+    let bounds_ptr = scratch;
+    let storage_ptr = scratch + 0x100;
+    loaded.memory.add_region(scratch, vec![0; 32]);
+    loaded
+        .memory
+        .add_region(storage_ptr, vec![0xaa; PPC_CGRAF_PORT_SIZE as usize]);
+    ppc_write_rect(&mut loaded.memory, bounds_ptr, 60, 40, 260, 340).unwrap();
+    loaded.cpu.gpr[3] = storage_ptr;
+    loaded.cpu.gpr[4] = bounds_ptr;
+    loaded.cpu.gpr[5] = 0;
+    loaded.cpu.gpr[6] = 0;
+    loaded.cpu.gpr[7] = 4;
+    loaded.cpu.gpr[8] = u32::MAX;
+    loaded.cpu.gpr[9] = 0;
+    loaded.cpu.gpr[10] = 0x1234_5678;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], storage_ptr);
+    assert_eq!(
+        loaded.memory.read_u32_be(storage_ptr + 152),
+        Some(0x1234_5678)
+    );
+    let trailing: Vec<u8> = (PPC_CWINDOW_RECORD_SIZE..PPC_CGRAF_PORT_SIZE)
+        .map(|offset| loaded.memory.read_u8(storage_ptr + offset).unwrap())
+        .collect();
+    assert_eq!(
+        trailing,
+        vec![0xaa; (PPC_CGRAF_PORT_SIZE - PPC_CWINDOW_RECORD_SIZE) as usize],
+        "NewCWindow wrote past the caller's CWindowRecord",
+    );
+}
+
+#[test]
+fn get_new_cwindow_applies_wind_positioning_word() {
+    let pef = synthetic_pef_with_import(b"GetNewCWindow");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let storage_ptr = PPC_DATA_BASE + 0x1000;
+    loaded
+        .memory
+        .add_region(storage_ptr, vec![0; PPC_CGRAF_PORT_SIZE as usize]);
+    let mut wind =
+        test_wind_resource((46, 56, 466, 576), 4, false, false, 0, b"Super Othello");
+    // "Super Othello" is 13 bytes, so the title already ends word-aligned.
+    assert_eq!(wind.len() % 2, 0);
+    wind.extend_from_slice(&0x280Au16.to_be_bytes());
+    assert_eq!(ppc_wind_position_word(&wind), 0x280A);
+    let current_resource_refnum = *loaded.process_file_system.current_resource_file;
+    loaded.process_file_system.push_vfs_resource(PpcVfsResourceRecord {
+        ref_num: current_resource_refnum,
+        path: "Test App".to_string(),
+        res_type: u32::from_be_bytes(*b"WIND"),
+        res_id: 200,
+        name: Vec::new(),
+        data: wind.into(),
+        raw_data: None,
+        raw_attrs: None,
+        attrs: 0,
+        handle: 0,
+    });
+    loaded.cpu.gpr[3] = 200;
+    loaded.cpu.gpr[4] = storage_ptr;
+    loaded.cpu.gpr[5] = u32::MAX;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(loaded.cpu.gpr[3], storage_ptr);
+    let content_rgn = loaded
+        .memory
+        .read_u32_be(storage_ptr + PPC_CWINDOW_CONTENT_RGN_OFFSET)
+        .unwrap();
+    let (top, left, bottom, right) =
+        ppc_read_rgn_bbox(&mut loaded.memory, content_rgn).unwrap();
+    assert_eq!((bottom - top, right - left), (420, 520));
+    // kWindowCenterMainScreen centres the structure (frame and shadow
+    // included) horizontally.
+    let structure = ppc_window_structure_bounds(4, (top, left, bottom, right));
+    let screen_width = ppc_main_screen_width() as i16;
+    assert!((structure.1 - (screen_width - structure.3)).abs() <= 1);
+    assert_ne!((top, left), (46, 56));
+    let title_handle = loaded
+        .memory
+        .read_u32_be(storage_ptr + PPC_CWINDOW_TITLE_HANDLE_OFFSET)
+        .unwrap();
+    let title = loaded.memory.read_u32_be(title_handle).unwrap();
+    assert_eq!(
+        ppc_read_pstring_bytes(&mut loaded.memory, title),
+        Some(b"Super Othello".to_vec())
+    );
+}
+
+#[test]
 fn hle_import_runner_handles_get_new_cwindow() {
     let pef = synthetic_pef_with_import(b"GetNewCWindow");
     let mut loaded = load_pef_application(&pef).unwrap();
@@ -2853,6 +2928,57 @@ fn hle_import_runner_handles_get_new_cwindow() {
         ),
         Some(black),
         "ShowWindow did not draw the hidden WIND document frame",
+    );
+}
+
+#[test]
+fn get_new_cwindow_uses_a_loaded_template_the_application_edited() {
+    let pef = synthetic_pef_with_import(b"GetNewCWindow");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let storage_ptr = PPC_DATA_BASE + 0x1000;
+    loaded
+        .memory
+        .add_region(storage_ptr, vec![0xaa; PPC_CGRAF_PORT_SIZE as usize]);
+    let file_template = test_wind_resource((48, 16, 528, 656), 4, false, false, 0, b"Atlas");
+    // The application loaded the 'WIND' with GetResource and sized its
+    // bounds to the screen before calling GetNewCWindow.
+    let handle = PPC_DATA_BASE + 0x2000;
+    let master = handle + 0x10;
+    let mut edited = file_template.clone();
+    edited[..8].copy_from_slice(&[0, 0, 0, 0, 0x01, 0xe0, 0x02, 0x80]);
+    loaded.memory.add_region(handle, vec![0; 0x100]);
+    loaded.memory.write_u32_be(handle, master).unwrap();
+    loaded.memory.write_bytes(master, &edited).unwrap();
+    let current_resource_refnum = *loaded.process_file_system.current_resource_file;
+    loaded.process_file_system.push_vfs_resource(PpcVfsResourceRecord {
+        ref_num: current_resource_refnum,
+        path: "Test App".to_string(),
+        res_type: u32::from_be_bytes(*b"WIND"),
+        res_id: 1999,
+        name: Vec::new(),
+        data: file_template.into(),
+        raw_data: None,
+        raw_attrs: None,
+        attrs: 0,
+        handle,
+    });
+    loaded.cpu.gpr[3] = 1999;
+    loaded.cpu.gpr[4] = storage_ptr;
+    loaded.cpu.gpr[5] = u32::MAX;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(loaded.cpu.gpr[3], storage_ptr);
+    let record = loaded
+        .gworlds
+        .iter()
+        .find(|record| record.port == storage_ptr)
+        .unwrap();
+    assert_eq!((record.width, record.height), (640, 480));
+    assert_eq!(
+        ppc_window_global_content_bounds(&mut loaded.memory, &loaded.gworlds, storage_ptr),
+        Some((0, 0, 480, 640))
     );
 }
 
@@ -3185,9 +3311,14 @@ fn hle_import_runner_tracks_ppc_update_region_until_end_update() {
         "InvalRect must publish a concrete local update region",
     );
 
+    // BeginUpdate leaves the current port alone; the application chooses
+    // where to draw. Macintosh Toolbox Essentials (1992), p. 4-129.
+    loaded
+        .current_gworld
+        .with_mut(|current_gworld| *current_gworld = PPC_MAIN_GWORLD);
     loaded.cpu.gpr[3] = window;
     run_test_import(&mut loaded, PpcImportDispatcherTarget::BeginUpdate);
-    assert_eq!(*loaded.current_gworld, window);
+    assert_eq!(*loaded.current_gworld, PPC_MAIN_GWORLD);
     run_test_import(&mut loaded, PpcImportDispatcherTarget::EndUpdate);
     assert_eq!(
         ppc_read_rgn_bbox(&mut loaded.memory, update_rgn),
@@ -3781,6 +3912,78 @@ fn show_window_does_not_read_dialog_edit_state_as_a_color_table() {
             .read_u32_be(dialog + crate::dialog_manager::DIALOG_EDIT_FIELD_OFFSET),
         Some(edit_state)
     );
+}
+
+/// Shows a hidden window of `proc_id` (a dialog when `dialog_kind`) over a
+/// black probe pixel with `import`, and returns the probe pixel afterwards.
+fn reveal_hidden_window_over_black(import: &[u8], proc_id: u32, dialog_kind: bool) -> Option<u16> {
+    let pef = synthetic_pef_with_import(import);
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let mut last_mem_error = loaded.last_mem_error();
+    let bounds_ptr = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(bounds_ptr, vec![0; 8]);
+    ppc_write_rect(&mut loaded.memory, bounds_ptr, 60, 40, 160, 200).unwrap();
+    let mut window_cpu = loaded.cpu.clone();
+    window_cpu.gpr[3] = 0;
+    window_cpu.gpr[4] = bounds_ptr;
+    window_cpu.gpr[6] = 0;
+    window_cpu.gpr[7] = proc_id;
+    window_cpu.gpr[8] = u32::MAX;
+    let window = ppc_new_cwindow(
+        &window_cpu,
+        None,
+        &mut loaded.memory,
+        test_heap_cursor!(loaded),
+        test_heap_limit!(loaded),
+        &mut last_mem_error,
+        test_handles!(loaded),
+        &mut loaded.gworlds,
+        &mut loaded.window_list,
+        *loaded.current_gdevice,
+    );
+    assert_ne!(window, 0);
+    if dialog_kind {
+        loaded
+            .memory
+            .write_u16_be(
+                window + PPC_CWINDOW_WINDOW_KIND_OFFSET,
+                crate::dialog_manager::DIALOG_WINDOW_KIND,
+            )
+            .unwrap();
+    }
+    let front = ppc_front_buffer_for_gworld(&loaded.gworlds, PPC_MAIN_GWORLD).unwrap();
+    ppc_quickdraw_write_pixel(&mut loaded.memory, front, (120, 110), PPC_RGB_BLACK);
+    loaded.cpu.gpr[3] = window;
+    loaded.cpu.gpr[4] = 1;
+
+    let probe = loaded.run_with_hle_imports(64);
+
+    assert_eq!(probe.handled_import_count, 1);
+    assert_eq!(probe.unsupported_import_index, None);
+    assert_eq!(
+        loaded.memory.read_u8(window + PPC_CWINDOW_VISIBLE_OFFSET),
+        Some(1)
+    );
+    ppc_quickdraw_read_pixel(&mut loaded.memory, front, (120, 110))
+}
+
+#[test]
+fn show_window_erases_a_revealed_movable_modal_dialog_without_a_color_table() {
+    // Macintosh Toolbox Essentials (1992), pp. 4-91 and 4-115: ShowWindow
+    // reveals the window through PaintOne, which erases its content region
+    // with the window's content color (white without a color table).
+    // Super Othello builds its movable-modal "Enter code" dialog hidden and
+    // shows it; the board behind it must not show through the dialog.
+    let white = Some(u16::from(ppc_rgb_color_to_8bpp_index(PPC_RGB_WHITE)));
+    assert_eq!(reveal_hidden_window_over_black(b"ShowWindow", 5, true), white);
+    assert_eq!(reveal_hidden_window_over_black(b"ShowWindow", 0, false), white);
+}
+
+#[test]
+fn show_hide_erases_a_revealed_window_without_a_color_table() {
+    let white = Some(u16::from(ppc_rgb_color_to_8bpp_index(PPC_RGB_WHITE)));
+    assert_eq!(reveal_hidden_window_over_black(b"ShowHide", 5, true), white);
+    assert_eq!(reveal_hidden_window_over_black(b"ShowHide", 4, false), white);
 }
 
 #[test]
@@ -5326,10 +5529,13 @@ fn window_invalidation_update_and_drawing_commands_dispatch_with_canonical_evalu
             loaded.cpu.pc = loaded.entry_pc;
             loaded.cpu.lr = PPC_HALT_PC;
             loaded.cpu.gpr[3] = window;
+            loaded
+                .current_gworld
+                .with_mut(|current_gworld| *current_gworld = PPC_MAIN_GWORLD);
             let probe = loaded.run_with_hle_imports(64);
             assert_eq!(probe.handled_import_count, 1);
             assert_eq!(probe.unsupported_import_index, None);
-            assert_eq!(*loaded.current_gworld, window);
+            assert_eq!(*loaded.current_gworld, PPC_MAIN_GWORLD);
 
             // EndUpdate empties update region
             loaded.imports[0].dispatcher_target = dispatcher_target_for_import(std::str::from_utf8(lib).unwrap(), "EndUpdate");

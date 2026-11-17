@@ -533,6 +533,7 @@ pub enum PpcImportDispatcherTarget {
     EqualPt,
     AddPt,
     SubPt,
+    DeltaPoint,
     LocalToGlobal,
     GlobalToLocal,
     PtInRect,
@@ -972,6 +973,7 @@ pub enum PpcImportDispatcherTarget {
     NumToString,
     NumToCString,
     StringToNum,
+    CStringToNum,
     Random,
     SetQDGlobalsRandomSeed,
     GetQDGlobalsRandomSeed,
@@ -1106,6 +1108,7 @@ pub enum PpcImportDispatcherTarget {
     ICGetSeed,
     ICGetComponentInstance,
     ICParseURL,
+    ICLaunchURL,
     ICGetPref,
     ICCountMapEntries,
     ICGetIndMapEntry,
@@ -3680,6 +3683,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "GlobalToLocal") => PpcImportDispatcherTarget::GlobalToLocal,
         ("InterfaceLib", "AddPt") => PpcImportDispatcherTarget::AddPt,
         ("InterfaceLib", "SubPt") => PpcImportDispatcherTarget::SubPt,
+        ("InterfaceLib", "DeltaPoint") => PpcImportDispatcherTarget::DeltaPoint,
         ("InterfaceLib" | "AppearanceLib" | "CarbonLib", "MenuKey" | "menukey") => {
             PpcImportDispatcherTarget::MenuKey
         }
@@ -5356,8 +5360,8 @@ pub(crate) fn dispatcher_target_for_import(
         ) => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
         (
             "Translation",
-            "CanDocBeOpened" | "ExtendFileTypeList" | "GetFileTranslationPaths"
-            | "GetPathFromTranslationDialog" | "TranslateFile",
+            "CanDocBeOpened" | "ExtendFileTypeList" | "GetPathFromTranslationDialog"
+            | "TranslateFile",
         ) => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
         // These Text Encoding Converter entry points have no conversion path: kTECNoConversionPathErr.
         (
@@ -5370,9 +5374,11 @@ pub(crate) fn dispatcher_target_for_import(
         (
             "InterfaceLib",
             "OpenComponent" | "RegisterComponentResource" | "CloseComponentResFile"
-            | "UnregisterComponent" | "GetNextFOND" | "GetMCInfo" | "DeltaPoint",
+            | "UnregisterComponent" | "GetNextFOND" | "GetMCInfo",
         )
-        | ("QuickTimeLib", "MCIsPlayerEvent") => PpcImportDispatcherTarget::ReturnNoErr,
+        | ("QuickTimeLib", "MCIsPlayerEvent")
+        // short GetFileTranslationPaths(...) returns a path count, not an OSErr.
+        | ("Translation", "GetFileTranslationPaths") => PpcImportDispatcherTarget::ReturnNoErr,
         (
             "InterfaceLib",
             "PicComment" | "SpaceExtra" | "SysBreakStr" | "DisposeMCInfo" | "ResizePalette"
@@ -5403,6 +5409,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib" | "CarbonLib", "NumToString") => PpcImportDispatcherTarget::NumToString,
         ("InterfaceLib", "numtostring") => PpcImportDispatcherTarget::NumToCString,
         ("InterfaceLib" | "CarbonLib", "StringToNum") => PpcImportDispatcherTarget::StringToNum,
+        ("InterfaceLib", "stringtonum") => PpcImportDispatcherTarget::CStringToNum,
         ("InterfaceLib", "Random") => PpcImportDispatcherTarget::Random,
         ("InterfaceLib" | "CarbonLib", "GetQDGlobalsRandomSeed" | "getqdglobalsrandomseed") => {
             PpcImportDispatcherTarget::GetQDGlobalsRandomSeed
@@ -5619,6 +5626,9 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("InterfaceLib" | "ICAp;InternetConfigLib" | "InternetConfigLib", "ICParseURL") => {
             PpcImportDispatcherTarget::ICParseURL
+        }
+        ("InterfaceLib" | "ICAp;InternetConfigLib" | "InternetConfigLib", "ICLaunchURL") => {
+            PpcImportDispatcherTarget::ICLaunchURL
         }
         ("InterfaceLib", "GetCurrentProcess" | "GetFrontProcess") => {
             PpcImportDispatcherTarget::GetCurrentProcess

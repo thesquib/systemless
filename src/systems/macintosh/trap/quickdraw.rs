@@ -519,6 +519,35 @@ struct ScrollRows {
     background: [u8; 8],
 }
 
+/// Canonical RGB values of the eight classic QuickDraw colors, in `QDColors`
+/// order: black, yellow, magenta, red, cyan, green, blue, white. Color
+/// QuickDraw uses these rather than pure primaries; green uses 0x8000 to match
+/// the System 7.5.3 ROM `clut` 127 rather than Executor's diverging 0x64AF.
+pub(crate) const LEGACY_QD_COLOR_RGB: [(u16, u16, u16); 8] = [
+    (0x0000, 0x0000, 0x0000), // blackColor (33)
+    (0xFC00, 0xF37D, 0x052F), // yellowColor (69)
+    (0xF2D7, 0x0856, 0x84EC), // magentaColor (137)
+    (0xDD6B, 0x08C2, 0x06A2), // redColor (205)
+    (0x0241, 0xAB54, 0xEAFF), // cyanColor (273)
+    (0x0000, 0x8000, 0x11B0), // greenColor (341)
+    (0x0000, 0x0000, 0xD400), // blueColor (409)
+    (0xFFFF, 0xFFFF, 0xFFFF), // whiteColor (30)
+];
+
+/// Map a classic planar color value (`xxxC MYBr gbwb`, Inside Macintosh I-158)
+/// to its `QDColors` index the way Color QuickDraw's ForeColor/BackColor do
+/// (QDUtil.a): a clear normal bit (bit 0) means white, otherwise the cyan,
+/// magenta and yellow plane bits 8..6 select the entry. Other bits are ignored,
+/// so non-canonical values such as 139 (magenta) or 197 (red) resolve to a
+/// QuickDraw color rather than an unrelated CLUT entry.
+pub(crate) fn legacy_qd_color_plane_index(color: u32) -> usize {
+    if color & 1 == 0 {
+        7
+    } else {
+        ((color >> 6) & 7) as usize
+    }
+}
+
 impl super::TrapDispatcher {
     /// Install a basic QuickDraw bit pattern in a color port without changing
     /// the caller-owned color PixPat that was previously installed there.
@@ -7662,12 +7691,7 @@ impl super::TrapDispatcher {
                                 requested_right,
                             )
                         };
-                        // Keep offscreen scanlines 16-byte aligned without
-                        // adding padding when the visible width is already
-                        // aligned. Applications can copy complete scanlines
-                        // directly between GWorlds and the screen.
-                        let visible_row_bytes = (width * depth).div_ceil(8);
-                        let row_bytes = visible_row_bytes.div_ceil(16) * 16;
+                        let row_bytes = Self::offscreen_row_bytes(width, depth);
 
                         // IM:VI 21-13: noNewDevice uses the supplied GDevice's
                         // depth and color table; custom cTable requires an
@@ -7951,8 +7975,7 @@ impl super::TrapDispatcher {
                         let new_width = ((new_right as i32) - (new_left as i32)).max(1) as u32;
                         let new_height = ((new_bottom as i32) - (new_top as i32)).max(1) as u32;
 
-                        let visible_row_bytes = (new_width * depth).div_ceil(8);
-                        let new_row_bytes = visible_row_bytes.div_ceil(16) * 16;
+                        let new_row_bytes = Self::offscreen_row_bytes(new_width, depth);
                         let new_buf_size = new_row_bytes * new_height;
 
                         let mut result_flags: u32 = 0;
@@ -11220,6 +11243,7 @@ impl super::TrapDispatcher {
                                         self.fg_color = rgb;
                                         self.bg_color = rgb;
                                     }
+                                    self.generated_fill_rgb = rgb;
                                 }
                             } else {
                                 bus.read_bytes_into(port + 40, &mut pattern);
@@ -11235,6 +11259,7 @@ impl super::TrapDispatcher {
                     0x0BD => self.draw_arc(cpu, bus, &r, previous_argument, last_argument, op),
                     _ => self.draw_rect(cpu, bus, &r, op),
                 }
+                self.generated_fill_rgb = None;
                 self.fg_color = saved_fg;
                 self.bg_color = saved_bg;
                 Ok(())
@@ -13901,7 +13926,9 @@ impl super::TrapDispatcher {
                     let saved_bg = self.bg_color;
                     self.fg_color = rgb;
                     self.bg_color = rgb;
+                    self.generated_fill_rgb = Some(rgb);
                     self.draw_rect(cpu, bus, &r, ShapeOp::Fill([0xFF; 8]));
+                    self.generated_fill_rgb = None;
                     self.fg_color = saved_fg;
                     self.bg_color = saved_bg;
                     true
@@ -14000,7 +14027,9 @@ impl super::TrapDispatcher {
                         self.fg_color = rgb;
                         self.bg_color = rgb;
                     }
+                    self.generated_fill_rgb = generated_rgb;
                     self.draw_oval(cpu, bus, &r, ShapeOp::Fill(pat));
+                    self.generated_fill_rgb = None;
                     self.fg_color = saved_fg;
                     self.bg_color = saved_bg;
                 }
@@ -14053,7 +14082,9 @@ impl super::TrapDispatcher {
                         self.fg_color = rgb;
                         self.bg_color = rgb;
                     }
+                    self.generated_fill_rgb = generated_rgb;
                     self.draw_round_rect(cpu, bus, &r, oval_width, oval_height, ShapeOp::Fill(pat));
+                    self.generated_fill_rgb = None;
                     self.fg_color = saved_fg;
                     self.bg_color = saved_bg;
                 }
@@ -14108,7 +14139,9 @@ impl super::TrapDispatcher {
                         self.fg_color = rgb;
                         self.bg_color = rgb;
                     }
+                    self.generated_fill_rgb = generated_rgb;
                     self.draw_arc(cpu, bus, &r, start_angle, arc_angle, ShapeOp::Fill(pat));
+                    self.generated_fill_rgb = None;
                     self.fg_color = saved_fg;
                     self.bg_color = saved_bg;
                 }
@@ -14160,7 +14193,9 @@ impl super::TrapDispatcher {
                             self.fg_color = rgb;
                             self.bg_color = rgb;
                         }
+                        self.generated_fill_rgb = generated_rgb;
                         self.draw_rgn(cpu, bus, rgn_handle, ShapeOp::Fill(pat));
+                        self.generated_fill_rgb = None;
                         self.fg_color = saved_fg;
                         self.bg_color = saved_bg;
                     }
@@ -14212,7 +14247,9 @@ impl super::TrapDispatcher {
                         self.fg_color = rgb;
                         self.bg_color = rgb;
                     }
+                    self.generated_fill_rgb = generated_rgb;
                     self.draw_poly(cpu, bus, poly_handle, ShapeOp::Fill(pat));
+                    self.generated_fill_rgb = None;
                     self.fg_color = saved_fg;
                     self.bg_color = saved_bg;
                 }
@@ -19967,6 +20004,17 @@ impl super::TrapDispatcher {
         true
     }
 
+    /// Scanline stride of a NewGWorld/UpdateGWorld pixel buffer.
+    ///
+    /// NewGWorld long-aligns the visible scanline, adds four bytes of slop
+    /// and then aligns the stride to 16 bytes, so a 640-pixel 8-bit row is
+    /// 656 bytes, 74 pixels take 80 and 78 pixels take 96. Applications that
+    /// saved GWorld pixels at that stride and read them straight back into
+    /// a GWorld (Gridz) depend on the padding. PowerPC GWorlds share it.
+    pub(crate) fn offscreen_row_bytes(width: u32, depth: u32) -> u32 {
+        ((width * depth).div_ceil(8).next_multiple_of(4) + 4).next_multiple_of(16)
+    }
+
     fn row_bytes_for_depth(width: u16, depth: u16) -> Option<u32> {
         match depth {
             1 => Some(u32::from(width).div_ceil(8)),
@@ -24110,28 +24158,7 @@ impl super::TrapDispatcher {
     /// Convert classic ForeColor/BackColor constants to RGB.
     /// Inside Macintosh Volume I (1985), pp. I-173 to I-174.
     fn legacy_qd_color_to_rgb(color: u32) -> (u16, u16, u16) {
-        match color {
-            30 => (0xFFFF, 0xFFFF, 0xFFFF), // whiteColor
-            33 => (0, 0, 0),                // blackColor
-            // Color QuickDraw uses canonical RGB values for the classic
-            // ForeColor/BackColor constants rather than pure primaries.
-            // greenColor (341) uses 0x8000 for green to match System 7.5.3
-            // ROM rather than Executor's diverging 0x64AF.
-            69 => (0xFC00, 0xF37D, 0x052F), // yellowColor
-            // System 7.5.3 normalizes 139 to the same cGrafPort fgColor and
-            // rgbFgColor as the documented magentaColor constant 137. The
-            // extra legacy color-plane bit must not turn into CLUT index 139.
-            137 | 139 => (0xF2D7, 0x0856, 0x84EC), // magentaColor
-            205 => (0xDD6B, 0x08C2, 0x06A2),       // redColor
-            273 => (0x0241, 0xAB54, 0xEAFF),       // cyanColor
-            341 => (0x0000, 0x8000, 0x11B0),       // greenColor
-            409 => (0x0000, 0x0000, 0xD400),       // blueColor
-            _ => {
-                let idx = (color as usize) & 0xFF;
-                let [r, g, b] = Self::standard_mac_8bpp_clut()[idx];
-                (r, g, b)
-            }
-        }
+        LEGACY_QD_COLOR_RGB[legacy_qd_color_plane_index(color)]
     }
 
     fn set_entries_request_in_range(

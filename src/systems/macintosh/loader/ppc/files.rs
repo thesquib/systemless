@@ -2487,6 +2487,19 @@ pub(super) fn ppc_existing_path_for_fsspec(
     fallback_path.ok_or(PPC_DIR_NF_ERR)
 }
 
+/// A data-fork open names a file. When the exact path is a directory the open
+/// fails with `notAFileErr`, rather than searching other directories for a
+/// file of the same name.
+fn ppc_refuse_directory_data_open(
+    vfs_directories: &[PpcVfsDirectory],
+    path: &str,
+) -> Result<(), i16> {
+    match ppc_directory_id_for_path(vfs_directories, path) {
+        Some(_) => Err(PPC_NOT_A_FILE_ERR),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn ppc_existing_data_path_for_fsspec(
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
@@ -2513,6 +2526,7 @@ pub(super) fn ppc_existing_data_path_for_fsspec(
     }
     if let Some(parent_path) = ppc_directory_path_for_id(vfs_directories, dir_id) {
         let path = ppc_join_vfs_path(parent_path, &normalized_name);
+        ppc_refuse_directory_data_open(vfs_directories, &path)?;
         if let Some(index) = ppc_vfs_file_index(vfs_files, &path) {
             if vfs_files[index].data.is_empty() {
                 if let Some(non_empty_path) =
@@ -3804,6 +3818,9 @@ pub(super) fn ppc_open_data_fork_by_name(
             return PPC_DIR_NF_ERR;
         };
         let requested_path = ppc_join_vfs_path(parent_path, &name);
+        if let Err(error) = ppc_refuse_directory_data_open(vfs_directories, &requested_path) {
+            return error;
+        }
         ppc_vfs_file_index(vfs_files, &requested_path)
             .map(|index| vfs_files[index].path.clone())
             .or_else(|| ppc_vfs_file_path_by_suffix_or_unique_basename(vfs_files, &name))
@@ -3837,6 +3854,7 @@ pub(super) fn ppc_pbh_open_df(
     cpu: &PpcCpu,
     memory: &mut PpcSectionMem,
     vfs_directories: &[PpcVfsDirectory],
+    vfs_volumes: &[PpcVfsVolumeRecord],
     vfs_files: &mut [PpcVfsFileRecord],
     files: &mut Vec<PpcFileRecord>,
     writable_refnums: &mut HashSet<u16>,
@@ -3856,6 +3874,11 @@ pub(super) fn ppc_pbh_open_df(
     let Some(dir_id) = memory.read_u32_be(pb + 48) else {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     };
+    let Some(vref) = memory.read_u16_be(pb + 22).map(|value| value as i16) else {
+        return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
+    };
+    // A mounted volume's root (dirID 2) is its own directory, not the boot root.
+    let dir_id = process_volume_dir_id(vfs_volumes, vref, dir_id);
     let Some(raw_permission) = memory.read_u8(pb + 27) else {
         return ppc_complete_pb(memory, pb, PPC_PARAM_ERR);
     };
@@ -3878,6 +3901,12 @@ pub(super) fn ppc_pbh_open_df(
     }
     let exact_path = ppc_directory_path_for_id(vfs_directories, dir_id)
         .map(|parent| ppc_join_vfs_path(parent, &name));
+    if let Some(Err(error)) = exact_path
+        .as_deref()
+        .map(|path| ppc_refuse_directory_data_open(vfs_directories, path))
+    {
+        return ppc_complete_pb(memory, pb, error);
+    }
     let path = exact_path
         .as_deref()
         .and_then(|path| {
@@ -4125,7 +4154,9 @@ pub(super) fn ppc_pb_read(
         return ppc_complete_pb(memory, pb, PPC_POS_ERR);
     }
     let requested_len = usize::try_from(requested_count).unwrap_or(usize::MAX);
-    let read_len = requested_len.min(vfs_file.data.len().saturating_sub(start));
+    let extent =
+        crate::file_manager::read_extent(&vfs_file.data[start..], requested_len, position_mode);
+    let read_len = extent.len;
     if read_len != 0
         && (buffer_ptr == 0 || !ppc_memory_can_write_bytes(memory, buffer_ptr, read_len as u32))
     {
@@ -4144,11 +4175,7 @@ pub(super) fn ppc_pb_read(
     files[file_index].position = new_position;
     let _ = memory.write_u32_be(pb + 40, read_len as u32);
     let _ = memory.write_u32_be(pb + 46, new_position);
-    let result = if read_len < requested_len {
-        PPC_EOF_ERR
-    } else {
-        PPC_NO_ERR
-    };
+    let result = if extent.eof { PPC_EOF_ERR } else { PPC_NO_ERR };
     if std::env::var_os("SYSTEMLESS_PPC_FILE_TRACE").is_some() {
         eprintln!("[PPC-FILE-TRACE] PBRead path=\"{}\" start={} requested={} read={} result={}", vfs_file.path, start, requested_len, read_len, result);
     }

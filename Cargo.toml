@@ -1,6 +1,6 @@
 [package]
 name = "systemless"
-version = "0.124.0"
+version = "0.125.0"
 edition = "2021"
 rust-version = "1.93"
 # Emulator code is GPL-3.0-or-later.
@@ -36,8 +36,8 @@ resolver = "2"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-m68k = { version = "0.14.7" }
-ppc = "0.8.0"
+m68k = { version = "0.17.0" }
+ppc = "0.8.1"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

@@ -3116,6 +3116,158 @@
         }
     }
 
+    /// Push one argument and dispatch a QuickDraw trap that takes it.
+    fn qd_call_long(
+        d: &mut TrapDispatcher,
+        cpu: &mut impl CpuOps,
+        bus: &mut MacMemoryBus,
+        trap: u16,
+        arg: u32,
+    ) {
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, arg);
+        assert!(d.dispatch_quickdraw(true, trap, cpu, bus).unwrap().is_ok());
+    }
+
+    fn one_bit_rows(bus: &MacMemoryBus, base: u32, row_bytes: u32, rows: u32) -> Vec<String> {
+        (0..rows)
+            .map(|row| {
+                bus.read_bytes(base + row * row_bytes, 2)
+                    .iter()
+                    .map(|byte| format!("{byte:08b}"))
+                    .collect::<String>()
+                    .replace('0', ".")
+                    .replace('1', "#")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_bit_gworld_paints_with_the_white_foreground_like_color_quickdraw() {
+        // Diamonds 3D builds its ball masks in a 1-bit GWorld with
+        // ForeColor(whiteColor); PaintRect(r); ForeColor(blackColor);
+        // InsetRect(r, 1, 1); PaintOval(r). Color QuickDraw inks a one-bit
+        // destination with the low bits of the port's resolved fgColor and
+        // bkColor pixels (QDUtil.a ColorMap, DoOneBit), so the white PaintRect
+        // clears the mask and only the oval stays set. Painting black
+        // regardless of the foreground left an opaque square behind the ball.
+        let (mut d, mut cpu, mut bus) = setup();
+        let bounds_ptr = 0x300000u32;
+        let gworld_ptr_ptr = 0x300100u32;
+        write_rect(&mut bus, bounds_ptr, 0, 0, 8, 16);
+        cpu.write_reg(Register::A7, TEST_SP);
+        bus.write_long(TEST_SP, 0u32);
+        bus.write_long(TEST_SP + 4, 0u32);
+        bus.write_long(TEST_SP + 8, 0u32);
+        bus.write_long(TEST_SP + 12, bounds_ptr);
+        bus.write_word(TEST_SP + 16, 1u16);
+        bus.write_long(TEST_SP + 18, gworld_ptr_ptr);
+        assert!(d
+            .dispatch_quickdraw(true, 0x31D, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        let gworld = bus.read_long(gworld_ptr_ptr);
+        let gdh = d.gworld_devices.get(&gworld).copied().unwrap_or(0);
+        cpu.write_reg(Register::A7, TEST_SP);
+        cpu.write_reg(Register::D0, 0x0008_0006);
+        bus.write_long(TEST_SP, gdh);
+        bus.write_long(TEST_SP + 4, gworld);
+        assert!(d
+            .dispatch_quickdraw(true, 0x31D, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        assert_eq!(*d.current_port, gworld);
+        let pm_ptr = bus.read_long(bus.read_long(gworld + 2));
+        assert_eq!(
+            bus.read_word(pm_ptr + 32),
+            1,
+            "the GWorld must be one bit deep"
+        );
+        let base = TrapDispatcher::offscreen_pixmap_base_ptr(&bus, pm_ptr);
+        let row_bytes = u32::from(bus.read_word(pm_ptr + 4) & 0x3FFF);
+        for row in 0..8 {
+            bus.write_bytes(base + row * row_bytes, &[0xFF, 0xFF]);
+        }
+
+        let rect = bus.alloc(8);
+        write_rect(&mut bus, rect, 0, 0, 8, 16);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x062, 30); // ForeColor(whiteColor)
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x0A2, rect); // PaintRect
+        assert_eq!(
+            one_bit_rows(&bus, base, row_bytes, 8),
+            vec!["................"; 8],
+            "a white foreground must clear the one-bit mask"
+        );
+
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x062, 33); // ForeColor(blackColor)
+        write_rect(&mut bus, rect, 0, 4, 8, 12);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x0B8, rect); // PaintOval
+        let rows = one_bit_rows(&bus, base, row_bytes, 8);
+        assert!(
+            rows.iter()
+                .all(|row| row[..4].chars().all(|c| c == '.') && row[12..].chars().all(|c| c == '.')),
+            "a black oval must leave the cleared corners transparent: {rows:#?}"
+        );
+        assert!(rows[4].contains('#'), "the oval must be painted: {rows:#?}");
+    }
+
+    #[test]
+    fn basic_grafport_one_bit_inks_follow_the_classic_normal_bit() {
+        // QDUtil.a ColorMap (remapOld1bit): on a basic GrafPort drawing into a
+        // one-bit bitmap with colrBit 0, a foreground whose normal bit is
+        // clear (whiteColor) paints white and a background whose normal bit is
+        // set (any colour but whiteColor) erases black. Inside Macintosh
+        // Volume I (1985), pp. I-158 and I-173.
+        let (mut d, mut cpu, mut bus) = setup();
+        let base = bus.alloc(2 * 4);
+        let port = bus.alloc(108);
+        write_bitmap_1bpp(&mut bus, port + 2, base, 2, (0, 0, 4, 16));
+        write_rect(&mut bus, port + 16, 0, 0, 4, 16);
+        let vis = make_complex_rgn(&mut bus, (0, 0, 4, 16), &[]);
+        let clip = make_complex_rgn(&mut bus, (0, 0, 4, 16), &[]);
+        bus.write_long(port + 24, vis);
+        bus.write_long(port + 28, clip);
+        d.set_current_port_state(&mut bus, &mut cpu, port, None);
+        d.pn_pat = [0xFF; 8];
+        d.bk_pat = [0x00; 8];
+        d.pn_mode = 8;
+        let rect = bus.alloc(8);
+
+        bus.write_bytes(base, &[0xFF; 8]);
+        write_rect(&mut bus, rect, 0, 0, 1, 16);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x062, 30); // ForeColor(whiteColor)
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x0A2, rect); // PaintRect
+
+        write_rect(&mut bus, rect, 1, 0, 2, 16);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x062, 205); // ForeColor(redColor)
+        bus.write_bytes(base + 2, &[0x00, 0x00]);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x0A2, rect); // PaintRect
+
+        write_rect(&mut bus, rect, 2, 0, 3, 16);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x063, 33); // BackColor(blackColor)
+        bus.write_bytes(base + 4, &[0x00, 0x00]);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x0A3, rect); // EraseRect
+
+        assert_eq!(
+            one_bit_rows(&bus, base, 2, 4),
+            vec![
+                "................",
+                "################",
+                "################",
+                "################"
+            ],
+            "whiteColor paints white, other foregrounds black, a black background erases black"
+        );
+
+        // A negative colrBit keeps the black-on-white defaults.
+        bus.write_word(port + 88, 0xFFFF);
+        write_rect(&mut bus, rect, 3, 0, 4, 16);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x062, 30); // ForeColor(whiteColor)
+        bus.write_bytes(base + 6, &[0x00, 0x00]);
+        qd_call_long(&mut d, &mut cpu, &mut bus, 0x0A2, rect); // PaintRect
+        assert_eq!(one_bit_rows(&bus, base, 2, 4)[3], "################");
+    }
+
     #[test]
     fn gpu_classic_glyph_rows_match_software_at_every_depth_and_transfer() {
         for depth in [1, 2, 4, 8, 16, 32] {
@@ -16654,6 +16806,35 @@ fn copy_bits_converts_between_direct_color_depths() {
     }
 
     #[test]
+    fn fore_and_back_color_select_quickdraw_colors_from_cmy_plane_bits() {
+        // Color QuickDraw's ForeColor/BackColor (QDUtil.a) ignore every bit
+        // of the planar value except normal (bit 0) and cyan/magenta/yellow
+        // (bits 8..6). 500 Cards' heart and diamond PICTs record FgColor 197
+        // (normal + yellow + magenta + blue bit), which is red, not CLUT 197.
+        let cases = [
+            (197u32, (0xDD6B, 0x08C2, 0x06A2)), // red planes + stray blue bit
+            (0x0001, (0x0000, 0x0000, 0x0000)), // normal, no planes: black
+            (0x0000, (0xFFFF, 0xFFFF, 0xFFFF)), // normal bit clear: white
+            (0x0155, (0x0000, 0x8000, 0x11B0)), // greenColor
+            (0x0141, (0x0000, 0x8000, 0x11B0)), // green planes only
+            (0x01C1, (0xFFFF, 0xFFFF, 0xFFFF)), // all CMY planes: white entry
+        ];
+        for (color, rgb) in cases {
+            let (mut d, mut cpu, mut bus) = setup_with_port();
+            bus.write_long(TEST_SP, color);
+            let result = d.dispatch_quickdraw(true, 0x062, &mut cpu, &mut bus);
+            assert!(result.unwrap().is_ok());
+            assert_eq!(d.fg_color, rgb, "ForeColor({color})");
+
+            cpu.write_reg(Register::A7, TEST_SP);
+            bus.write_long(TEST_SP, color);
+            let result = d.dispatch_quickdraw(true, 0x063, &mut cpu, &mut bus);
+            assert!(result.unwrap().is_ok());
+            assert_eq!(d.bg_color, rgb, "BackColor({color})");
+        }
+    }
+
+    #[test]
     fn fore_color_resolves_the_cgrafport_foreground_pixel() {
         let (mut d, mut cpu, mut bus) = setup_with_port();
         let port = 0x181000u32;
@@ -18486,6 +18667,51 @@ fn copy_bits_converts_between_direct_color_depths() {
             0,
             "FillCRect must preserve pixels outside the requested rectangle"
         );
+    }
+
+    #[test]
+    fn makergbpat_fill_ignores_port_resolved_foreground_pixel() {
+        // IM:V V-73: a MakeRGBPat pattern approximates its requested color
+        // whatever the port's colors are. Lose Your Marbles! sets ForeColor
+        // to black (resolving fgColor) and then fills its Help tabs with a
+        // gray MakeRGBPat pattern; those fills must stay gray, not black.
+        let (mut d, mut cpu, mut bus) = setup_with_port();
+        let (screen_base, row_bytes) = setup_color_polygon_surface(&mut d, &cpu, &mut bus);
+        let requested = (0xCCCD, 0xCCCD, 0xCCCD);
+        d.device_clut.replace([[0xFFFF, 0xFFFF, 0xFFFF]; 256]);
+        d.device_clut.set_entry(7, [requested.0, requested.1, requested.2]);
+        d.device_clut.set_entry(255, [0, 0, 0]);
+        let port = *d.current_port;
+        bus.write_long(port + 80, 255);
+        bus.write_long(port + 84, 0);
+        d.resolved_port_color_fields.insert(port, 0x03);
+
+        let color_ptr = bus.alloc(6);
+        bus.write_word(color_ptr, requested.0);
+        bus.write_word(color_ptr + 2, requested.1);
+        bus.write_word(color_ptr + 4, requested.2);
+        let rect_ptr = bus.alloc(8);
+        for (trap, top) in [(0x20E, 10), (0x20F, 30)] {
+            let pp_handle =
+                make_pixpat_handle(&mut bus, [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55]);
+            cpu.write_reg(Register::A7, TEST_SP);
+            bus.write_long(TEST_SP, color_ptr);
+            bus.write_long(TEST_SP + 4, pp_handle);
+            assert!(d.dispatch_quickdraw(true, 0x20D, &mut cpu, &mut bus).unwrap().is_ok());
+
+            write_rect(&mut bus, rect_ptr, top, 10, top + 16, 26);
+            cpu.write_reg(Register::A7, TEST_SP);
+            bus.write_long(TEST_SP, pp_handle);
+            bus.write_long(TEST_SP + 4, rect_ptr);
+            assert!(d.dispatch_quickdraw(true, trap, &mut cpu, &mut bus).unwrap().is_ok());
+            assert_eq!(
+                read_surface_pixel(&bus, screen_base, row_bytes, 18, top as u32 + 8),
+                7,
+                "trap ${trap:03X} must fill with the MakeRGBPat color, not the port's black fgColor"
+            );
+        }
+        assert_eq!(bus.read_long(port + 80), 255, "the port's fgColor is untouched");
+        assert!(d.generated_fill_rgb.is_none());
     }
 
     #[test]
@@ -22630,7 +22856,37 @@ fn copy_bits_converts_between_direct_color_depths() {
         let gworld = bus.read_long(gworld_ptr_ptr);
         let pixmap_handle = bus.read_long(gworld + 2);
         let pixmap = bus.read_long(pixmap_handle);
-        assert_eq!(bus.read_word(pixmap + 4) & 0x3FFF, 640);
+        // NewGWorld pads even 16-byte-aligned scanlines. Gridz stores its
+        // 640x460 title image at this 656-byte stride and reads it straight
+        // into the GWorld; a 640-byte stride shears the board into stripes.
+        assert_eq!(bus.read_word(pixmap + 4) & 0x3FFF, 656);
+    }
+
+    #[test]
+    fn offscreen_row_bytes_pad_long_aligned_rows_to_sixteen_bytes() {
+        // Strides Gridz stored for its GWorld images (8-bit) and Angel Egg's
+        // 384-pixel 8- and 16-bit rows.
+        for (width, depth, expected) in [
+            (13, 8, 32),
+            (18, 8, 32),
+            (31, 8, 48),
+            (33, 8, 48),
+            (45, 8, 64),
+            (74, 8, 80),
+            (78, 8, 96),
+            (84, 8, 96),
+            (144, 8, 160),
+            (640, 8, 656),
+            (384, 8, 400),
+            (384, 16, 784),
+            (100, 1, 32),
+        ] {
+            assert_eq!(
+                TrapDispatcher::offscreen_row_bytes(width, depth),
+                expected,
+                "{width}x{depth}"
+            );
+        }
     }
 
     #[test]

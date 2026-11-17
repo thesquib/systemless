@@ -400,6 +400,47 @@ fn peerless_interprocess_imports_succeed() {
 }
 
 #[test]
+fn top_map_handle_accessors_share_the_low_memory_global() {
+    use crate::memory::globals::addr;
+    let mut loaded = loaded_with(b"LMSetTopMapHndl");
+    loaded.cpu.gpr[3] = 0x1234_5678;
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "LMSetTopMapHndl"),
+    );
+    assert_eq!(loaded.memory.read_u32_be(addr::TOP_MAP_HNDL), Some(0x1234_5678));
+    loaded.cpu.gpr[3] = 0;
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "LMGetTopMapHndl"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], 0x1234_5678);
+}
+
+#[test]
+fn fractional_width_setters_share_the_low_memory_global() {
+    let mut loaded = loaded_with(b"SetFractEnable");
+    for (symbol, value) in [("SetFractEnable", 1), ("LMSetFractEnable", 0)] {
+        loaded.cpu.gpr[3] = value;
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        run_test_import(
+            &mut loaded,
+            dispatcher_target_for_import("InterfaceLib", "LMGetFractEnable"),
+        );
+        assert_eq!(loaded.cpu.gpr[3], value, "{symbol}");
+    }
+}
+
+#[test]
+fn screen_resolution_accessors_report_the_seeded_72_dpi() {
+    let mut loaded = loaded_with(b"LMGetScrHRes");
+    for symbol in ["LMGetScrHRes", "LMGetScrVRes"] {
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        assert_eq!(loaded.cpu.gpr[3], 72, "{symbol}");
+    }
+}
+
+#[test]
 fn ppc_open_and_close_complete_their_parameter_blocks() {
     let mut loaded = loaded_with(b"PPCOpenSync");
     let pb = SCRATCH;
@@ -442,47 +483,6 @@ fn icon_id_to_rgn_reports_failure_instead_of_leaving_the_region_stale() {
         dispatcher_target_for_import("InterfaceLib", "IconIDToRgn"),
     );
     assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_PARAM_ERR));
-}
-
-#[test]
-fn top_map_handle_accessors_share_the_low_memory_global() {
-    use crate::memory::globals::addr;
-    let mut loaded = loaded_with(b"LMSetTopMapHndl");
-    loaded.cpu.gpr[3] = 0x1234_5678;
-    run_test_import(
-        &mut loaded,
-        dispatcher_target_for_import("InterfaceLib", "LMSetTopMapHndl"),
-    );
-    assert_eq!(loaded.memory.read_u32_be(addr::TOP_MAP_HNDL), Some(0x1234_5678));
-    loaded.cpu.gpr[3] = 0;
-    run_test_import(
-        &mut loaded,
-        dispatcher_target_for_import("InterfaceLib", "LMGetTopMapHndl"),
-    );
-    assert_eq!(loaded.cpu.gpr[3], 0x1234_5678);
-}
-
-#[test]
-fn fractional_width_setters_share_the_low_memory_global() {
-    let mut loaded = loaded_with(b"SetFractEnable");
-    for (symbol, value) in [("SetFractEnable", 1), ("LMSetFractEnable", 0)] {
-        loaded.cpu.gpr[3] = value;
-        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
-        run_test_import(
-            &mut loaded,
-            dispatcher_target_for_import("InterfaceLib", "LMGetFractEnable"),
-        );
-        assert_eq!(loaded.cpu.gpr[3], value, "{symbol}");
-    }
-}
-
-#[test]
-fn screen_resolution_accessors_report_the_seeded_72_dpi() {
-    let mut loaded = loaded_with(b"LMGetScrHRes");
-    for symbol in ["LMGetScrHRes", "LMGetScrVRes"] {
-        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
-        assert_eq!(loaded.cpu.gpr[3], 72, "{symbol}");
-    }
 }
 
 #[test]
@@ -690,6 +690,50 @@ fn classic_fcb_pointer_accessor_reads_current_low_memory_without_dereferencing()
 }
 
 #[test]
+fn absent_manager_imports_return_their_documented_errors() {
+    for (library, symbol, error) in [
+        ("InterfaceLib", "SCSIGet", 2),
+        ("InterfaceLib", "OpenEdition", PPC_PARAM_ERR),
+        ("InterfaceLib", "OpenComponentResFile", PPC_PARAM_ERR),
+        ("Translation", "TranslateFile", PPC_PARAM_ERR),
+        ("TextCommon", "TECGetInfo", -8749),
+    ] {
+        assert_eq!(
+            dispatcher_target_for_import(library, symbol),
+            PpcImportDispatcherTarget::ReturnError(error),
+            "{symbol}"
+        );
+    }
+    for (library, symbol) in [
+        ("InterfaceLib", "OpenComponent"),
+        ("InterfaceLib", "RegisterComponentResource"),
+        ("InterfaceLib", "GetNextFOND"),
+        ("QuickTimeLib", "MCIsPlayerEvent"),
+        ("Translation", "GetFileTranslationPaths"),
+    ] {
+        assert_eq!(
+            dispatcher_target_for_import(library, symbol),
+            PpcImportDispatcherTarget::ReturnNoErr,
+            "{symbol}"
+        );
+    }
+
+    let mut loaded = loaded_with(b"SCSIGet");
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "SCSIGet"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(2));
+    for symbol in ["PicComment", "SpaceExtra", "ColorBit", "ResizePalette"] {
+        assert_eq!(
+            dispatcher_target_for_import("InterfaceLib", symbol),
+            PpcImportDispatcherTarget::NoOpPreserve,
+            "{symbol}"
+        );
+    }
+}
+
+#[test]
 fn file_and_lowmem_aliases_bind_and_behave() {
     assert_eq!(
         dispatcher_target_for_import("InterfaceLib", "PBGetVolSync"),
@@ -714,6 +758,18 @@ fn file_and_lowmem_aliases_bind_and_behave() {
     );
     assert_eq!(loaded.memory.read_u16_be(SCRATCH), Some(72));
     assert_eq!(loaded.memory.read_u16_be(SCRATCH + 2), Some(72));
+    {
+        // ScreenRes reports the ScrHRes and ScrVRes globals.
+        use crate::memory::globals::addr;
+        loaded.memory.write_u16_be(addr::SCR_H_RES, 96).unwrap();
+        loaded.memory.write_u16_be(addr::SCR_V_RES, 80).unwrap();
+        run_test_import(
+            &mut loaded,
+            dispatcher_target_for_import("InterfaceLib", "ScreenRes"),
+        );
+        assert_eq!(loaded.memory.read_u16_be(SCRATCH), Some(96));
+        assert_eq!(loaded.memory.read_u16_be(SCRATCH + 2), Some(80));
+    }
 
     let mut loaded = loaded_with(b"LMSetMemErr");
     loaded.cpu.gpr[3] = ppc_i16_result(-108);
@@ -746,45 +802,18 @@ fn byte_range_and_file_id_imports_complete_their_parameter_blocks() {
 }
 
 #[test]
-fn absent_manager_imports_return_their_documented_errors() {
-    for (library, symbol, error) in [
-        ("InterfaceLib", "SCSIGet", 2),
-        ("InterfaceLib", "OpenEdition", PPC_PARAM_ERR),
-        ("InterfaceLib", "OpenComponentResFile", PPC_PARAM_ERR),
-        ("Translation", "TranslateFile", PPC_PARAM_ERR),
-        ("TextCommon", "TECGetInfo", -8749),
+fn delta_point_subtracts_each_coordinate_into_its_own_word() {
+    let mut loaded = loaded_with(b"DeltaPoint");
+    for (pt_a, pt_b, delta) in [
+        (0x000a_0003, 0x0004_0005, 0x0006_fffe),
+        (0x0004_0005, 0x000a_0003, 0xfffa_0002),
     ] {
-        assert_eq!(
-            dispatcher_target_for_import(library, symbol),
-            PpcImportDispatcherTarget::ReturnError(error),
-            "{symbol}"
+        loaded.cpu.gpr[3] = pt_a;
+        loaded.cpu.gpr[4] = pt_b;
+        run_test_import(
+            &mut loaded,
+            dispatcher_target_for_import("InterfaceLib", "DeltaPoint"),
         );
-    }
-    for (library, symbol) in [
-        ("InterfaceLib", "OpenComponent"),
-        ("InterfaceLib", "RegisterComponentResource"),
-        ("InterfaceLib", "GetNextFOND"),
-        ("InterfaceLib", "DeltaPoint"),
-        ("QuickTimeLib", "MCIsPlayerEvent"),
-    ] {
-        assert_eq!(
-            dispatcher_target_for_import(library, symbol),
-            PpcImportDispatcherTarget::ReturnNoErr,
-            "{symbol}"
-        );
-    }
-
-    let mut loaded = loaded_with(b"SCSIGet");
-    run_test_import(
-        &mut loaded,
-        dispatcher_target_for_import("InterfaceLib", "SCSIGet"),
-    );
-    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(2));
-    for symbol in ["PicComment", "SpaceExtra", "ColorBit", "ResizePalette"] {
-        assert_eq!(
-            dispatcher_target_for_import("InterfaceLib", symbol),
-            PpcImportDispatcherTarget::NoOpPreserve,
-            "{symbol}"
-        );
+        assert_eq!(loaded.cpu.gpr[3], delta);
     }
 }
