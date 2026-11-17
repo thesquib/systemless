@@ -499,6 +499,7 @@ pub(super) fn dispatch_window_import(
                 current_resource_refnum,
                 last_resource_error,
                 toolbox_startup.host_menu_bar_hidden,
+                &mut toolbox_startup.port_palettes,
             );
             if window != 0 {
                 ppc_recalculate_window_vis_regions(
@@ -1470,6 +1471,16 @@ pub(super) fn ppc_window_structure_bounds(
     let border: i16 = if proc_id == 2 { 1 } else { 6 };
     if has_title_bar {
         crate::window_manager::standard_window_structure_bounds(content)
+    } else if proc_id == 3 {
+        // altDBoxProc: a one-pixel frame around the content plus a two-pixel
+        // drop shadow below and to the right, with no gap band.
+        // Inside Macintosh Volume I (1985), pp. I-273 and I-299.
+        (
+            content.0.saturating_sub(1),
+            content.1.saturating_sub(1),
+            content.2.saturating_add(3),
+            content.3.saturating_add(3),
+        )
     } else {
         (
             content.0.saturating_sub(border),
@@ -2889,6 +2900,7 @@ pub(super) fn ppc_get_new_cwindow(
     current_resource_refnum: i16,
     last_resource_error: &mut i16,
     host_menu_bar_hidden: bool,
+    port_palettes: &mut HashMap<u32, (u32, u16)>,
 ) -> u32 {
     let params = crate::window_manager::evaluate_get_new_window_parameters(
         cpu.gpr[3] as u16 as i16,
@@ -2994,8 +3006,7 @@ pub(super) fn ppc_get_new_cwindow(
         palette
     };
     if palette != 0 {
-        let _ = memory.write_u32_be(window + PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET, palette);
-        let _ = memory.write_u16_be(window + PPC_CGRAF_PORT_PALETTE_UPDATES_OFFSET, 1);
+        port_palettes.insert(window, (palette, 1));
     }
     *last_resource_error = PPC_NO_ERR;
     *last_mem_error = PPC_NO_ERR;
@@ -4347,9 +4358,10 @@ pub(super) fn ppc_dispatch_legacy_window(
                         .and_then(|region| ppc_read_rgn_bbox(memory, region))
                 })
                 .flatten();
-            let disposed_palette = memory
-                .read_u32_be(window.wrapping_add(PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET))
-                .unwrap_or(0);
+            let disposed_palette = toolbox_startup
+                .port_palettes
+                .remove(&window)
+                .map_or(0, |entry| entry.0);
             let disposed_pixmap_handle = gworlds
                 .iter()
                 .find(|record| {
@@ -4409,13 +4421,7 @@ pub(super) fn ppc_dispatch_legacy_window(
                 quickdraw_fore_indices.remove(&window);
                 let still_associated = toolbox_startup.application_palette == disposed_palette
                     || gworlds.iter().any(|record| {
-                        memory
-                            .read_u32_be(
-                                record
-                                    .port
-                                    .wrapping_add(PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET),
-                            )
-                            .unwrap_or(0)
+                        ppc_window_palette_handle(toolbox_startup, record.port)
                             == disposed_palette
                     });
                 if disposed_palette != 0 && !still_associated {
@@ -6468,9 +6474,10 @@ pub(super) fn ppc_close_window(
         })
         .flatten();
     if window != 0 {
-        let closed_palette = memory
-            .read_u32_be(window.wrapping_add(PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET))
-            .unwrap_or(0);
+        let closed_palette = toolbox_startup
+            .port_palettes
+            .remove(&window)
+            .map_or(0, |entry| entry.0);
         let closed_pixmap_handle = gworlds
             .iter()
             .find(|gworld| {
@@ -6527,14 +6534,7 @@ pub(super) fn ppc_close_window(
             quickdraw_fore_indices.remove(&window);
             let still_associated = toolbox_startup.application_palette == closed_palette
                 || gworlds.iter().any(|record| {
-                    memory
-                        .read_u32_be(
-                            record
-                                .port
-                                .wrapping_add(PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET),
-                        )
-                        .unwrap_or(0)
-                        == closed_palette
+                    ppc_window_palette_handle(toolbox_startup, record.port) == closed_palette
                 });
             if closed_palette != 0 && !still_associated {
                 ppc_release_palette_allocations_and_restore(

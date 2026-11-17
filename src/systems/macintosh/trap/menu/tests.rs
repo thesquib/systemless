@@ -4644,6 +4644,52 @@ fn test_setitem_syncs_guest_memory_text() {
     assert_eq!(bus.read_byte(menu_ptr + 22), b'w');
 }
 
+// IM:I I-358: GetItem returns the item text as the Str255 the menu holds.
+// Item text is stored one char per Mac Roman byte, so "Save As\xC9"
+// ("Save As…") must come back as eight bytes, not UTF-8 ("\xC3\x89").
+#[test]
+fn getitem_returns_mac_roman_item_bytes() {
+    let (mut disp, mut cpu, mut bus) = setup();
+
+    let title_ptr = 0x304000u32;
+    bus.write_pstring(title_ptr, b"File");
+    bus.write_long(TEST_SP, title_ptr);
+    bus.write_word(TEST_SP + 4, 129);
+    assert!(disp
+        .dispatch_menu(true, 0x131, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok()); // NewMenu
+    let handle = bus.read_long(cpu.read_reg(Register::A7));
+
+    let data_ptr = 0x304100u32;
+    bus.write_pstring(data_ptr, b"Save As\xC9");
+    cpu.write_reg(Register::A7, TEST_SP);
+    bus.write_long(TEST_SP, data_ptr);
+    bus.write_long(TEST_SP + 4, handle);
+    assert!(disp
+        .dispatch_menu(true, 0x133, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok()); // AppendMenu
+
+    let out_ptr = 0x304200u32;
+    bus.write_bytes(out_ptr, &[0xEE; 16]);
+    cpu.write_reg(Register::A7, TEST_SP);
+    bus.write_long(TEST_SP, out_ptr);
+    bus.write_word(TEST_SP + 4, 1);
+    bus.write_long(TEST_SP + 6, handle);
+    assert!(disp
+        .dispatch_menu(true, 0x146, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok()); // GetItem
+
+    assert_eq!(bus.read_pstring(out_ptr), b"Save As\xC9");
+    assert_eq!(
+        bus.read_byte(out_ptr + 9),
+        0xEE,
+        "GetItem must not overrun the item text"
+    );
+}
+
 // DeleteMenuItem must sync the guest-memory MENU record so CountMItems
 // doesn't still see the deleted item via the guest-memory path.
 #[test]
@@ -9773,6 +9819,64 @@ fn menuselect_title_hit_enters_tracking_without_immediate_stack_pop() {
     assert!(trace.contains("outcome=open_tracking"));
     assert!(trace.contains("A93D action=tracking_entered"));
     assert!(trace.contains("tracking=menu:active"));
+}
+
+// MenuMgr.a MSLoop: a startPt outside every title leaves no menu down,
+// but MenuSelect keeps polling GetMouse while the button is held. Mahjong
+// passes (0,0) for a click on its File title; the held pointer must open it.
+#[test]
+fn menuselect_off_title_start_point_tracks_held_pointer_in_menu_bar() {
+    let (mut disp, mut cpu, mut bus) = setup_with_port();
+    disp.enable_input_trace_capture();
+    disp.menu_bar_hidden = false;
+    bus.write_word(crate::memory::globals::addr::MBAR_HEIGHT, 20);
+    let handle = new_menu_with_title(&mut disp, &mut cpu, &mut bus, 521, 0x30B900, "File");
+    append_menu_data(&mut disp, &mut cpu, &mut bus, handle, 0x30B940, "Open/O");
+    insert_menu(&mut disp, &mut cpu, &mut bus, handle);
+    cpu.write_reg(Register::A7, TEST_SP);
+    assert!(disp
+        .dispatch_menu(true, 0x137, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok());
+    let regions = disp.menu_title_regions();
+    let title_mid_h = (regions[0].0 + regions[0].1) / 2;
+    assert!(regions[0].0 > 0, "(0,0) must lie outside the File title");
+
+    // Held below the menu bar: still no title, so MenuSelect returns 0.
+    disp.input_state
+        .set_mouse_position_for_test((40, title_mid_h));
+    disp.input_state.set_mouse_button_for_test(true);
+    cpu.write_reg(Register::A7, TEST_SP);
+    bus.write_long(TEST_SP, 0);
+    bus.write_long(TEST_SP + 4, 0xA5A5_A5A5);
+    assert!(disp
+        .step_menu_fixture(true, 0x13D, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok());
+    assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 4);
+    assert_eq!(bus.read_long(TEST_SP + 4), 0);
+    assert!(disp.menu_tracking.is_none());
+
+    // Held on the title: tracking opens File even though startPt missed.
+    disp.input_state
+        .set_mouse_position_for_test((10, title_mid_h));
+    cpu.write_reg(Register::A7, TEST_SP);
+    bus.write_long(TEST_SP, 0);
+    bus.write_long(TEST_SP + 4, 0xA5A5_A5A5);
+    assert!(disp
+        .step_menu_fixture(true, 0x13D, &mut cpu, &mut bus)
+        .unwrap()
+        .is_ok());
+    assert_eq!(
+        cpu.read_reg(Register::A7),
+        TEST_SP,
+        "MenuSelect keeps tracking instead of returning"
+    );
+    assert!(
+        disp.menu_tracking.is_some(),
+        "the held pointer's title opens"
+    );
+    assert!(disp.input_trace_text().contains("outcome=open_tracking"));
 }
 
 // IM:I I-355: MenuSelect tracks until mouse-up, then returns the

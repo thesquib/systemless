@@ -3088,15 +3088,11 @@ fn hle_import_runner_get_new_cwindow_associates_matching_palette() {
     let probe = loaded.run_with_hle_imports(64);
 
     assert_eq!(probe.unsupported_import_index, None);
-    let palette_handle = loaded
-        .memory
-        .read_u32_be(storage_ptr + PPC_CGRAF_PORT_PALETTE_HANDLE_OFFSET)
+    let palette_handle = loaded.toolbox_startup.port_palettes.get(&storage_ptr).map(|entry| entry.0)
         .unwrap();
     assert_ne!(palette_handle, 0);
     assert_eq!(
-        loaded
-            .memory
-            .read_u16_be(storage_ptr + PPC_CGRAF_PORT_PALETTE_UPDATES_OFFSET),
+        loaded.toolbox_startup.port_palettes.get(&storage_ptr).map(|entry| entry.1),
         Some(1)
     );
     let palette = loaded.memory.read_u32_be(palette_handle).unwrap();
@@ -11162,4 +11158,46 @@ fn update_event_does_not_recur_for_a_hidden_window() {
         PpcImportDispatcherTarget::GetNextEvent(PpcEventPollOperation::GetNextEvent),
     );
     assert!(!loaded.event_queue().iter().any(|queued| queued.what == 6));
+}
+
+#[test]
+fn alt_dbox_window_frames_content_with_one_pixel_border_and_two_pixel_shadow() {
+    // Domain shows its splash PICT in a NewCWindow with altDBoxProc (3). The
+    // PPC WDEF gave it a six-pixel structure and painted that band white
+    // around the black artwork, which 68K and the original WDEF never draw.
+    let pef = synthetic_pef_with_import(b"NewCWindow");
+    let mut loaded = load_pef_application(&pef).unwrap();
+    let front =
+        ppc_live_front_buffer_for_gworld(&mut loaded.memory, &loaded.gworlds, PPC_MAIN_GWORLD)
+            .unwrap();
+    let framebuffer_len = usize::try_from(front.row_bytes * front.height).unwrap();
+    loaded
+        .memory
+        .write_bytes(front.base_addr, &vec![0x5a; framebuffer_len])
+        .unwrap();
+    let desktop = ppc_quickdraw_read_pixel(&mut loaded.memory, front, (90, 90)).unwrap();
+    let scratch = PPC_DATA_BASE + 0x1000;
+    loaded.memory.add_region(scratch, vec![0; 32]);
+    let window = create_test_cwindow(&mut loaded, scratch, (100, 100, 200, 300), 3, true, u32::MAX);
+
+    let structure = ppc_window_global_structure_bounds(&mut loaded.memory, &loaded.gworlds, window);
+    assert_eq!(structure, Some((99, 99, 203, 303)));
+    let surface = ppc_live_quickdraw_surface(&mut loaded.memory, &loaded.gworlds, window).unwrap();
+    let black =
+        ppc_quickdraw_surface_color_pixel(&mut loaded.memory, surface, PPC_RGB_BLACK).unwrap();
+    let pixel = |loaded: &mut PpcLoadedApp, h: i32, v: i32| {
+        ppc_quickdraw_read_pixel(&mut loaded.memory, front, (h, v)).unwrap()
+    };
+    // One-pixel frame hugging the content on every side.
+    for (h, v) in [(99, 150), (200, 99), (300, 150), (200, 200)] {
+        assert_eq!(pixel(&mut loaded, h, v), black, "frame at ({h},{v})");
+    }
+    // Two-pixel drop shadow below and to the right of the frame.
+    for (h, v) in [(301, 150), (302, 150), (200, 201), (200, 202)] {
+        assert_eq!(pixel(&mut loaded, h, v), black, "shadow at ({h},{v})");
+    }
+    // Nothing is painted beyond the frame on the top and left.
+    for (h, v) in [(98, 150), (94, 150), (200, 98), (200, 94), (303, 150), (200, 203)] {
+        assert_eq!(pixel(&mut loaded, h, v), desktop, "outside at ({h},{v})");
+    }
 }
