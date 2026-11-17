@@ -4234,6 +4234,126 @@ fn showhide_true_erases_content_and_recovers_stale_front_window_cache() {
     );
 }
 
+fn show_hide_for_test(
+    disp: &mut super::super::TrapDispatcher,
+    cpu: &mut super::super::test_helpers::MockCpu,
+    bus: &mut crate::memory::MacMemoryBus,
+    window: u32,
+    show: bool,
+) {
+    let sp = TEST_SP - 6;
+    cpu.write_reg(Register::A7, sp);
+    bus.write_byte(sp, u8::from(show));
+    bus.write_byte(sp + 1, 0);
+    bus.write_long(sp + 2, window);
+    dispatch(disp, 0x108, cpu, bus).unwrap().unwrap();
+}
+
+fn hidden_full_screen_backdrop_for_test(
+    disp: &mut super::super::TrapDispatcher,
+    cpu: &mut super::super::test_helpers::MockCpu,
+    bus: &mut crate::memory::MacMemoryBus,
+) -> (u32, u32) {
+    let screen_base = bus.alloc(800 * 600);
+    bus.write_long(crate::memory::globals::addr::SCREEN_BITS, screen_base);
+    disp.set_screen_mode_for_test(screen_base, 800, 800, 600, 8);
+    let window = bus.alloc(256);
+    // MegaPong's WIND 1005: an invisible plainDBox at (0,0,9999,9999),
+    // shown later with ShowHide as the backdrop behind its splash screen.
+    disp.init_cgraf_window(
+        bus, cpu, window, screen_base, 0, 0, 9999, 9999, "", 2, false, true, true, 0,
+    );
+    (screen_base, window)
+}
+
+#[test]
+fn showhide_true_erases_full_screen_window_created_hidden() {
+    // Creation fills a full-screen window only when it starts visible.
+    // Revealing one later still runs PaintOne's erase, so the desktop must
+    // not show through the backdrop. Inside Macintosh Volume I, I-285, I-296.
+    let (mut disp, mut cpu, mut bus) = setup();
+    disp.menu_bar_hidden = false;
+    let (screen_base, window) = hidden_full_screen_backdrop_for_test(&mut disp, &mut cpu, &mut bus);
+    bus.write_word(crate::memory::globals::addr::MBAR_HEIGHT, 20);
+    let probe = screen_base + 590 * 800 + 790;
+    bus.write_byte(probe, 0x42);
+    let menu_bar_probe = screen_base + 5 * 800 + 400;
+    bus.write_byte(menu_bar_probe, 0x42);
+
+    show_hide_for_test(&mut disp, &mut cpu, &mut bus, window, true);
+
+    assert_eq!(
+        bus.read_byte(probe),
+        0x00,
+        "ShowHide(TRUE) must erase a revealed full-screen window to white"
+    );
+    assert_eq!(
+        bus.read_byte(menu_bar_probe),
+        0x42,
+        "the window's visRgn excludes the menu bar, so the erase stops below it"
+    );
+}
+
+#[test]
+fn showhide_true_keeps_kiosk_stage_for_full_screen_window_created_hidden() {
+    let (mut disp, mut cpu, mut bus) = setup();
+    disp.menu_bar_hidden = true;
+    let (screen_base, window) = hidden_full_screen_backdrop_for_test(&mut disp, &mut cpu, &mut bus);
+    let probe = screen_base + 590 * 800 + 790;
+    bus.write_byte(probe, 0xFF);
+
+    show_hide_for_test(&mut disp, &mut cpu, &mut bus, window, true);
+
+    assert_eq!(
+        bus.read_byte(probe),
+        0xFF,
+        "kiosk mode keeps its black stage behind a revealed full-screen window"
+    );
+}
+
+#[test]
+fn show_window_erases_whole_content_despite_a_narrower_application_clip() {
+    // Spin Doctor builds its alert hidden, clips to the window's first
+    // 66-pixel portRect, grows it with SizeWindow and then shows it. PaintOne
+    // erases the content region from the Window Manager port, so the stale
+    // application clipRgn must not leave the lower content unerased.
+    // boot3 WindowMgr.a, PaintOneGuts; Inside Macintosh Volume I, I-285.
+    let (mut disp, mut cpu, mut bus) = setup();
+    let screen_base = bus.alloc(800 * 600);
+    bus.write_long(crate::memory::globals::addr::SCREEN_BITS, screen_base);
+    disp.set_screen_mode_for_test(screen_base, 800, 800, 600, 8);
+    let window = bus.alloc(256);
+    disp.init_cgraf_window(
+        &mut bus, &mut cpu, window, screen_base, 40, 235, 124, 564, "", 1, false, true, false, 0,
+    );
+    let clip = bus.read_long(window + 28);
+    super::super::TrapDispatcher::write_region_handle_rect(&mut bus, clip, Some((0, 0, 66, 329)));
+    let inside_clip = screen_base + (40 + 30) * 800 + 300;
+    let below_clip = screen_base + (40 + 75) * 800 + 300;
+    let outside_window = screen_base + (124 + 20) * 800 + 300;
+    for probe in [inside_clip, below_clip, outside_window] {
+        bus.write_byte(probe, 0x42);
+    }
+
+    cpu.write_reg(Register::A7, TEST_SP);
+    bus.write_long(TEST_SP, window);
+    dispatch(&mut disp, 0x115, &mut cpu, &mut bus).unwrap().unwrap();
+
+    assert_eq!(bus.read_byte(inside_clip), 0x00);
+    assert_eq!(
+        bus.read_byte(below_clip),
+        0x00,
+        "ShowWindow must erase content below the application's clipRgn"
+    );
+    assert_eq!(bus.read_byte(outside_window), 0x42, "the erase stays inside the content");
+    assert_eq!(bus.read_long(window + 28), clip, "the application keeps its clipRgn handle");
+    assert_eq!(
+        super::super::TrapDispatcher::region_handle_rect(&bus, clip),
+        Some((0, 0, 66, 329)),
+        "the application's clip region is left unchanged"
+    );
+}
+
 // IM:I I-285: ShowHide(FALSE) makes the target window invisible but does
 // not reorder windows or generate activate events.
 #[test]

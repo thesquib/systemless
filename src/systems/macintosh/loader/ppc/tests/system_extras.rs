@@ -386,6 +386,106 @@ fn replace_gestalt_value_requires_an_existing_selector() {
 }
 
 #[test]
+fn peerless_interprocess_imports_succeed() {
+    let mut loaded = loaded_with(b"PPCInit");
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "ReserveMemSys"),
+        dispatcher_target_for_import("InterfaceLib", "ReserveMem")
+    );
+    for symbol in ["PPCInit", "AEInstallCoercionHandler"] {
+        loaded.cpu.gpr[3] = 1;
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        assert_eq!(loaded.cpu.gpr[3], 0, "{symbol}");
+    }
+}
+
+#[test]
+fn top_map_handle_accessors_share_the_low_memory_global() {
+    use crate::memory::globals::addr;
+    let mut loaded = loaded_with(b"LMSetTopMapHndl");
+    loaded.cpu.gpr[3] = 0x1234_5678;
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "LMSetTopMapHndl"),
+    );
+    assert_eq!(loaded.memory.read_u32_be(addr::TOP_MAP_HNDL), Some(0x1234_5678));
+    loaded.cpu.gpr[3] = 0;
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "LMGetTopMapHndl"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], 0x1234_5678);
+}
+
+#[test]
+fn fractional_width_setters_share_the_low_memory_global() {
+    let mut loaded = loaded_with(b"SetFractEnable");
+    for (symbol, value) in [("SetFractEnable", 1), ("LMSetFractEnable", 0)] {
+        loaded.cpu.gpr[3] = value;
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        run_test_import(
+            &mut loaded,
+            dispatcher_target_for_import("InterfaceLib", "LMGetFractEnable"),
+        );
+        assert_eq!(loaded.cpu.gpr[3], value, "{symbol}");
+    }
+}
+
+#[test]
+fn screen_resolution_accessors_report_the_seeded_72_dpi() {
+    let mut loaded = loaded_with(b"LMGetScrHRes");
+    for symbol in ["LMGetScrHRes", "LMGetScrVRes"] {
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        assert_eq!(loaded.cpu.gpr[3], 72, "{symbol}");
+    }
+}
+
+#[test]
+fn ppc_open_and_close_complete_their_parameter_blocks() {
+    let mut loaded = loaded_with(b"PPCOpenSync");
+    let pb = SCRATCH;
+    for symbol in ["PPCOpenSync", "PPCCloseSync"] {
+        loaded.memory.write_u16_be(pb + 16, 0xffff).unwrap();
+        loaded.cpu.gpr[3] = pb;
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        assert_eq!(loaded.cpu.gpr[3], 0, "{symbol}");
+        assert_eq!(loaded.memory.read_u16_be(pb + 16), Some(0), "{symbol}");
+        if symbol == "PPCOpenSync" {
+            assert_ne!(loaded.memory.read_u16_be(pb + 38), Some(0));
+        }
+    }
+}
+
+#[test]
+fn peerless_high_level_event_lookups_report_no_port_or_process() {
+    let mut loaded = loaded_with(b"GetSpecificHighLevelEvent");
+    loaded.memory.write_u16_be(SCRATCH, 0).unwrap();
+    loaded.cpu.gpr[3] = 1;
+    loaded.cpu.gpr[5] = SCRATCH;
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "GetSpecificHighLevelEvent"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], 0);
+    assert_eq!(loaded.memory.read_u16_be(SCRATCH), Some((-903i16) as u16));
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "GetPortNameFromProcessSerialNumber"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_PROC_NOT_FOUND_ERR));
+}
+
+#[test]
+fn icon_id_to_rgn_reports_failure_instead_of_leaving_the_region_stale() {
+    let mut loaded = loaded_with(b"IconIDToRgn");
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "IconIDToRgn"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(PPC_PARAM_ERR));
+}
+
+#[test]
 fn imperialism_low_memory_getters_read_current_values() {
     use crate::memory::globals::addr;
     let mut loaded = loaded_with(b"LMGetFSFCBLen");
@@ -586,5 +686,134 @@ fn classic_fcb_pointer_accessor_reads_current_low_memory_without_dereferencing()
         run_test_import(&mut loaded, target.clone());
         assert_eq!(loaded.cpu.gpr[3], pointer);
         assert_eq!(loaded.memory.read_u32_be(addr::FCB_S_PTR), Some(pointer));
+    }
+}
+
+#[test]
+fn absent_manager_imports_return_their_documented_errors() {
+    for (library, symbol, error) in [
+        ("InterfaceLib", "SCSIGet", 2),
+        ("InterfaceLib", "OpenEdition", PPC_PARAM_ERR),
+        ("InterfaceLib", "OpenComponentResFile", PPC_PARAM_ERR),
+        ("Translation", "TranslateFile", PPC_PARAM_ERR),
+        ("TextCommon", "TECGetInfo", -8749),
+    ] {
+        assert_eq!(
+            dispatcher_target_for_import(library, symbol),
+            PpcImportDispatcherTarget::ReturnError(error),
+            "{symbol}"
+        );
+    }
+    for (library, symbol) in [
+        ("InterfaceLib", "OpenComponent"),
+        ("InterfaceLib", "RegisterComponentResource"),
+        ("InterfaceLib", "GetNextFOND"),
+        ("QuickTimeLib", "MCIsPlayerEvent"),
+        ("Translation", "GetFileTranslationPaths"),
+    ] {
+        assert_eq!(
+            dispatcher_target_for_import(library, symbol),
+            PpcImportDispatcherTarget::ReturnNoErr,
+            "{symbol}"
+        );
+    }
+
+    let mut loaded = loaded_with(b"SCSIGet");
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "SCSIGet"),
+    );
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(2));
+    for symbol in ["PicComment", "SpaceExtra", "ColorBit", "ResizePalette"] {
+        assert_eq!(
+            dispatcher_target_for_import("InterfaceLib", symbol),
+            PpcImportDispatcherTarget::NoOpPreserve,
+            "{symbol}"
+        );
+    }
+}
+
+#[test]
+fn file_and_lowmem_aliases_bind_and_behave() {
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "PBGetVolSync"),
+        dispatcher_target_for_import("InterfaceLib", "PBHGetVolSync")
+    );
+    assert_eq!(
+        dispatcher_target_for_import("InterfaceLib", "LMGetTheGDevice"),
+        PpcImportDispatcherTarget::GetGDevice
+    );
+    assert_eq!(
+        dispatcher_target_for_import("QuickTimeLib", "CustomGetFilePreview"),
+        dispatcher_target_for_import("InterfaceLib", "CustomGetFile")
+    );
+
+    let mut loaded = loaded_with(b"ScreenRes");
+    loaded.memory.write_u32_be(SCRATCH, 0).unwrap();
+    loaded.cpu.gpr[3] = SCRATCH;
+    loaded.cpu.gpr[4] = SCRATCH + 2;
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "ScreenRes"),
+    );
+    assert_eq!(loaded.memory.read_u16_be(SCRATCH), Some(72));
+    assert_eq!(loaded.memory.read_u16_be(SCRATCH + 2), Some(72));
+    {
+        // ScreenRes reports the ScrHRes and ScrVRes globals.
+        use crate::memory::globals::addr;
+        loaded.memory.write_u16_be(addr::SCR_H_RES, 96).unwrap();
+        loaded.memory.write_u16_be(addr::SCR_V_RES, 80).unwrap();
+        run_test_import(
+            &mut loaded,
+            dispatcher_target_for_import("InterfaceLib", "ScreenRes"),
+        );
+        assert_eq!(loaded.memory.read_u16_be(SCRATCH), Some(96));
+        assert_eq!(loaded.memory.read_u16_be(SCRATCH + 2), Some(80));
+    }
+
+    let mut loaded = loaded_with(b"LMSetMemErr");
+    loaded.cpu.gpr[3] = ppc_i16_result(-108);
+    run_test_import(
+        &mut loaded,
+        dispatcher_target_for_import("InterfaceLib", "LMSetMemErr"),
+    );
+    run_test_import(&mut loaded, PpcImportDispatcherTarget::MemError);
+    assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(-108));
+}
+
+#[test]
+fn byte_range_and_file_id_imports_complete_their_parameter_blocks() {
+    let mut loaded = loaded_with(b"PBLockRangeSync");
+    for (symbol, result) in [
+        ("PBLockRangeSync", PPC_NO_ERR),
+        ("PBUnlockRangeSync", PPC_NO_ERR),
+        ("PBCreateFileIDRefSync", PPC_PARAM_ERR),
+    ] {
+        loaded.memory.write_u16_be(SCRATCH + 16, 0x7fff).unwrap();
+        loaded.cpu.gpr[3] = SCRATCH;
+        run_test_import(&mut loaded, dispatcher_target_for_import("InterfaceLib", symbol));
+        assert_eq!(loaded.cpu.gpr[3], ppc_i16_result(result), "{symbol}");
+        assert_eq!(
+            loaded.memory.read_u16_be(SCRATCH + 16),
+            Some(result as u16),
+            "{symbol}"
+        );
+    }
+}
+
+#[test]
+fn delta_point_subtracts_each_coordinate_into_its_own_word() {
+    let mut loaded = loaded_with(b"DeltaPoint");
+    for (pt_a, pt_b, delta) in [
+        (0x000a_0003, 0x0004_0005, 0x0006_fffe),
+        (0x0004_0005, 0x000a_0003, 0xfffa_0002),
+    ] {
+        loaded.cpu.gpr[3] = pt_a;
+        loaded.cpu.gpr[4] = pt_b;
+        run_test_import(
+            &mut loaded,
+            dispatcher_target_for_import("InterfaceLib", "DeltaPoint"),
+        );
+        assert_eq!(loaded.cpu.gpr[3], delta);
     }
 }

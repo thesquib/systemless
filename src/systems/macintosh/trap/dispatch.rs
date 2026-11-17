@@ -1711,6 +1711,10 @@ pub struct TrapDispatcher {
     /// HLE keeps the source RGB so color fills can resolve it for the current
     /// destination depth at draw time.
     pub(crate) makergbpat_colors: FastHashMap<u32, (u16, u16, u16)>,
+    /// Requested color of the MakeRGBPat pattern a FillC* call is currently
+    /// drawing with. Like a generated pen pattern, it supplies the fill's
+    /// pixel instead of the port's resolved fgColor/bkColor fields.
+    pub(crate) generated_fill_rgb: Option<(u16, u16, u16)>,
     /// Bit-pattern PixPats allocated by PenPat and BackPat for color ports.
     pub(crate) owned_bit_pixpats: FastHashSet<u32>,
     /// Extra horizontal pixels added to each non-space character
@@ -1796,6 +1800,9 @@ pub struct TrapDispatcher {
     /// position the application never requested invents pixels the Mac would
     /// not have shown.
     pub(crate) windows_placed_offscreen: FastHashSet<u32>,
+    /// Full-screen windows created invisible. Creation fills a visible
+    /// full-screen window's stage; these receive that erase when revealed.
+    pub(crate) hidden_fullscreen_windows: FastHashSet<u32>,
     /// Aux-window handles keyed by WindowPtr. BasiliskII/System 7.5.3 gives
     /// each freshly created window a non-NIL AuxWin record, and SetWinColor
     /// mutates that record in place instead of allocating the first one on
@@ -3977,6 +3984,7 @@ impl TrapDispatcher {
             pm_fg_color: None,
             pm_bg_color: None,
             makergbpat_colors: HashMap::default(),
+            generated_fill_rgb: None,
             owned_bit_pixpats: Default::default(),
             char_extra: 0,
             bk_pat: [0x00; 8],
@@ -4007,6 +4015,7 @@ impl TrapDispatcher {
             window_proc_id: 0,
             window_proc_ids: HashMap::default(),
             windows_placed_offscreen: std::collections::HashSet::default(),
+            hidden_fullscreen_windows: std::collections::HashSet::default(),
             window_aux_records: HashMap::default(),
             window_original_pixmaps: HashMap::default(),
             window_saved_under_pixels: HashMap::default(),
@@ -4677,6 +4686,22 @@ impl TrapDispatcher {
         bus: &mut MacMemoryBus,
         resident_segments: &[i16],
     ) {
+        self.bind_code_handles(bus, resident_segments, false);
+    }
+
+    /// Bind the CODE handle of a segment the guest's LoadSeg call is loading.
+    /// Unlike the launch-time binding, the guest may already have loaded and
+    /// locked this resource itself, so that handle is left alone.
+    pub(crate) fn bind_loaded_segment_code_handle(&mut self, bus: &mut MacMemoryBus, segment: i16) {
+        self.bind_code_handles(bus, &[segment], true);
+    }
+
+    fn bind_code_handles(
+        &mut self,
+        bus: &mut MacMemoryBus,
+        resident_segments: &[i16],
+        keep_guest_locked_resources: bool,
+    ) {
         let mut segments: Vec<_> = self
             .segment_map
             .iter()
@@ -4702,6 +4727,29 @@ impl TrapDispatcher {
                 .and_then(|file| file.loaded.get(&(*b"CODE", id)))
                 .copied()
                 .unwrap_or(0);
+            // The guest may already hold this CODE resource, loaded and locked
+            // through GetResource. A locked block never moves, and LoadSeg
+            // gets the segment with GetResource, which returns a resource that
+            // is already in memory unchanged (Inside Macintosh Volume I, I-119;
+            // Volume II, II-58). Code that cached the dereferenced pointer
+            // keeps calling into it, so leave that handle and its block alone
+            // and keep executing the segment from the image as before. At
+            // launch no guest code has run yet: a CODE resource that is
+            // already loaded then was preloaded through its attributes, and
+            // its handle must describe the image the application executes.
+            if keep_guest_locked_resources && old_ptr != 0 && old_ptr != ptr {
+                let guest_locked = self
+                    .resource_handles_by_key
+                    .get(&key)
+                    .copied()
+                    .is_some_and(|handle| {
+                        bus.read_long(handle) == old_ptr
+                            && self.handle_state_bits(handle).unwrap_or(0) & 0x80 != 0
+                    });
+                if guest_locked {
+                    continue;
+                }
+            }
             let handle = self.get_or_create_resource_handle_in_file(bus, *b"CODE", id, old_ptr, 0);
             bus.adopt_reserved_allocation(ptr, size);
             if old_ptr != 0 && old_ptr != ptr {
@@ -7687,21 +7735,7 @@ impl TrapDispatcher {
         if let Some(&ptr) = self.system_icon_cache.get(&icon_id) {
             return Some(ptr);
         }
-        let body: &[u8] = match icon_id {
-            1 => &[
-                0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x7F, 0xFF, 0xFF, 0x80, 0x7F, 0xFF, 0xFF, 0x80, 0x7F,
-                0xFF, 0xFF, 0x80, 0x7F, 0xFF, 0xFF, 0x80, 0x7F, 0xC0, 0xFF, 0x88, 0x7F, 0x00, 0x3F,
-                0x88, 0x7E, 0x00, 0x1F, 0x88, 0x7C, 0x00, 0x0F, 0x80, 0x78, 0x00, 0x07, 0x80, 0x78,
-                0x00, 0x07, 0x80, 0x70, 0x00, 0x03, 0x80, 0x71, 0xDD, 0xC3, 0x80, 0x70, 0x00, 0x03,
-                0x80, 0x70, 0x00, 0x03, 0x80, 0x71, 0xDD, 0x43, 0x80, 0x70, 0x00, 0x03, 0x80, 0x70,
-                0x00, 0x03, 0x80, 0x71, 0xD7, 0x03, 0x80, 0x70, 0x00, 0x03, 0x87, 0xF0, 0x00, 0x03,
-                0x81, 0xF1, 0xEE, 0xC3, 0x81, 0xF0, 0x00, 0x07, 0x81, 0xF0, 0x00, 0x07, 0x81, 0xF0,
-                0x00, 0x0F, 0x81, 0xE0, 0x00, 0x1F, 0x8F, 0x80, 0x00, 0x7F, 0x81, 0xFF, 0xFF, 0xFF,
-                0x81, 0xFF, 0xFF, 0xFF, 0x81, 0xFF, 0xFF, 0xFF, 0x81, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                0xFF, 0xFF,
-            ],
-            _ => return None,
-        };
+        let body = crate::dialog_manager::system_icon_bitmap(icon_id)?;
         let ptr = bus.alloc(body.len() as u32);
         bus.write_bytes(ptr, body);
         self.system_icon_cache.insert(icon_id, ptr);

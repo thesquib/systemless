@@ -83,6 +83,7 @@ pub enum PpcImportDispatcherTarget {
     LMGetCurMap,
     LMSetCurMap,
     LMSetResErr,
+    LMSetMemErr,
     UseResFile,
     CloseResFile,
     OpenResFile,
@@ -532,6 +533,7 @@ pub enum PpcImportDispatcherTarget {
     EqualPt,
     AddPt,
     SubPt,
+    DeltaPoint,
     LocalToGlobal,
     GlobalToLocal,
     PtInRect,
@@ -914,6 +916,9 @@ pub enum PpcImportDispatcherTarget {
     AEGetInteractionAllowed,
     AEInteractWithUser,
     AEManagerInfo,
+    PPCOpenSync,
+    PPCCloseSync,
+    GetSpecificHighLevelEvent,
     LMGetCurDirStore,
     LMSetCurDirStore,
     LMGetSFSaveDisk,
@@ -950,6 +955,16 @@ pub enum PpcImportDispatcherTarget {
     DrawCString,
     /// openresfile: OpenResFile with a C-string file name.
     OpenResFileCString,
+    /// relstring: RelString with C-string arguments.
+    RelCString,
+    /// getfnum: GetFNum with a C-string family name.
+    GetFNumCString,
+    /// getfontname: GetFontName writing a C string.
+    GetFontNameCString,
+    /// stringwidth: StringWidth with a C-string argument.
+    StringWidthCString,
+    /// ScreenRes: reports the display resolution in dots per inch.
+    ScreenRes,
     RelString,
     InitEditionPackVersion,
     StuffHex,
@@ -958,6 +973,7 @@ pub enum PpcImportDispatcherTarget {
     NumToString,
     NumToCString,
     StringToNum,
+    CStringToNum,
     Random,
     SetQDGlobalsRandomSeed,
     GetQDGlobalsRandomSeed,
@@ -1092,6 +1108,7 @@ pub enum PpcImportDispatcherTarget {
     ICGetSeed,
     ICGetComponentInstance,
     ICParseURL,
+    ICLaunchURL,
     ICGetPref,
     ICCountMapEntries,
     ICGetIndMapEntry,
@@ -2893,6 +2910,21 @@ pub(crate) fn dispatcher_target_for_import(
         ("StdCLib", "_BreakPoint") | ("StdCLib", "__NubAt3") => {
             PpcImportDispatcherTarget::NoOpPreserve
         }
+        // No other process exists to exchange PPC Toolbox or high-level events
+        // with, so these succeed without any peer to observe them.
+        ("InterfaceLib", "PPCInit" | "AEInstallCoercionHandler") => {
+            PpcImportDispatcherTarget::ReturnNoErr
+        }
+        ("InterfaceLib", "GetPortNameFromProcessSerialNumber") => {
+            PpcImportDispatcherTarget::ReturnError(PPC_PROC_NOT_FOUND_ERR)
+        }
+        ("InterfaceLib", "GetSpecificHighLevelEvent") => {
+            PpcImportDispatcherTarget::GetSpecificHighLevelEvent
+        }
+        ("InterfaceLib", "PPCOpenSync") => PpcImportDispatcherTarget::PPCOpenSync,
+        ("InterfaceLib", "PPCCloseSync") => PpcImportDispatcherTarget::PPCCloseSync,
+        // Icon masks are not converted to regions.
+        ("InterfaceLib", "IconIDToRgn") => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
         ("InterfaceLib", "AEInstallSpecialHandler") => {
             PpcImportDispatcherTarget::AEInstallSpecialHandler
         }
@@ -3161,8 +3193,8 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "HNoPurge") => PpcImportDispatcherTarget::HNoPurge,
         ("InterfaceLib", "HPurge") => PpcImportDispatcherTarget::HPurge,
         ("InterfaceLib", "TickCount") => PpcImportDispatcherTarget::TickCount,
-        ("InterfaceLib", "GetZone") => PpcImportDispatcherTarget::GetZone,
-        ("InterfaceLib", "SetZone") => PpcImportDispatcherTarget::SetZone,
+        ("InterfaceLib", "GetZone" | "LMGetTheZone") => PpcImportDispatcherTarget::GetZone,
+        ("InterfaceLib", "SetZone" | "LMSetTheZone") => PpcImportDispatcherTarget::SetZone,
         // The ApplZone and SysZone low-memory globals hold the zones that
         // ApplicationZone and SystemZone return.
         ("InterfaceLib", "LMGetApplZone") => PpcImportDispatcherTarget::GetApplZone,
@@ -3201,6 +3233,23 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "HOpenResFile") => PpcImportDispatcherTarget::HOpenResFile,
         ("InterfaceLib", "ResError" | "LMGetResErr") => PpcImportDispatcherTarget::ResError,
         ("InterfaceLib", "LMSetResErr") => PpcImportDispatcherTarget::LMSetResErr,
+        ("InterfaceLib", "LMSetMemErr") => PpcImportDispatcherTarget::LMSetMemErr,
+        ("InterfaceLib", "ScreenRes") => PpcImportDispatcherTarget::ScreenRes,
+        ("InterfaceLib", "PBLockRangeSync") => PpcImportDispatcherTarget::FileCompatibility(
+            PpcFileCompatibilityOperation::PbLockRangeSync,
+        ),
+        ("InterfaceLib", "PBUnlockRangeSync") => PpcImportDispatcherTarget::FileCompatibility(
+            PpcFileCompatibilityOperation::PbUnlockRangeSync,
+        ),
+        ("InterfaceLib", "PBCreateFileIDRefSync") => PpcImportDispatcherTarget::FileCompatibility(
+            PpcFileCompatibilityOperation::PbCreateFileIdRefSync,
+        ),
+        // The preview pane is cosmetic; the arguments match CustomGetFile.
+        ("QuickTimeLib", "CustomGetFilePreview") => {
+            PpcImportDispatcherTarget::StandardFileCompatibility(
+                PpcStandardFileOperation::CustomGetFile,
+            )
+        }
         ("InterfaceLib", "SetResLoad" | "LMSetResLoad") => PpcImportDispatcherTarget::SetResLoad,
         ("InterfaceLib", "LMGetResLoad") => PpcImportDispatcherTarget::LMGetResLoad,
         ("InterfaceLib", "LoadResource") => PpcImportDispatcherTarget::LoadResource,
@@ -3634,6 +3683,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "GlobalToLocal") => PpcImportDispatcherTarget::GlobalToLocal,
         ("InterfaceLib", "AddPt") => PpcImportDispatcherTarget::AddPt,
         ("InterfaceLib", "SubPt") => PpcImportDispatcherTarget::SubPt,
+        ("InterfaceLib", "DeltaPoint") => PpcImportDispatcherTarget::DeltaPoint,
         ("InterfaceLib" | "AppearanceLib" | "CarbonLib", "MenuKey" | "menukey") => {
             PpcImportDispatcherTarget::MenuKey
         }
@@ -3849,7 +3899,7 @@ pub(crate) fn dispatcher_target_for_import(
             PpcImportDispatcherTarget::GetWMgrPort
         }
         ("InterfaceLib", "SetPort") => PpcImportDispatcherTarget::SetPort,
-        ("InterfaceLib", "GetGDevice") => PpcImportDispatcherTarget::GetGDevice,
+        ("InterfaceLib", "GetGDevice" | "LMGetTheGDevice") => PpcImportDispatcherTarget::GetGDevice,
         ("InterfaceLib", "SetGDevice") => PpcImportDispatcherTarget::SetGDevice,
         ("InterfaceLib", "GDeviceChanged") => PpcImportDispatcherTarget::GDeviceChanged,
         ("InterfaceLib", "GetDeviceList") => PpcImportDispatcherTarget::GetDeviceList,
@@ -4306,6 +4356,33 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("InterfaceLib", "LMGetTheMenu") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetTheMenu)
+        }
+        ("InterfaceLib", "LMGetScrHRes") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetScrHRes)
+        }
+        ("InterfaceLib", "LMGetScrVRes") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetScrVRes)
+        }
+        ("InterfaceLib", "LMGetFractEnable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetFractEnable)
+        }
+        ("InterfaceLib", "LMSetFractEnable" | "SetFractEnable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetFractEnable)
+        }
+        ("InterfaceLib", "SetFScaleDisable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetFScaleDisable)
+        }
+        ("InterfaceLib", "LMSetLastSPExtra") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetLastSpExtra)
+        }
+        ("InterfaceLib", "LMSetMenuDisable") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetMenuDisable)
+        }
+        ("InterfaceLib", "LMGetTopMapHndl") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::GetTopMapHndl)
+        }
+        ("InterfaceLib", "LMSetTopMapHndl") => {
+            PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetTopMapHndl)
         }
         ("InterfaceLib", "LMSetCursorNew") => {
             PpcImportDispatcherTarget::LowMemoryAccessor(PpcLowMemoryAccessor::SetCursorNew)
@@ -5266,12 +5343,57 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("InterfaceLib", "AEInteractWithUser") => PpcImportDispatcherTarget::AEInteractWithUser,
         ("InterfaceLib", "AEManagerInfo") => PpcImportDispatcherTarget::AEManagerInfo,
+        // No SCSI bus: scCommErr. No Edition, Component or Translation managers: paramErr.
+        (
+            "InterfaceLib",
+            "SCSIGet" | "SCSISelect" | "SCSICmd" | "SCSIRead" | "SCSIRBlind" | "SCSIWrite"
+            | "SCSIWBlind" | "SCSIComplete" | "SCSIStat" | "SCSIAction",
+        ) => PpcImportDispatcherTarget::ReturnError(2),
+        (
+            "InterfaceLib",
+            "OpenEdition" | "CloseEdition" | "EditionHasFormat" | "ReadEdition"
+            | "SetEditionFormatMark" | "GetEditionInfo" | "GoToPublisherSection"
+            | "GetLastEditionContainerUsed" | "NewSection" | "RegisterSection"
+            | "UnRegisterSection" | "IsRegisteredSection" | "AssociateSection"
+            | "NewSubscriberDialog" | "SectionOptionsDialog" | "OpenComponentResFile"
+            | "GetCompressedPixMapInfo",
+        ) => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
+        (
+            "Translation",
+            "CanDocBeOpened" | "ExtendFileTypeList" | "GetPathFromTranslationDialog"
+            | "TranslateFile",
+        ) => PpcImportDispatcherTarget::ReturnError(PPC_PARAM_ERR),
+        // These Text Encoding Converter entry points have no conversion path: kTECNoConversionPathErr.
+        (
+            "TextCommon" | "UnicodeConverter" | "TextEncodingConverter" | "InterfaceLib",
+            "TECGetInfo" | "CreateTextToUnicodeInfo"
+            | "CreateUnicodeToTextInfo" | "TruncateForTextToUnicode" | "TruncateForUnicodeToText"
+            | "SetFallbackUnicodeToText",
+        ) => PpcImportDispatcherTarget::ReturnError(-8749),
+        // These return nil or zero results and ignore drawing.
+        (
+            "InterfaceLib",
+            "OpenComponent" | "RegisterComponentResource" | "CloseComponentResFile"
+            | "UnregisterComponent" | "GetNextFOND" | "GetMCInfo",
+        )
+        | ("QuickTimeLib", "MCIsPlayerEvent")
+        // short GetFileTranslationPaths(...) returns a path count, not an OSErr.
+        | ("Translation", "GetFileTranslationPaths") => PpcImportDispatcherTarget::ReturnNoErr,
+        (
+            "InterfaceLib",
+            "PicComment" | "SpaceExtra" | "SysBreakStr" | "DisposeMCInfo" | "ResizePalette"
+            | "ColorBit",
+        ) => PpcImportDispatcherTarget::NoOpPreserve,
         ("InterfaceLib", "SVersion") => PpcImportDispatcherTarget::SVersion,
         ("InterfaceLib" | "CarbonLib", "EqualString") => PpcImportDispatcherTarget::EqualString,
         ("InterfaceLib", "equalstring") => PpcImportDispatcherTarget::EqualCString,
         ("InterfaceLib", "upperstring") => PpcImportDispatcherTarget::UpperCString,
         ("InterfaceLib", "drawstring") => PpcImportDispatcherTarget::DrawCString,
         ("InterfaceLib", "openresfile") => PpcImportDispatcherTarget::OpenResFileCString,
+        ("InterfaceLib", "relstring") => PpcImportDispatcherTarget::RelCString,
+        ("InterfaceLib", "getfnum") => PpcImportDispatcherTarget::GetFNumCString,
+        ("InterfaceLib", "getfontname") => PpcImportDispatcherTarget::GetFontNameCString,
+        ("InterfaceLib", "stringwidth") => PpcImportDispatcherTarget::StringWidthCString,
         ("InterfaceLib" | "CarbonLib", "RelString") => PpcImportDispatcherTarget::RelString,
         ("InterfaceLib", "InitEditionPackVersion") => {
             PpcImportDispatcherTarget::InitEditionPackVersion
@@ -5287,6 +5409,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib" | "CarbonLib", "NumToString") => PpcImportDispatcherTarget::NumToString,
         ("InterfaceLib", "numtostring") => PpcImportDispatcherTarget::NumToCString,
         ("InterfaceLib" | "CarbonLib", "StringToNum") => PpcImportDispatcherTarget::StringToNum,
+        ("InterfaceLib", "stringtonum") => PpcImportDispatcherTarget::CStringToNum,
         ("InterfaceLib", "Random") => PpcImportDispatcherTarget::Random,
         ("InterfaceLib" | "CarbonLib", "GetQDGlobalsRandomSeed" | "getqdglobalsrandomseed") => {
             PpcImportDispatcherTarget::GetQDGlobalsRandomSeed
@@ -5503,6 +5626,9 @@ pub(crate) fn dispatcher_target_for_import(
         }
         ("InterfaceLib" | "ICAp;InternetConfigLib" | "InternetConfigLib", "ICParseURL") => {
             PpcImportDispatcherTarget::ICParseURL
+        }
+        ("InterfaceLib" | "ICAp;InternetConfigLib" | "InternetConfigLib", "ICLaunchURL") => {
+            PpcImportDispatcherTarget::ICLaunchURL
         }
         ("InterfaceLib", "GetCurrentProcess" | "GetFrontProcess") => {
             PpcImportDispatcherTarget::GetCurrentProcess
@@ -5836,9 +5962,11 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "PurgeSpace") => PpcImportDispatcherTarget::LegacyMemoryUtility(
             PpcLegacyMemoryUtilityOperation::PurgeSpace,
         ),
-        ("InterfaceLib", "ReserveMem") => PpcImportDispatcherTarget::LegacyMemoryUtility(
-            PpcLegacyMemoryUtilityOperation::ReserveMem,
-        ),
+        ("InterfaceLib", "ReserveMem" | "ReserveMemSys") => {
+            PpcImportDispatcherTarget::LegacyMemoryUtility(
+                PpcLegacyMemoryUtilityOperation::ReserveMem,
+            )
+        }
         ("InterfaceLib", "SetGrowZone") => PpcImportDispatcherTarget::LegacyMemoryUtility(
             PpcLegacyMemoryUtilityOperation::SetGrowZone,
         ),
@@ -7139,7 +7267,7 @@ pub(crate) fn dispatcher_target_for_import(
         ("InterfaceLib", "PBHGetVolParmsSync") => PpcImportDispatcherTarget::FileCompatibility(
             PpcFileCompatibilityOperation::PbHGetVolParmsSync,
         ),
-        ("InterfaceLib", "PBHGetVolSync") => PpcImportDispatcherTarget::FileCompatibility(
+        ("InterfaceLib", "PBHGetVolSync" | "PBGetVolSync") => PpcImportDispatcherTarget::FileCompatibility(
             PpcFileCompatibilityOperation::PbHGetVolSync,
         ),
         ("InterfaceLib", "PBHSetVolSync") => PpcImportDispatcherTarget::FileCompatibility(
