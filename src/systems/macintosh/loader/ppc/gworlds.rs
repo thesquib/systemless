@@ -528,6 +528,7 @@ pub(crate) fn ppc_open_cport(
         || pixmap_handle == 0
         || vis_rgn == 0
         || clip_rgn == 0
+        || ppc_clear_opened_cport_fields(memory, port).is_none()
         || memory.write_u32_be(pixmap_handle, pixmap).is_none()
         || ppc_write_pixmap(
             memory,
@@ -598,6 +599,24 @@ pub(crate) fn ppc_open_cport(
     });
     *last_mem_error = PPC_NO_ERR;
     true
+}
+
+/// Give a CGrafPort being opened in caller-owned storage the defaults
+/// OpenCPort assigns to the fields `ppc_write_gworld_port` leaves alone.
+///
+/// Inside Macintosh: Imaging With QuickDraw (1994), pp. 4-64--4-66: the pen
+/// is at (0,0) and visible, chExtra and spExtra are zero, fgColor/bkColor are
+/// blackColor/whiteColor, and picSave, rgnSave, polySave and grafProcs are
+/// NIL. Applications commonly pass storage from a non-clearing NewPtr, so
+/// stale bytes in grafProcs would otherwise route DrawPicture and other
+/// drawing through garbage bottleneck procedures.
+fn ppc_clear_opened_cport_fields(memory: &mut PpcSectionMem, port: u32) -> Option<()> {
+    memory.write_bytes(port.checked_add(PPC_CGRAF_PORT_GRAF_VARS_OFFSET)?, &[0; 100])?;
+    // pnLocHFrac starts at one half.
+    memory.write_u16_be(port + 14, 0x8000)?;
+    memory.write_u32_be(port + 80, 0x0000_0021)?;
+    memory.write_u32_be(port + 84, 0x0000_001e)?;
+    Some(())
 }
 
 pub(crate) fn ppc_init_cport(
@@ -3515,11 +3534,8 @@ pub(crate) fn ppc_rect_dimensions(top: i16, left: i16, bottom: i16, right: i16) 
 }
 
 pub(crate) fn ppc_row_bytes(width: u32, depth: u32) -> Option<u32> {
-    let visible_row_bytes = width.checked_mul(depth)?.div_ceil(8);
-    visible_row_bytes
-        .checked_div(16)?
-        .checked_add(1)?
-        .checked_mul(16)
+    width.checked_mul(depth)?;
+    Some(TrapDispatcher::offscreen_row_bytes(width, depth))
 }
 
 pub(crate) fn ppc_u32_to_i16_saturating(value: u32) -> i16 {

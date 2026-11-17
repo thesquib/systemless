@@ -156,6 +156,7 @@ fn geometry_uses_only_guest_memory(target: &PpcImportDispatcherTarget) -> bool {
         | PpcImportDispatcherTarget::EqualPt
         | PpcImportDispatcherTarget::AddPt
         | PpcImportDispatcherTarget::SubPt
+        | PpcImportDispatcherTarget::DeltaPoint
         | PpcImportDispatcherTarget::PtInRect
         | PpcImportDispatcherTarget::OffsetRect
         | PpcImportDispatcherTarget::InsetRect
@@ -2070,6 +2071,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::EqualPt
         | PpcImportDispatcherTarget::AddPt
         | PpcImportDispatcherTarget::SubPt
+        | PpcImportDispatcherTarget::DeltaPoint
         | PpcImportDispatcherTarget::LocalToGlobal
         | PpcImportDispatcherTarget::GlobalToLocal
         | PpcImportDispatcherTarget::PtInRect
@@ -2528,8 +2530,8 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::EqualString
         | PpcImportDispatcherTarget::EqualCString
         | PpcImportDispatcherTarget::UpperCString
-        | PpcImportDispatcherTarget::ScreenRes
         | PpcImportDispatcherTarget::RelCString
+        | PpcImportDispatcherTarget::ScreenRes
         | PpcImportDispatcherTarget::RelString
         | PpcImportDispatcherTarget::InitEditionPackVersion
         | PpcImportDispatcherTarget::StuffHex
@@ -2537,6 +2539,7 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::NumToString
         | PpcImportDispatcherTarget::NumToCString
         | PpcImportDispatcherTarget::StringToNum
+        | PpcImportDispatcherTarget::CStringToNum
         | PpcImportDispatcherTarget::Random
         | PpcImportDispatcherTarget::SetQDGlobalsRandomSeed
         | PpcImportDispatcherTarget::GetQDGlobalsRandomSeed
@@ -2704,7 +2707,8 @@ pub(crate) fn dispatch_supported_import(
         | PpcImportDispatcherTarget::ICBegin
         | PpcImportDispatcherTarget::ICEnd
         | PpcImportDispatcherTarget::ICFindConfigFile
-        | PpcImportDispatcherTarget::ICParseURL => {
+        | PpcImportDispatcherTarget::ICParseURL
+        | PpcImportDispatcherTarget::ICLaunchURL => {
             dispatch_internet_config::dispatch_internet_config_import(
                 binding,
                 cpu,

@@ -21,6 +21,8 @@ pub(crate) const PPC_CWINDOW_STATE_HANDLE_OFFSET: u32 = crate::window_manager::W
 pub(crate) const PPC_CWINDOW_TITLE_HANDLE_OFFSET: u32 = 134;
 pub(crate) const PPC_CWINDOW_TITLE_WIDTH_OFFSET: u32 = crate::window_manager::WINDOW_TITLE_WIDTH_OFFSET;
 pub(crate) const PPC_CGRAF_PORT_WINDOW_REF_CON_OFFSET: u32 = crate::window_manager::WINDOW_REF_CON_OFFSET;
+/// Size of a CWindowRecord: the most NewCWindow may touch in caller storage.
+pub(crate) const PPC_CWINDOW_RECORD_SIZE: u32 = crate::window_manager::WINDOW_RECORD_SIZE;
 pub(crate) const PPC_CWINDOW_COLOR_TABLE_HANDLE_OFFSET: u32 = 164;
 pub(crate) const PPC_CWINDOW_CONTROL_LIST_OFFSET: u32 = 140;
 pub(crate) const PPC_LM_WINDOW_LIST_ADDR: u32 = crate::window_manager::LM_WINDOW_LIST_ADDR;
@@ -805,26 +807,7 @@ pub(super) fn dispatch_window_import(
                     tick_count,
                 );
                 if !was_visible {
-                    if let Some(port_rect) = ppc_read_rect(memory, window.wrapping_add(16)) {
-                        ppc_invalidate_window_local_rect(memory, window, port_rect);
-                    }
-                    // Macintosh Toolbox Essentials (1992), Window Manager,
-                    // PaintOne: newly exposed content uses its window color table.
-                    let content_color = ppc_window_color_table_handle(memory, window)
-                        .and_then(|handle| ppc_window_content_color(memory, handle))
-                        .or_else(|| {
-                            (ppc_window_proc_id(memory, window) == 3).then(|| {
-                                ppc_theme_rgb(
-                                    ppc_ui_theme(gworlds).provider().palette().window_background,
-                                )
-                            })
-                        });
-                    if let (Some(rect), Some(color)) = (
-                        ppc_read_rect(memory, window.wrapping_add(PPC_CWINDOW_PORT_RECT_OFFSET)),
-                        content_color,
-                    ) {
-                        let _ = ppc_paint_window_background_bounds(memory, gworlds, window, rect, color);
-                    }
+                    ppc_paint_revealed_window_content(memory, gworlds, window_list, handles, window);
                     if ppc_front_visible_process_window(memory, window_list) != Some(window) {
                         ppc_draw_existing_window_frame(
                             memory,
@@ -970,6 +953,7 @@ pub(super) fn dispatch_window_import(
                     input,
                 );
                 if visible && !was_visible {
+                    ppc_paint_revealed_window_content(memory, gworlds, window_list, handles, window);
                     if ppc_front_visible_process_window(memory, window_list) != Some(window) {
                         ppc_draw_existing_window_frame(
                             memory,
@@ -979,6 +963,7 @@ pub(super) fn dispatch_window_import(
                             toolbox_startup.host_menu_bar_hidden,
                         );
                     }
+                    ppc_enqueue_window_update_event(event_queue, window, tick_count, input);
                 }
                 if ppc_front_visible_process_window(memory, window_list) != previous_front {
                     let _ = ppc_activate_front_window_palette(
@@ -1248,16 +1233,12 @@ pub(super) fn dispatch_window_import(
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::BeginUpdate => {
-            if let Some(params) =
-                crate::window_manager::evaluate_begin_update_parameters(cpu.gpr[3])
-            {
-                let window = params.window_ptr();
-                if gworlds.iter().any(|record| record.port == window) {
-                    *current_gworld = window;
-                    *current_gdevice =
-                        ppc_gworld_device(gworlds, window).unwrap_or(*current_gdevice);
-                }
-            }
+            // Macintosh Toolbox Essentials (1992), p. 4-129: BeginUpdate
+            // only limits the window's visRgn to its update region; it does
+            // not change the current port. Applications that SetPort to an
+            // offscreen port and then BeginUpdate (Escape Velocity draws its
+            // main menu offscreen before copying it to the window) must keep
+            // drawing into that port.
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::EndUpdate => {
@@ -1797,7 +1778,9 @@ pub(super) fn ppc_new_cwindow_with_storage(
         *last_mem_error = PPC_PARAM_ERR;
         return 0;
     }
-    // Caller storage holds only a CWindowRecord; bytes after it belong to the application.
+    // Caller-supplied wStorage only spans a CWindowRecord; the bytes after it
+    // belong to the application, so never initialize past the record there.
+    // Inside Macintosh: Macintosh Toolbox Essentials (1992), Window Manager.
     let record_size = if storage_ptr != 0 {
         PPC_CWINDOW_RECORD_SIZE
     } else {
@@ -2928,7 +2911,18 @@ pub(super) fn ppc_get_new_cwindow(
         *last_resource_error = PPC_RES_NOT_FOUND_ERR;
         return 0;
     };
-    let bytes = resource.data.clone();
+    // The template is loaded as a resource (Inside Macintosh I-283), and
+    // GetResource returns the existing handle for a loaded resource (I-119),
+    // so a 'WIND' the application has already loaded supplies its handle's
+    // current bytes: applications commonly size the template to the screen
+    // before creating the window.
+    let bytes = (resource.handle != 0)
+        .then(|| memory.read_u32_be(resource.handle))
+        .flatten()
+        .filter(|ptr| *ptr != 0)
+        .and_then(|ptr| ppc_memory_read_bytes(memory, ptr, resource.data.len() as u32))
+        .map(Into::into)
+        .unwrap_or_else(|| resource.data.clone());
     let mut allocator = PpcProcessAllocatorView {
         memory_manager: process_memory_manager,
     };
@@ -2943,6 +2937,7 @@ pub(super) fn ppc_get_new_cwindow(
         *last_mem_error = PPC_PARAM_ERR;
         return 0;
     };
+    ppc_apply_wind_position(memory, gworlds, &bytes, bounds_ptr);
     let mut window_cpu = cpu.clone();
     window_cpu.gpr[3] = storage_ptr;
     window_cpu.gpr[4] = bounds_ptr;
@@ -3728,6 +3723,51 @@ fn ppc_window_is_dialog(memory: &mut PpcSectionMem, window: u32) -> bool {
             == Some(crate::dialog_manager::DIALOG_WINDOW_KIND)
 }
 
+/// Macintosh Toolbox Essentials (1992), pp. 4-91 and 4-115: a window that
+/// ShowWindow or ShowHide reveals is painted by PaintOne, which erases the
+/// whole content region with the window's content color and adds it to the
+/// update region. Without a WCTab, the content color is the default white
+/// (the theme's window background). The erase uses the Window Manager port's
+/// clipping, so the application's clipRgn does not limit it.
+fn ppc_paint_revealed_window_content(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    window_list: &SharedProcessWindowList,
+    handles: &[PpcHandleRecord],
+    window: u32,
+) {
+    let Some(port_rect) = ppc_read_rect(memory, window.wrapping_add(PPC_CWINDOW_PORT_RECT_OFFSET))
+    else {
+        return;
+    };
+    ppc_invalidate_window_local_rect(memory, window, port_rect);
+    // A dialog's color table is the dctb GetNewDialog copied for it.
+    let color_table = if ppc_window_is_dialog(memory, window) {
+        memory
+            .read_u32_be(window_list.dialog_private_address(
+                window,
+                crate::dialog_manager::DIALOG_COLOR_TABLE_HANDLE_OFFSET,
+            ))
+            .filter(|handle| handles.iter().any(|record| record.handle == *handle))
+    } else {
+        ppc_window_color_table_handle(memory, window)
+    };
+    // Only the standard document and dialog WDEFs (IDs 0 and 1, procIDs
+    // 0-15) have content regions Systemless computes; a custom WDEF defines
+    // its own, so without a WCTab its content is left to the application.
+    let Some(color) = color_table
+        .and_then(|handle| ppc_window_content_color(memory, handle))
+        .or_else(|| {
+            (0..16).contains(&ppc_window_proc_id(memory, window)).then(|| {
+                ppc_theme_rgb(ppc_ui_theme(gworlds).provider().palette().window_background)
+            })
+        })
+    else {
+        return;
+    };
+    let _ = ppc_paint_window_background_bounds(memory, gworlds, window, port_rect, color);
+}
+
 fn ppc_window_color_table_handle(memory: &mut PpcSectionMem, window: u32) -> Option<u32> {
     // DialogRecord overlays the CWindowRecord extension at +164 with its
     // editField/editOpen state. Those bytes are never an AuxWin color table.
@@ -4184,6 +4224,7 @@ pub(super) fn ppc_dispatch_legacy_window(
                 *last_resource_error = PPC_PARAM_ERR;
                 return Some(PpcImportAction::Return(0));
             };
+            ppc_apply_wind_position(memory, gworlds, &bytes, bounds);
             let mut window_cpu = cpu.clone();
             window_cpu.gpr[3] = params.storage_ptr();
             window_cpu.gpr[4] = bounds;
@@ -6287,6 +6328,65 @@ pub(super) fn ppc_set_window_title(
             .is_some();
     *last_mem_error = if wrote { PPC_NO_ERR } else { PPC_PARAM_ERR };
     wrote
+}
+
+/// The optional System 7 positioning word that follows a WIND template's
+/// word-aligned title, or zero when the template predates it.
+pub(super) fn ppc_wind_position_word(bytes: &[u8]) -> u16 {
+    let Some(&title_len) = bytes.get(18) else {
+        return 0;
+    };
+    let offset = (19 + usize::from(title_len) + 1) & !1;
+    bytes
+        .get(offset..offset + 2)
+        .map_or(0, |word| u16::from_be_bytes([word[0], word[1]]))
+}
+
+/// System 7 WIND templates may append a positioning word after the
+/// word-aligned title; GetNewWindow and GetNewCWindow place the window with
+/// it the same way the Dialog Manager places DLOG templates.
+/// Inside Macintosh: Macintosh Toolbox Essentials (1992), Window Manager.
+fn ppc_apply_wind_position(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    bytes: &[u8],
+    bounds_ptr: u32,
+) {
+    let position = ppc_wind_position_word(bytes);
+    if position == 0 || bytes.len() < 10 {
+        return;
+    }
+    let proc_id = i16::from_be_bytes([bytes[8], bytes[9]]);
+    if let Some(bounds) = ppc_read_rect(memory, bounds_ptr) {
+        let (top, left, bottom, right) =
+            ppc_position_window_template_bounds(memory, gworlds, bounds, position, proc_id);
+        let _ = ppc_write_rect(memory, bounds_ptr, top, left, bottom, right);
+    }
+}
+
+fn ppc_position_window_template_bounds(
+    memory: &mut PpcSectionMem,
+    gworlds: &[PpcGWorldRecord],
+    bounds: (i16, i16, i16, i16),
+    position: u16,
+    proc_id: i16,
+) -> (i16, i16, i16, i16) {
+    let screen = gworlds.iter().find(|record| record.port == PPC_MAIN_GWORLD);
+    let screen_width = screen.map_or(ppc_main_screen_width(), |record| record.width) as i32;
+    let screen_height = screen.map_or(ppc_main_screen_height(), |record| record.height) as i32;
+    let menu_bar_height =
+        i32::from(memory.read_u16_be(PPC_MBAR_HEIGHT_ADDR).unwrap_or(20) as i16).max(0);
+    let parent = ppc_front_visible_window(memory, gworlds)
+        .and_then(|window| ppc_window_global_content_bounds(memory, gworlds, window));
+    crate::dialog_manager::evaluate_dialog_position_bounds(
+        bounds,
+        position,
+        Some(ppc_window_structure_bounds(proc_id, bounds)),
+        parent,
+        screen_width,
+        screen_height,
+        menu_bar_height,
+    )
 }
 
 pub(super) fn ppc_materialize_window_resource_parameters(

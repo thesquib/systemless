@@ -52,10 +52,16 @@ pub(super) fn dispatch_toolbox_import(
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::ScreenRes => {
-            // void ScreenRes(short *scrnHRes, short *scrnVRes): the emulated
-            // display is 72 dpi in both directions.
-            let _ = memory.write_u16_be(cpu.gpr[3], 72);
-            let _ = memory.write_u16_be(cpu.gpr[4], 72);
+            // void ScreenRes(short *scrnHRes, short *scrnVRes): reports the
+            // ScrHRes and ScrVRes low-memory globals, which the loader seeds
+            // at 72 dpi (Inside Macintosh Volume I, Toolbox Utilities).
+            use crate::memory::globals::addr;
+            for (out, global) in [(cpu.gpr[3], addr::SCR_H_RES), (cpu.gpr[4], addr::SCR_V_RES)] {
+                if out != 0 {
+                    let value = memory.read_u16_be(global).unwrap_or(72);
+                    let _ = memory.write_u16_be(out, value);
+                }
+            }
             Some(PpcImportAction::ReturnPreserve)
         }
         PpcImportDispatcherTarget::EqualCString => {
@@ -63,9 +69,14 @@ pub(super) fn dispatch_toolbox_import(
         }
         PpcImportDispatcherTarget::RelCString => {
             // short relstring(const char *, const char *, Boolean caseSens,
-            // Boolean diacSens): the C glue for RelString.
-            let left = ppc_read_bounded_c_string(memory, cpu.gpr[3])?;
-            let right = ppc_read_bounded_c_string(memory, cpu.gpr[4])?;
+            // Boolean diacSens): the C glue for RelString. An unreadable or
+            // unterminated string compares as equal, as equalstring treats it.
+            let (Some(left), Some(right)) = (
+                ppc_read_bounded_c_string(memory, cpu.gpr[3]),
+                ppc_read_bounded_c_string(memory, cpu.gpr[4]),
+            ) else {
+                return Some(PpcImportAction::Return(0));
+            };
             let result = crate::text_utils::evaluate_rel_string(
                 &left,
                 &right,
@@ -155,6 +166,10 @@ pub(super) fn dispatch_toolbox_import(
             ppc_string_to_num(cpu, memory);
             Some(PpcImportAction::ReturnPreserve)
         }
+        PpcImportDispatcherTarget::CStringToNum => {
+            ppc_c_string_to_num(cpu, memory);
+            Some(PpcImportAction::ReturnPreserve)
+        }
         PpcImportDispatcherTarget::GetQDGlobalsRandomSeed => {
             // Quickdraw.h: long GetQDGlobalsRandomSeed(void). A query must
             // preserve all seed bits and must not advance Random's state.
@@ -205,6 +220,23 @@ pub(crate) fn ppc_string_to_num(cpu: &PpcCpu, memory: &mut PpcSectionMem) {
         return;
     }
     let Some(bytes) = ppc_read_pstring_bytes(memory, string_ptr) else {
+        return;
+    };
+    let value = crate::text_utils::evaluate_string_to_num(&bytes);
+    let _ = memory.write_u32_be(number_ptr, value as u32);
+}
+
+/// `void stringtonum(char *theString, long *theNum)`: the C-string glue for
+/// StringToNum. NumberFormatting.h lists it for InterfaceLib 7.1 and later and
+/// not for Carbon; older interfaces declare it in TextUtils.h. Parsing rules
+/// are StringToNum's.
+pub(crate) fn ppc_c_string_to_num(cpu: &PpcCpu, memory: &mut PpcSectionMem) {
+    let string_ptr = cpu.gpr[3];
+    let number_ptr = cpu.gpr[4];
+    if string_ptr == 0 || number_ptr == 0 || !ppc_memory_can_write_bytes(memory, number_ptr, 4) {
+        return;
+    }
+    let Some(bytes) = ppc_read_bounded_c_string(memory, string_ptr) else {
         return;
     };
     let value = crate::text_utils::evaluate_string_to_num(&bytes);

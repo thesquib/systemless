@@ -477,6 +477,39 @@ fn draw_raw_quilt_frame(
     true
 }
 
+mod matte;
+
+/// The frame-to-destination transform `draw_picture` applies to picture
+/// coordinates: `dst = (pic - frame) * scale + dst_origin`.
+struct PictureMapping {
+    frame_top: i16,
+    frame_left: i16,
+    scale_x: f64,
+    scale_y: f64,
+    dst_top: i16,
+    dst_left: i16,
+}
+
+impl PictureMapping {
+    fn to_destination(&self, pic_y: i32, pic_x: i32) -> (i32, i32) {
+        (
+            ((pic_y - i32::from(self.frame_top)) as f64 * self.scale_y) as i32
+                + i32::from(self.dst_top),
+            ((pic_x - i32::from(self.frame_left)) as f64 * self.scale_x) as i32
+                + i32::from(self.dst_left),
+        )
+    }
+
+    fn to_picture(&self, y: i32, x: i32) -> (i32, i32) {
+        (
+            (f64::from(y - i32::from(self.dst_top)) / self.scale_y).floor() as i32
+                + i32::from(self.frame_top),
+            (f64::from(x - i32::from(self.dst_left)) / self.scale_x).floor() as i32
+                + i32::from(self.frame_left),
+        )
+    }
+}
+
 /// Parse and render a PICT from guest memory.
 /// `pic_ptr` points to the Picture record (picSize + picFrame + opcodes).
 /// `dst_rect` is the destination rectangle from DrawPicture parameters.
@@ -610,6 +643,9 @@ pub fn draw_picture(
     let mut tx_mode: i16 = 1;
 
     let mut is_v2 = false;
+    // Matte from an UncompressedQuickTime opcode ($8201), applied to the
+    // bits opcode that follows it.
+    let mut pending_matte: Option<matte::PictureMatte> = None;
 
     loop {
         if opcount > 10000 {
@@ -633,6 +669,23 @@ pub fn draw_picture(
             let op = bus.read_byte(pos) as u16;
             pos += 1;
             op
+        };
+
+        let matte_backdrop = if is_v2 && matches!(opcode, 0x90 | 0x91 | 0x98 | 0x99 | 0x9A | 0x9B) {
+            pending_matte.take().and_then(|matte| {
+                let mapping = PictureMapping {
+                    frame_top,
+                    frame_left,
+                    scale_x,
+                    scale_y,
+                    dst_top,
+                    dst_left,
+                };
+                matte::MatteBackdrop::save(bus, matte, &mapping, screen_mode)
+                    .map(|backdrop| (backdrop, mapping))
+            })
+        } else {
+            None
         };
 
         match opcode {
@@ -740,13 +793,13 @@ pub fn draw_picture(
                 // FgColor (4 bytes) — map legacy QD colors into the active
                 // destination palette.
                 let c = bus.read_long(pos);
-                fg_idx = pict_qd_color_to_clut_index(c, fg_idx, black_idx, white_idx);
+                fg_idx = pict_qd_color_to_clut_index(c, black_idx, white_idx, device_clut);
                 pos += 4;
             }
             0x0F => {
                 // BkColor (4 bytes) — same mapping as FgColor.
                 let c = bus.read_long(pos);
-                bg_idx = pict_qd_color_to_clut_index(c, bg_idx, black_idx, white_idx);
+                bg_idx = pict_qd_color_to_clut_index(c, black_idx, white_idx, device_clut);
                 pos += 4;
             }
             0x10 => {
@@ -1556,6 +1609,16 @@ pub fn draw_picture(
                 // Version (v2, 2 bytes)
                 pos += 2;
             }
+            0x8201 => {
+                // UncompressedQuickTime: a matte for the bits opcode that
+                // follows. Inside Macintosh: QuickTime (1993), Table 3-1.
+                pending_matte = matte::parse_uncompressed_quicktime_matte(bus, pos);
+                let data_len = bus.read_long(pos);
+                let Some(next) = checked_skip_pict_data(pos, 4, data_len) else {
+                    break;
+                };
+                pos = next;
+            }
             0x8200 => {
                 // CompressedQuickTime. QuickTime 1993, Table 3-1:
                 // fixed opcode header, optional matte/mask data, an
@@ -1634,6 +1697,10 @@ pub fn draw_picture(
                     break;
                 }
             }
+        }
+
+        if let Some((backdrop, mapping)) = matte_backdrop {
+            backdrop.composite(bus, &mapping, screen_mode, device_clut, dst_clip);
         }
     }
 
@@ -3257,23 +3324,23 @@ fn indexed_destination_clut(device_clut: &[[u16; 3]; 256], pixel_size: u16) -> [
     clut
 }
 
-/// Map a legacy Mac Pascal QuickDraw color constant to a destination CLUT
-/// index. Inside Macintosh Volume I, I-172 defines the 8 canonical colors.
-/// `default_idx` is returned for color = 0 (Pascal sentinel for "no color
-/// change"). Unknown constants fall through to `color & 0xFF` so apps passing
-/// custom CLUT indices via FgColor still address the intended slot.
-fn pict_qd_color_to_clut_index(color: u32, default_idx: u8, black_idx: u8, white_idx: u8) -> u8 {
-    match color {
-        0 => default_idx,
-        30 => white_idx,
-        33 => black_idx,
-        205 => 35,  // redColor → red slot on std Mac 8bpp CLUT
-        341 => 173, // greenColor
-        409 => 210, // blueColor
-        69 => 17,   // yellowColor
-        137 => 137, // magentaColor
-        273 => 69,  // cyanColor
-        _ => (color & 0xFF) as u8,
+/// Resolve a PICT FgColor/BkColor (0x0E/0x0F) planar color value. Playback
+/// applies these through ForeColor/BackColor, which select one of the eight
+/// QuickDraw colors; Color QuickDraw then matches that RGB in the destination
+/// color table.
+fn pict_qd_color_to_clut_index(
+    color: u32,
+    black_idx: u8,
+    white_idx: u8,
+    device_clut: &[[u16; 3]; 256],
+) -> u8 {
+    match super::quickdraw::legacy_qd_color_plane_index(color) {
+        0 => black_idx,
+        7 => white_idx,
+        index => {
+            let (r, g, b) = super::quickdraw::LEGACY_QD_COLOR_RGB[index];
+            closest_clut_index(r, g, b, device_clut)
+        }
     }
 }
 

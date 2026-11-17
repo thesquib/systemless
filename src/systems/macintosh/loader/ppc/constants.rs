@@ -75,6 +75,8 @@ pub const PPC_WR_PERM_ERR: i16 = -61;
 pub const PPC_PARAM_ERR: i16 = -50;
 pub const PPC_C_RES_ERR: i16 = -156;
 pub const PPC_DIR_NF_ERR: i16 = -120;
+/// notAFileErr (Files.h): the catalog entry is a directory.
+pub(crate) const PPC_NOT_A_FILE_ERR: i16 = -1302;
 pub(crate) const PPC_PIXMAP_TOO_DEEP_ERR: i16 = -148;
 pub(crate) const PPC_RGN_TOO_BIG_ERR: i16 = -500;
 pub const PPC_OPEN_ERR: i16 = -23;
@@ -319,7 +321,6 @@ pub(crate) const PPC_CGRAF_PORT_TX_FACE_OFFSET: u32 = 70;
 pub(crate) const PPC_CGRAF_PORT_TX_MODE_OFFSET: u32 = 72;
 pub(crate) const PPC_CGRAF_PORT_TX_SIZE_OFFSET: u32 = 74;
 pub(crate) const PPC_CGRAF_PORT_RGN_SAVE_OFFSET: u32 = 96;
-pub(crate) const PPC_CWINDOW_RECORD_SIZE: u32 = 156;
 pub(crate) const PPC_GRAF_PORT_SIZE: u32 = 108;
 pub(crate) const PPC_GDEVICE_SIZE: u32 = 62;
 pub const PPC_PIXMAP_SIZE: u32 = 50;
