@@ -411,7 +411,6 @@ impl PpcLoadedApp {
         let mut recent_imports = VecDeque::<PpcHleImportTraceEntry>::new();
         let mut idle_poll_counts = HashMap::<u32, u32>::new();
         let mut tick_count_idle_poll = PpcTickCountIdlePollState::default();
-        let mut os_event_idle_poll = PpcOsEventIdlePollState::default();
         let needs_fetch_observer = trace_fetches || trace_ppc || trace_pc_range.is_some();
         let mut interrupt_return_work = None;
         let mut fetch_observer = PpcHleFetchObserver {
@@ -861,6 +860,14 @@ impl PpcLoadedApp {
                         recent_imports.pop_front();
                     }
                 }
+                // A control definition returning to the import that queued
+                // it re-enters that import with the definition's registers.
+                // Only the general dispatch path resumes the queued messages,
+                // so no fast path may answer the re-entry. Inside Macintosh:
+                // Macintosh Toolbox Essentials (1992), p. 5-109: the Control
+                // Manager sends drawCntl for every visible control drawn.
+                let resuming_control_definition =
+                    ppc_control_definition_resume_pending(&toolbox_startup, cpu);
                 // A null event cannot select an item. Pending callbacks
                 // still need the general dispatch path.
                 let null_dialog_poll = matches!(
@@ -871,6 +878,7 @@ impl PpcLoadedApp {
                 ) && dialog_callback_stack.is_empty()
                     && memory.read_u16_be(cpu.gpr[3]) == Some(0);
                 if !trace_ppc
+                    && !resuming_control_definition
                     && (*dispatcher_target != PpcImportDispatcherTarget::TickCount
                         || !trace_imports)
                     && (matches!(
@@ -2226,10 +2234,14 @@ impl PpcLoadedApp {
                             action,
                             ppc_import_extra_cycles_for_binding(binding),
                         );
-                        let action = if binding.dispatcher_target
-                            == PpcImportDispatcherTarget::GetOSEvent
-                        {
-                            ppc_os_event_idle_poll_action(
+                        let action = if matches!(
+                            binding.dispatcher_target,
+                            PpcImportDispatcherTarget::GetOSEvent
+                                | PpcImportDispatcherTarget::GetNextEvent(
+                                    PpcEventPollOperation::GetNextEvent
+                                )
+                        ) {
+                            ppc_event_idle_poll_action(
                                 action,
                                 cpu.lr,
                                 import_tick_count,
@@ -2239,7 +2251,7 @@ impl PpcLoadedApp {
                                     elapsed,
                                 )
                                 .min(max_cycles.saturating_sub(elapsed)),
-                                &mut os_event_idle_poll,
+                                &mut toolbox_startup.event_idle_poll,
                             )
                         } else {
                             action

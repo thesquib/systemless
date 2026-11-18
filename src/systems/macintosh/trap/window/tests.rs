@@ -1424,11 +1424,11 @@ fn run_new_window_with_visible(visible_arg: u16) -> (u32, u8) {
 }
 
 #[test]
-fn new_window_with_visible_true_sets_visible_byte_to_ff() {
+fn new_window_with_visible_true_sets_visible_byte_to_pascal_true() {
     let (window_ptr, visible_byte) = run_new_window_with_visible(1);
     assert_ne!(window_ptr, 0);
     assert_eq!(
-        visible_byte, 0xFF,
+        visible_byte, 0x01,
         "NewWindow(visible=true) must mark window visible"
     );
 }
@@ -1898,6 +1898,74 @@ fn new_cwindow_behind_nil_places_new_window_at_back() {
         "NewCWindow(behind=NIL) must insert at the back"
     );
     assert_eq!(disp.front_window, existing);
+}
+
+#[test]
+fn new_cwindow_created_hidden_behind_does_not_invalidate_windows_in_front() {
+    // A window created hidden draws nothing, so placing it behind an
+    // existing window clobbers nothing there (Inside Macintosh Volume I,
+    // I-283). THINK Class Library creates each dialog hidden at the screen
+    // origin before moving and showing it; invalidating the window in front
+    // made Fluffy's Adventure 1.2 repaint that corner over its dialogs.
+    let (mut disp, mut cpu, mut bus) = setup();
+    let screen_base = bus.alloc(800 * 600);
+    bus.write_long(0x0824, screen_base);
+    disp.set_screen_mode_for_test(screen_base, 800, 800, 600, 8);
+
+    let existing = bus.alloc(256);
+    disp.init_cgraf_window(
+        &mut bus,
+        &mut cpu,
+        existing,
+        screen_base,
+        40,
+        4,
+        420,
+        540,
+        "Game",
+        0,
+        true,
+        true,
+        true,
+        0,
+    );
+    disp.window_list.replace(vec![existing]);
+    disp.sync_window_list_links(&mut bus);
+    disp.front_window = existing;
+    let update_handle = bus.read_long(existing + 122);
+    super::super::TrapDispatcher::write_region_handle_rect(&mut bus, update_handle, None);
+    disp.clear_queued_update_events(existing);
+
+    let bounds_rect_ptr = 0x301200u32;
+    bus.write_word(bounds_rect_ptr, 0);
+    bus.write_word(bounds_rect_ptr + 2, 0);
+    bus.write_word(bounds_rect_ptr + 4, 178);
+    bus.write_word(bounds_rect_ptr + 6, 335);
+
+    let sp = TEST_SP - 30;
+    cpu.write_reg(Register::A7, sp);
+    for i in 0..30u32 {
+        bus.write_byte(sp + i, 0);
+    }
+    bus.write_word(sp + 10, 4); // procID: dBoxProc
+    bus.write_word(sp + 12, 0); // visible = FALSE
+    bus.write_long(sp + 18, bounds_rect_ptr);
+    bus.write_long(sp + 6, 0); // behind = NIL (backmost)
+
+    let result = dispatch(&mut disp, 0x245, &mut cpu, &mut bus);
+    assert!(result.unwrap().is_ok());
+    assert_eq!(
+        disp.window_update_rect(&bus, existing),
+        None,
+        "a hidden new window must not add to the update region of a window in front"
+    );
+    assert!(
+        !disp
+            .event_queue
+            .iter()
+            .any(|event| event.what == 6 && event.message == existing),
+        "a hidden new window must not queue an update event for a window in front"
+    );
 }
 
 #[test]
@@ -2736,6 +2804,53 @@ fn disposewindow_front_promotion_highlights_next_visible_and_queues_activate_eve
             .iter()
             .any(|event| event.what == 8 && event.message == next && (event.modifiers & 1) == 1),
         "DisposeWindow front promotion must queue activate event for new front window"
+    );
+}
+
+#[test]
+fn disposewindow_front_promotion_skips_hidden_remaining_window() {
+    // IM:I I-283: only a visible window behind the closed front window is
+    // highlighted and activated. THINK Class Library applications keep a
+    // hidden clipboard window; activating it moves TCL's gGopher away from
+    // the next document window (Fluffy's Adventure 1.2 never starts its
+    // first scene).
+    let (mut disp, mut cpu, mut bus) = setup();
+    let front = 0x200040u32;
+    let hidden = 0x200140u32;
+    disp.window_list.replace(vec![front, hidden]);
+    disp.front_window = front;
+    disp.current_port
+        .with_mut(|current_port| *current_port = front);
+    for &base in &[front, hidden] {
+        bus.write_word(base + 16, 10);
+        bus.write_word(base + 18, 10);
+        bus.write_word(base + 20, 50);
+        bus.write_word(base + 22, 100);
+    }
+    bus.write_byte(front + 110u32, 0xFF);
+    bus.write_byte(front + 111u32, 0xFF);
+    bus.write_byte(hidden + 110u32, 0x00);
+    bus.write_byte(hidden + 111u32, 0x00);
+
+    let sp = TEST_SP - 4;
+    cpu.write_reg(Register::A7, sp);
+    bus.write_long(sp, front);
+
+    let result = dispatch(&mut disp, 0x114, &mut cpu, &mut bus);
+    assert!(result.unwrap().is_ok());
+    assert_eq!(cpu.read_reg(Register::A7), TEST_SP);
+    assert_eq!(disp.window_list, vec![hidden]);
+    assert_eq!(
+        bus.read_byte(hidden + 111u32),
+        0x00,
+        "a hidden window must not be highlighted when the front window is disposed"
+    );
+    assert!(
+        !disp
+            .event_queue
+            .iter()
+            .any(|event| event.what == 8 && event.message == hidden),
+        "a hidden window must not receive an activate event when the front window is disposed"
     );
 }
 
@@ -4116,7 +4231,7 @@ fn showhide_true_makes_target_visible_without_front_reorder_or_activate_events()
 
     assert_eq!(
         bus.read_byte(target_window + 110),
-        0xFF,
+        0x01,
         "ShowHide(TRUE) must set visible byte"
     );
     assert_eq!(
@@ -4264,6 +4379,55 @@ fn hidden_full_screen_backdrop_for_test(
         bus, cpu, window, screen_base, 0, 0, 9999, 9999, "", 2, false, true, true, 0,
     );
     (screen_base, window)
+}
+
+#[test]
+fn window_visible_flag_stores_pascal_true_like_the_rom() {
+    // WindowMgr.a: ShowWindow pushes #1 ("set boolean WVISIBLE to $01, not
+    // $FF") and ShowHide stores its showFlag byte verbatim, testing only bit
+    // 0. Moria re-hides its main window unless `visible == 1`.
+    let (mut disp, mut cpu, mut bus) = setup();
+    let screen_base = bus.alloc(800 * 600);
+    bus.write_long(crate::memory::globals::addr::SCREEN_BITS, screen_base);
+    disp.set_screen_mode_for_test(screen_base, 800, 800, 600, 8);
+    let window = bus.alloc(256);
+    disp.init_cgraf_window(
+        &mut bus,
+        &mut cpu,
+        window,
+        screen_base,
+        60,
+        40,
+        200,
+        300,
+        "Moria",
+        4,
+        true,
+        true,
+        true,
+        0,
+    );
+    assert_eq!(bus.read_byte(window + 110), 0x01, "NewWindow(visible=TRUE)");
+
+    show_hide_for_test(&mut disp, &mut cpu, &mut bus, window, false);
+    assert_eq!(bus.read_byte(window + 110), 0x00);
+    show_hide_for_test(&mut disp, &mut cpu, &mut bus, window, true);
+    assert_eq!(bus.read_byte(window + 110), 0x01, "ShowHide(window, TRUE)");
+
+    show_hide_for_test(&mut disp, &mut cpu, &mut bus, window, false);
+    let sp = TEST_SP - 4;
+    cpu.write_reg(Register::A7, sp);
+    bus.write_long(sp, window);
+    dispatch(&mut disp, 0x115, &mut cpu, &mut bus).unwrap().unwrap();
+    assert_eq!(bus.read_byte(window + 110), 0x01, "ShowWindow");
+
+    // An already-visible window keeps its byte: only bit 0 is compared.
+    let sp = TEST_SP - 6;
+    cpu.write_reg(Register::A7, sp);
+    bus.write_byte(sp, 0xFF);
+    bus.write_long(sp + 2, window);
+    dispatch(&mut disp, 0x108, &mut cpu, &mut bus).unwrap().unwrap();
+    assert_eq!(bus.read_byte(window + 110), 0x01);
 }
 
 #[test]

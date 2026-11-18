@@ -2120,7 +2120,7 @@
 
         let dlg_ptr = bus.read_long(TEST_SP + 10);
         assert_ne!(dlg_ptr, 0);
-        assert_eq!(bus.read_byte(dlg_ptr + 110), 0xFF);
+        assert_eq!(bus.read_byte(dlg_ptr + 110), 0x01);
         assert!(disp.dialog_items.contains_key(&dlg_ptr));
         assert!(
             disp.dialog_saved_pixels.contains_key(&dlg_ptr),
@@ -2795,7 +2795,7 @@
             0,
         );
 
-        assert_eq!(bus.read_byte(dialog_ptr + 110), 0xFF);
+        assert_eq!(bus.read_byte(dialog_ptr + 110), 0x01);
         assert!(disp
             .event_queue
             .iter()
@@ -8091,7 +8091,7 @@
         assert_eq!(classic.new_front_window, classic.new_dialog_ptr);
         assert_eq!(classic.new_current_port, classic.new_previous_port);
         assert_eq!(classic.new_the_port, classic.new_previous_port);
-        assert_eq!(classic.new_visible_byte, 0xFF);
+        assert_eq!(classic.new_visible_byte, 0x01);
         assert_eq!(classic.new_goaway_byte, 0xFF);
         assert_eq!(classic.new_refcon, 0x1234_5678);
         assert_eq!(classic.new_window_kind, 2);
@@ -8119,7 +8119,7 @@
         assert_eq!(classic.get_front_window, classic.get_dialog_ptr);
         assert_eq!(classic.get_current_port, classic.get_previous_port);
         assert_eq!(classic.get_the_port, classic.get_previous_port);
-        assert_eq!(classic.get_visible_byte, 0xFF);
+        assert_eq!(classic.get_visible_byte, 0x01);
         assert_eq!(classic.get_refcon, 0);
         assert_eq!(classic.get_window_kind, 2);
         assert_eq!(classic.get_proc_id, 2);
@@ -8826,6 +8826,42 @@
         for (x, y) in [(0, 0), (50, 30), (99, 59), (100, 60)] {
             assert_eq!(bus.read_byte(base + y * stride + x), 0x77);
         }
+    }
+
+    #[test]
+    fn drawdialog_draws_picture_item_with_resource_id_zero() {
+        // MTE 1992 p. 6-155: a picture item names a `PICT` resource by ID,
+        // and 0 is a valid resource ID. Hellcats over the Pacific's splash
+        // dialog (DITL 136) shows PICT 0 and was left blank.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let port = bus.alloc(170);
+        bus.write_word(port + 20, 60);
+        bus.write_word(port + 22, 100);
+        let (base, stride, _, _, _) = disp.screen_mode;
+        bus.write_bytes(base, &vec![0x77; (stride * 80) as usize]);
+        disp.install_test_resource(&mut bus, *b"PICT", 0, &solid_fill_pict_resource(16, 16));
+        disp.dialog_items.insert(
+            port,
+            vec![DialogItem {
+                item_type: 64,
+                rect: (8, 8, 24, 24),
+                text: String::new(),
+                resource_id: 0,
+                proc_ptr: 0,
+                sel_start: 0,
+                sel_end: 0,
+            }],
+        );
+        bus.write_long(TEST_SP, port);
+        cpu.write_reg(Register::A7, TEST_SP);
+        disp.dispatch_dialog(true, 0x181, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bus.read_byte(base + 16 * stride + 16),
+            255,
+            "DrawDialog must draw PICT 0 into its picture item"
+        );
     }
 
     #[test]
@@ -11078,6 +11114,106 @@
             + (16 - bounds.1 + TrapDispatcher::DBOX_FRAME_MARGIN) as usize;
         assert_eq!(tracking.rendered_pixels[bulk_index], 0x44);
         assert_eq!(tracking.rendered_pixels[later_index], 0x77);
+    }
+
+    #[test]
+    fn bulk_draw_during_user_item_update_pass_keeps_modal_snapshot_open() {
+        // Inside Macintosh Volume I, I-405: ModalDialog's update pass calls
+        // every userItem procedure in turn. Galactic Frontiers draws a
+        // picture in its first userItem and its popup menus in later ones;
+        // finalizing the snapshot after that picture let the next frame
+        // restore it over the popups before they had all been drawn.
+        let (mut disp, _cpu, mut bus) = setup();
+        let screen_base = bus.alloc((64 * 64) as u32);
+        bus.write_bytes(screen_base, &vec![0x00; 64 * 64]);
+        bus.write_long(0x0824, screen_base);
+        disp.screen_mode = (screen_base, 64, 64, 64, 8);
+
+        let dialog_ptr = 0x200000u32;
+        let bounds = (10, 10, 30, 30);
+        let snapshot_width = (bounds.3 - bounds.1 + TrapDispatcher::DBOX_FRAME_MARGIN * 2) as usize;
+        let snapshot_height =
+            (bounds.2 - bounds.0 + TrapDispatcher::DBOX_FRAME_MARGIN * 2) as usize;
+        let items = vec![
+            DialogItem {
+                item_type: 0,
+                rect: (2, 2, 8, 8),
+                proc_ptr: 0x300000,
+                ..Default::default()
+            },
+            DialogItem {
+                item_type: 0,
+                rect: (10, 2, 16, 16),
+                proc_ptr: 0x300000,
+                ..Default::default()
+            },
+        ];
+        disp.front_window = dialog_ptr;
+        disp.dialog_items.insert(dialog_ptr, items.clone());
+        bus.write_byte(dialog_ptr + 110, 0xFF);
+        disp.dialog_tracking = Some(crate::trap::dispatch::DialogTrackingState {
+            dialog_ptr,
+            bounds,
+            title: String::new(),
+            proc_id: 1,
+            items,
+            default_item: 0,
+            cancel_item: 0,
+            edit_text: String::new(),
+            edit_item: 0,
+            saved_pixels: Default::default(),
+            stack_ptr: TEST_SP,
+            item_hit_ptr: 0,
+            rendered_pixels: vec![0x00; snapshot_width * snapshot_height].into(),
+            flash_remaining: 0,
+            flash_delay: 0,
+            flash_item: 0,
+            edit_text_modified: false,
+            draw_proc_queue: VecDeque::from([(0x300000, 2)]),
+            draw_procs_done: false,
+            rendered_pixels_final: false,
+            filter_presentation_epoch: None,
+            filter_proc: 0,
+            game_managed: false,
+            last_filter_event: None,
+            popup_draws: Vec::new(),
+            active_popup: None,
+            active_button: None,
+            active_user_item: None,
+        });
+
+        // The first userItem draws a picture.
+        bus.write_byte(screen_base + 13 * 64 + 13, 0x44);
+        disp.refresh_visible_dialog_snapshot_after_bulk_port_draw(
+            &bus,
+            dialog_ptr,
+            (12, 12, 18, 18),
+        );
+        let tracking = disp.dialog_tracking.as_ref().unwrap();
+        assert!(
+            !tracking.rendered_pixels_final,
+            "a picture drawn by one userItem must not finalize the snapshot while later userItems are queued"
+        );
+        let bulk_index = (13 - bounds.0 + TrapDispatcher::DBOX_FRAME_MARGIN) as usize
+            * snapshot_width
+            + (13 - bounds.1 + TrapDispatcher::DBOX_FRAME_MARGIN) as usize;
+        assert_eq!(tracking.rendered_pixels[bulk_index], 0x44);
+
+        // The second userItem draws its popup frame, then the pass finishes.
+        let popup_probe = screen_base + 20 * 64 + 14;
+        bus.write_byte(popup_probe, 0xFF);
+        disp.dialog_tracking.as_mut().unwrap().draw_proc_queue.clear();
+        disp.finalize_dialog_draw_procs_if_idle(&mut bus);
+        let tracking = disp.dialog_tracking.as_ref().unwrap();
+        assert!(tracking.draw_procs_done);
+        assert!(tracking.rendered_pixels_final);
+        let popup_index = (20 - bounds.0 + TrapDispatcher::DBOX_FRAME_MARGIN) as usize
+            * snapshot_width
+            + (14 - bounds.1 + TrapDispatcher::DBOX_FRAME_MARGIN) as usize;
+        assert_eq!(
+            tracking.rendered_pixels[popup_index], 0xFF,
+            "the final snapshot must include every userItem's output"
+        );
     }
 
     #[test]
@@ -18164,6 +18300,155 @@
     }
 
     #[test]
+    fn teupdate_erases_redrawn_line_strip_but_not_space_below_text() {
+        // Apple TextEdit.a: TEUpdate -> Refresh -> DoDraw runs DoErase on
+        // each line it redraws (ChkBounds widens the line rect to
+        // UnboundLeft..UnboundRight; StdEntry clips to viewRect), so stale
+        // glyphs from previous text never show through. The area below the
+        // last line is not erased (IM I-387). Expert Backgammon erases only
+        // below TEGetPoint(teLength) and relies on this to replace its
+        // status line.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        let te_handle = make_te_with_text(&mut disp, &mut bus, b"HI");
+        // setup_with_port's 1-bit port bitmap.
+        let screen_base = bus.read_long(0x181000 + 2);
+        let row_bytes = u32::from(bus.read_word(0x181000 + 6) & 0x3FFF);
+        // Old pixels everywhere inside the 160-pixel-wide viewRect.
+        for row in 0..60 {
+            for byte in 0..20 {
+                bus.write_byte(screen_base + row * row_bytes + byte, 0xFF);
+            }
+        }
+
+        bus.write_long(TEST_SP, te_handle);
+        let rect_ptr = bus.alloc(8);
+        bus.write_word(rect_ptr, 0);
+        bus.write_word(rect_ptr + 2, 0);
+        bus.write_word(rect_ptr + 4, 60);
+        bus.write_word(rect_ptr + 6, 160);
+        bus.write_long(TEST_SP + 4, rect_ptr);
+
+        let result = disp.dispatch_dialog(true, 0x1D3, &mut cpu, &mut bus);
+        assert!(result.unwrap().is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+
+        // Right of "HI" on the first line: erased to the white background.
+        for row in 1..8 {
+            for byte in 10..20 {
+                assert_eq!(
+                    bus.read_byte(screen_base + row * row_bytes + byte),
+                    0,
+                    "line strip row {row} byte {byte} should be erased"
+                );
+            }
+        }
+        // The glyphs themselves are drawn after the erase.
+        let drew_glyph = (0..8).any(|row| {
+            (0..3).any(|byte| bus.read_byte(screen_base + row * row_bytes + byte) != 0)
+        });
+        assert!(drew_glyph, "TEUpdate should redraw the text after erasing");
+        // Below the only line: untouched.
+        for row in 40..60 {
+            for byte in 0..20 {
+                assert_eq!(
+                    bus.read_byte(screen_base + row * row_bytes + byte),
+                    0xFF,
+                    "row {row} byte {byte} below the text must not be erased"
+                );
+            }
+        }
+    }
+
+    /// Fill setup_with_port's 1-bit port with black inside the 160x60 TE
+    /// viewRect, run TEUpdate over that rect, and return (base, rowBytes).
+    fn teupdate_over_black_view(
+        disp: &mut TrapDispatcher,
+        cpu: &mut MockCpu,
+        bus: &mut MacMemoryBus,
+        te_handle: u32,
+    ) -> (u32, u32) {
+        let screen_base = bus.read_long(0x181000 + 2);
+        let row_bytes = u32::from(bus.read_word(0x181000 + 6) & 0x3FFF);
+        for row in 0..60 {
+            for byte in 0..20 {
+                bus.write_byte(screen_base + row * row_bytes + byte, 0xFF);
+            }
+        }
+        bus.write_long(TEST_SP, te_handle);
+        let rect_ptr = bus.alloc(8);
+        bus.write_word(rect_ptr, 0);
+        bus.write_word(rect_ptr + 2, 0);
+        bus.write_word(rect_ptr + 4, 60);
+        bus.write_word(rect_ptr + 6, 160);
+        bus.write_long(TEST_SP + 4, rect_ptr);
+        let result = disp.dispatch_dialog(true, 0x1D3, cpu, bus);
+        assert!(result.unwrap().is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+        (screen_base, row_bytes)
+    }
+
+    #[test]
+    fn teupdate_empty_record_erases_nothing() {
+        // TextEdit.a PrepLine: DoDraw leaves its line loop before DoErase
+        // when there are no characters to draw. Gold Digger's empty order-form
+        // fields overlap labels drawn underneath them.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        let te_handle = make_te_with_text(&mut disp, &mut bus, b"");
+        let (base, row_bytes) =
+            teupdate_over_black_view(&mut disp, &mut cpu, &mut bus, te_handle);
+        for row in 0..60 {
+            for byte in 0..20 {
+                assert_eq!(
+                    bus.read_byte(base + row * row_bytes + byte),
+                    0xFF,
+                    "row {row} byte {byte} must not be erased for an empty record"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn teupdate_leaves_erase_to_a_replacement_rect_proc() {
+        // DoErase's EraseRect goes through grafProcs.rectProc (IM:I I-197).
+        // Warlords II installs one so its marble backdrop survives TEUpdate.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        let te_handle = make_te_with_text(&mut disp, &mut bus, b"HI");
+        let procs = bus.alloc(52);
+        bus.write_long(procs + 8, 0x0020_0000);
+        bus.write_long(0x181000 + 104, procs);
+        let (base, row_bytes) =
+            teupdate_over_black_view(&mut disp, &mut cpu, &mut bus, te_handle);
+        for row in 1..8 {
+            for byte in 10..20 {
+                assert_eq!(
+                    bus.read_byte(base + row * row_bytes + byte),
+                    0xFF,
+                    "row {row} byte {byte} belongs to the custom rectProc"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn teupdate_standard_rect_proc_still_erases_line_strip() {
+        // SetStdProcs fills rectProc with the StdRect gateway: the standard
+        // bottleneck, so TEUpdate erases as usual.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        let te_handle = make_te_with_text(&mut disp, &mut bus, b"HI");
+        let procs = bus.alloc(52);
+        let std_rect = bus.get_or_create_system_trap_gateway(0xA8A0);
+        bus.write_long(procs + 8, std_rect);
+        bus.write_long(0x181000 + 104, procs);
+        let (base, row_bytes) =
+            teupdate_over_black_view(&mut disp, &mut cpu, &mut bus, te_handle);
+        for row in 1..8 {
+            for byte in 10..20 {
+                assert_eq!(bus.read_byte(base + row * row_bytes + byte), 0);
+            }
+        }
+    }
+
+    #[test]
     fn teupdate_systemless_theme_routes_active_caret_through_provider() {
         let (mut classic, mut classic_cpu, mut classic_bus) = setup_with_port();
         let classic_te_handle = make_te_with_text(&mut classic, &mut classic_bus, b"");
@@ -18213,6 +18498,40 @@
             screen_pixel_is_set(&themed_bus, screen_base, row_bytes, 0, 0),
             "systemless-default TEUpdate should draw provider-owned caret chrome"
         );
+    }
+
+    #[test]
+    fn textedit_draws_unstyled_text_in_its_own_port_foreground_colour() {
+        // Apple TextEdit.a StyleTrap selects teGrafPort before drawing, so an
+        // unstyled record uses that port's colours. Gold Digger scrolls its
+        // order form while a backdrop port with a white foreground is
+        // current; the text must not inherit that white.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        disp.set_screen_mode_for_test(bus.read_long(0x0824), 64, 512, 342, 1);
+        let te_handle = make_te_with_text(&mut disp, &mut bus, b"Name");
+        let te_port = 0x181000;
+        disp.set_current_port_state(&mut bus, &mut cpu, te_port, None);
+        disp.fg_color = (0, 0, 0);
+        let other_port = bus.alloc(108);
+        for offset in 0..108 {
+            let byte = bus.read_byte(te_port + offset);
+            bus.write_byte(other_port + offset, byte);
+        }
+        disp.set_current_port_state(&mut bus, &mut cpu, other_port, None);
+        disp.fg_color = (0xFFFF, 0xFFFF, 0xFFFF);
+        let (base, row_bytes, _, _, _) = disp.screen_mode;
+        for offset in 0..row_bytes * 80 {
+            bus.write_byte(base + offset, 0);
+        }
+
+        disp.draw_te_contents(&mut cpu, &mut bus, te_handle, true);
+
+        assert!(
+            count_set_pixels(&bus, base, row_bytes, 0, 0, 160, 60) > 0,
+            "unstyled text must draw in the record port's black foreground"
+        );
+        assert_eq!(*disp.current_port, other_port);
+        assert_eq!(disp.fg_color, (0xFFFF, 0xFFFF, 0xFFFF));
     }
 
     #[test]
@@ -18281,6 +18600,111 @@
             bus.write_word(te_ptr + TrapDispatcher::TE_CARET_STATE_OFFSET, 0);
             disp.draw_te_contents(&mut cpu, &mut bus, te_handle, true);
             assert!((0..row_bytes * 60).all(|offset| bus.read_byte(base + offset) == 0));
+        }
+    }
+
+    #[test]
+    fn textedit_glyphs_are_clipped_to_the_view_rectangle() {
+        // Apple TextEdit.a StyleTrap intersects the port clip with viewRect
+        // for every call. Gold Digger's partly visible last line drew its
+        // glyphs below the view, over the window frame.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        disp.set_screen_mode_for_test(bus.read_long(0x0824), 64, 512, 342, 1);
+        let te_handle = make_te_with_text(&mut disp, &mut bus, b"Wgjpqy Wgjpqy");
+        let te_ptr = bus.read_long(te_handle);
+        TrapDispatcher::te_write_rect_words(
+            &mut bus,
+            te_ptr + TrapDispatcher::TE_DEST_RECT_OFFSET,
+            (20, 20, 60, 160),
+        );
+        let (base, row_bytes, _, _, _) = disp.screen_mode;
+        let draw = |disp: &mut TrapDispatcher,
+                    cpu: &mut MockCpu,
+                    bus: &mut MacMemoryBus,
+                    view: (i16, i16, i16, i16)| {
+            TrapDispatcher::te_write_rect_words(
+                bus,
+                te_ptr + TrapDispatcher::TE_VIEW_RECT_OFFSET,
+                view,
+            );
+            for offset in 0..row_bytes * 80 {
+                bus.write_byte(base + offset, 0);
+            }
+            disp.draw_te_contents(cpu, bus, te_handle, true);
+            let mut inside = 0;
+            let mut outside = 0;
+            for y in 0..70 {
+                for x in 0..170 {
+                    if screen_pixel_is_set(bus, base, row_bytes, x, y) {
+                        if y >= view.0 && y < view.2 && x >= view.1 && x < view.3 {
+                            inside += 1;
+                        } else {
+                            outside += 1;
+                        }
+                    }
+                }
+            }
+            (inside, outside)
+        };
+
+        // With a generous view the descenders reach rows the short view
+        // excludes, so the short view must lose exactly those pixels.
+        let (full, _) = draw(&mut disp, &mut cpu, &mut bus, (20, 20, 60, 160));
+        let line_height =
+            bus.read_word(te_ptr + TrapDispatcher::TE_LINE_HEIGHT_OFFSET) as i16;
+        let ascent = bus.read_word(te_ptr + TrapDispatcher::TE_FONT_ASCENT_OFFSET) as i16;
+        assert!(line_height > ascent + 1);
+        let short = (20, 20, 20 + ascent + 1, 160);
+        let (inside, outside) = draw(&mut disp, &mut cpu, &mut bus, short);
+        assert!(inside > 0 && inside < full, "inside={inside} full={full}");
+        assert_eq!(outside, 0, "glyph pixels outside viewRect");
+        assert_eq!(bus.read_long(0x181000 + 28), 0x182300, "caller's clipRgn restored");
+    }
+
+    #[test]
+    fn textedit_selection_highlight_stays_inside_short_view_rectangle() {
+        // Apple TextEdit.a StyleTrap clips every TextEdit call to viewRect.
+        // Fungus selects "10" in a 15-pixel field whose line is 17 pixels
+        // tall; typing over it erases only the view, so a highlight painted
+        // below the view stayed on screen as a black bar.
+        for theme in [UiThemeId::ClassicSystem7, UiThemeId::SystemlessDefault] {
+            let (mut disp, mut cpu, mut bus) = setup_with_port();
+            disp.set_screen_mode_for_test(bus.read_long(0x0824), 64, 512, 342, 1);
+            disp.set_ui_theme_id(theme);
+            let te_handle = make_te_with_text(&mut disp, &mut bus, b"10");
+            let te_ptr = bus.read_long(te_handle);
+            let view = (20, 20, 35, 100);
+            TrapDispatcher::te_write_rect_words(
+                &mut bus,
+                te_ptr + TrapDispatcher::TE_DEST_RECT_OFFSET,
+                (20, 19, 35, 120),
+            );
+            TrapDispatcher::te_write_rect_words(
+                &mut bus,
+                te_ptr + TrapDispatcher::TE_VIEW_RECT_OFFSET,
+                view,
+            );
+            bus.write_word(te_ptr + TrapDispatcher::TE_LINE_HEIGHT_OFFSET, 18);
+            let (base, row_bytes, _, _, _) = disp.screen_mode;
+            for offset in 0..row_bytes * 80 {
+                bus.write_byte(base + offset, 0);
+            }
+            bus.write_word(te_ptr + TrapDispatcher::TE_ACTIVE_OFFSET, 1);
+            bus.write_word(te_ptr + TrapDispatcher::TE_SEL_START_OFFSET, 0);
+            bus.write_word(te_ptr + TrapDispatcher::TE_SEL_END_OFFSET, 2);
+            disp.draw_te_contents(&mut cpu, &mut bus, te_handle, true);
+            let mut visible_pixels = 0;
+            for y in 0..60 {
+                for x in 0..140 {
+                    let set = screen_pixel_is_set(&bus, base, row_bytes, x, y);
+                    if y >= view.0 && y < view.2 && x >= view.1 && x < view.3 {
+                        visible_pixels += usize::from(set);
+                    } else {
+                        assert!(!set, "{theme:?}: highlight outside view at ({x},{y})");
+                    }
+                }
+            }
+            assert!(visible_pixels > 0, "{theme:?}: selection must be highlighted");
         }
     }
 
@@ -20768,6 +21192,41 @@
         assert_eq!((runs[1].start, runs[1].style.color), (4, (0, 0xFFFF, 0)));
         assert_eq!((runs[2].start, runs[2].style.color), (9, (0, 0, 0)));
         assert_eq!(runs[1].style.face, 1);
+    }
+
+    /// Apple TextEdit.a iTEGetPoint returns teSelRect.bottom, the bottom of
+    /// the offset's line, and pins offsets at or past teLength to the line of
+    /// the last character. Gold Digger rules its order form under each line
+    /// from this point; the baseline put the rules through the text.
+    #[test]
+    fn te_get_point_returns_line_bottom_not_baseline() {
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        let te = make_te_with_text(&mut disp, &mut bus, b"one\rtwo\rthree");
+        let ptr = bus.read_long(te);
+        let top = bus.read_word(ptr + TrapDispatcher::TE_DEST_RECT_OFFSET) as i16;
+        let line_height = bus.read_word(ptr + TrapDispatcher::TE_LINE_HEIGHT_OFFSET) as i16;
+        assert!(line_height > 0);
+
+        let get_point = |disp: &mut TrapDispatcher,
+                         cpu: &mut MockCpu,
+                         bus: &mut MacMemoryBus,
+                         offset: i16| {
+            cpu.write_reg(Register::A7, TEST_SP);
+            bus.write_word(TEST_SP, 0x0008);
+            bus.write_long(TEST_SP + 2, te);
+            bus.write_word(TEST_SP + 6, offset as u16);
+            assert!(disp.dispatch_dialog(true, 0x03D, cpu, bus).unwrap().is_ok());
+            assert_eq!(cpu.read_reg(Register::A7), TEST_SP + 8);
+            bus.read_word(TEST_SP + 8) as i16
+        };
+
+        assert_eq!(get_point(&mut disp, &mut cpu, &mut bus, 0), top + line_height);
+        assert_eq!(get_point(&mut disp, &mut cpu, &mut bus, 5), top + 2 * line_height);
+        assert_eq!(get_point(&mut disp, &mut cpu, &mut bus, 13), top + 3 * line_height);
+        assert_eq!(get_point(&mut disp, &mut cpu, &mut bus, 500), top + 3 * line_height);
+
+        disp.te_set_text_contents(&mut bus, te, b"one\r");
+        assert_eq!(get_point(&mut disp, &mut cpu, &mut bus, 4), top + line_height);
     }
 
     /// Spin Doctor sizes its alerts with TEGetHeight(0, 32767, hTE). The ROM's

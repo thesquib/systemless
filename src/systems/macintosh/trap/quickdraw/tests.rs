@@ -4009,6 +4009,64 @@
         assert_eq!(bus.read_word(port_ptr + 18) as i16, 20); // left
     }
 
+    #[test]
+    fn set_origin_offsets_complex_vis_region_rows_with_its_bounds() {
+        // IM:I I-166: SetOrigin offsets visRgn into the new coordinate
+        // system. A visRgn with a hole (a window partly covered by another)
+        // must move its scanline data, not only its bounding box, or clipping
+        // drifts away from the covered area. THINK Class Library calls
+        // SetOrigin for every pane it draws.
+        let (mut d, mut cpu, mut bus) = setup_with_port();
+        let port_ptr = 0x181000u32;
+        let vis = make_complex_rgn(
+            &mut bus,
+            (0, 0, 40, 60),
+            &[
+                0,
+                0,
+                60,
+                super::REGION_STOP,
+                10,
+                20,
+                30,
+                super::REGION_STOP,
+                20,
+                20,
+                30,
+                super::REGION_STOP,
+                40,
+                0,
+                60,
+                super::REGION_STOP,
+                super::REGION_STOP,
+            ],
+        );
+        bus.write_long(port_ptr + 24, vis);
+        assert!(
+            !TrapDispatcher::region_contains_point(&bus, vis, 15, 25),
+            "precondition: the hole is at (10,20)-(20,30)"
+        );
+
+        bus.write_word(TEST_SP, 10u16); // v
+        bus.write_word(TEST_SP + 2, 20u16); // h
+        let result = d.dispatch_quickdraw(true, 0x078, &mut cpu, &mut bus);
+
+        assert!(result.unwrap().is_ok());
+        assert_eq!(
+            TrapDispatcher::region_bbox(&bus, vis),
+            Some((10, 20, 50, 80)),
+            "SetOrigin should offset the visRgn bounding box"
+        );
+        assert!(
+            !TrapDispatcher::region_contains_point(&bus, vis, 25, 45),
+            "the hole must move with the bounding box"
+        );
+        assert!(
+            TrapDispatcher::region_contains_point(&bus, vis, 15, 25),
+            "the hole's old position is visible after the offset"
+        );
+    }
+
     // ==================== Clipping ====================
 
     #[test]
@@ -11019,6 +11077,85 @@
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 0, 1), 9);
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 1, 1), 8);
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 2, 1), 7);
+        assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 3, 1), 8);
+    }
+
+    #[test]
+    fn fillcrect_raw_pixpat_respects_complex_vis_region_holes() {
+        // IM:I I-149: every drawing operation is clipped to visRgn and
+        // clipRgn, not to their bounding boxes. A window partly covered by a
+        // dialog has a visRgn with a hole; THINK Class Library fills pane
+        // backgrounds with FillCRect and a 'ppat', which painted into the hole.
+        let (mut d, mut cpu, mut bus) = setup();
+        let row_bytes = 64u32;
+        let screen_base = bus.alloc(row_bytes * 64);
+        bus.fill_zeros(screen_base, row_bytes * 64);
+        d.screen_mode = (screen_base, row_bytes, 64, 64, 8);
+        d.device_clut.replace([[0, 0, 0]; 256]);
+        d.device_clut.set_entry(7, [0x1111, 0x0000, 0x0000]);
+        d.device_clut.set_entry(8, [0x0000, 0x2222, 0x0000]);
+        d.device_clut.set_entry(9, [0x0000, 0x0000, 0x3333]);
+        d.color_manager_clut.replace(*d.device_clut);
+
+        let port = bus.alloc(128);
+        let pixmap_handle = bus.alloc(4);
+        let pixmap = bus.alloc(50);
+        bus.write_long(pixmap_handle, pixmap);
+        bus.write_long(port + 2, pixmap_handle);
+        bus.write_word(port + 6, 0xC000);
+        bus.write_long(pixmap, screen_base);
+        bus.write_word(pixmap + 4, 0x8000 | row_bytes as u16);
+        bus.write_word(pixmap + 6, 0);
+        bus.write_word(pixmap + 8, 0);
+        bus.write_word(pixmap + 10, 64);
+        bus.write_word(pixmap + 12, 64);
+        bus.write_word(pixmap + 32, 8);
+
+        // visRgn: row 0 spans [0, 4); row 1 spans [0, 1) and [3, 4), leaving
+        // a hole at x 1..3 where another window covers this one.
+        let vis_handle = bus.alloc(4);
+        let rows = vec![vec![0, 4], vec![0, 1, 3, 4]];
+        assert!(TrapDispatcher::write_region_from_rows(&mut bus, vis_handle, 0, &rows));
+        bus.write_long(port + 24, vis_handle);
+
+        let clip = bus.alloc(10);
+        bus.write_word(clip, 10);
+        bus.write_word(clip + 6, 64);
+        bus.write_word(clip + 8, 64);
+        let clip_handle = bus.alloc(4);
+        bus.write_long(clip_handle, clip);
+        bus.write_long(port + 28, clip_handle);
+
+        d
+            .current_port
+            .with_mut(|current_port| *current_port = port);
+        let globals_ptr = bus.read_long(cpu.read_reg(Register::A5));
+        bus.write_long(globals_ptr, port);
+
+        let rect_ptr = bus.alloc(8);
+        write_rect(&mut bus, rect_ptr, 0, 0, 2, 4);
+        let pp_handle = make_raw_color_pixpat_handle(&mut bus);
+
+        bus.write_long(TEST_SP, pp_handle);
+        bus.write_long(TEST_SP + 4, rect_ptr);
+        let result = d.dispatch_quickdraw(true, 0x20E, &mut cpu, &mut bus);
+        assert!(result.unwrap().is_ok());
+
+        assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 0, 0), 7);
+        assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 1, 0), 8);
+        assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 2, 0), 9);
+        assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 3, 0), 8);
+        assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 0, 1), 9);
+        assert_eq!(
+            read_surface_pixel(&bus, screen_base, row_bytes, 1, 1),
+            0,
+            "pixels in the visRgn hole must stay untouched"
+        );
+        assert_eq!(
+            read_surface_pixel(&bus, screen_base, row_bytes, 2, 1),
+            0,
+            "pixels in the visRgn hole must stay untouched"
+        );
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 3, 1), 8);
     }
 
@@ -23815,6 +23952,101 @@ fn copy_bits_converts_between_direct_color_depths() {
         assert_eq!(info.bounds_left, -64);
         assert_eq!(info.bounds_bottom, 411);
         assert_eq!(info.bounds_right, 576);
+    }
+
+    #[test]
+    fn resolve_copy_bitmap_dereferences_a_native_process_window_pixmap() {
+        // A PowerPC process carves window ports and their PixMaps from its
+        // native heap without classic allocation records. A 68K CDEF it
+        // calls still passes `&thePort->portBits` to CopyBits (WarCraft II).
+        let (d, _cpu, mut bus) = setup();
+        let heap_base = bus.alloc(0x200);
+        let pm_handle = heap_base;
+        let pm_ptr = heap_base + 0x10;
+        let port = heap_base + 0x80;
+        let pix_base = bus.alloc(640 * 480);
+        bus.write_long(pm_handle, pm_ptr);
+        write_pixmap_8(&mut bus, pm_ptr, pix_base, 640, 480, 0);
+        bus.write_long(port + 2, pm_handle);
+        bus.write_word(port + 6, 0xC000);
+        assert_eq!(d.resolve_copy_bitmap(&bus, port + 2).base, u32::MAX);
+
+        let heap = |heap_cursor| crate::process_context::ProcessNativeHeapState {
+            heap_base,
+            heap_cursor,
+            heap_limit: heap_base + 0x200,
+            last_mem_error: 0,
+            heap_maximized: false,
+            master_pointer_blocks_requested: 0,
+        };
+        // The PixMap must lie inside the allocated part of the native heap.
+        d.process_memory_manager()
+            .borrow_mut()
+            .publish_native_allocator(heap(heap_base + 0x20), &[], &[], &[]);
+        assert_eq!(d.resolve_copy_bitmap(&bus, port + 2).base, u32::MAX);
+
+        d.process_memory_manager()
+            .borrow_mut()
+            .publish_native_allocator(heap(heap_base + 0x100), &[], &[], &[]);
+        let info = d.resolve_copy_bitmap(&bus, port + 2);
+        assert_eq!(info.base, pix_base);
+        assert_eq!(info.row_bytes, 640);
+        assert_eq!(info.bounds_bottom, 480);
+        assert_eq!(info.bounds_right, 640);
+        assert_eq!(info.pixel_size, 8);
+
+        // A BitMap-shaped record (rowBytes bit 15 clear) is not a PixMap.
+        bus.write_word(pm_ptr + 4, 640);
+        assert_eq!(d.resolve_copy_bitmap(&bus, port + 2).base, u32::MAX);
+    }
+
+    #[test]
+    fn get_aux_ctl_gives_a_native_process_control_an_aux_record() {
+        // WarCraft II's 68K tab CDEF calls GetAuxCtl on controls the PowerPC
+        // application created in its native heap, and reads acCTable from
+        // the handle it gets back.
+        let (mut d, mut cpu, mut bus) = setup();
+        let heap_base = bus.alloc(0x200);
+        let ctrl_handle = heap_base;
+        let ctrl_ptr = heap_base + 0x10;
+        bus.write_long(ctrl_handle, ctrl_ptr);
+        let aux_out = bus.alloc(4);
+        let get_aux_ctl = |d: &mut TrapDispatcher,
+                           cpu: &mut super::super::test_helpers::MockCpu,
+                           bus: &mut MacMemoryBus| {
+            let sp = 0x300100;
+            cpu.write_reg(Register::A7, sp);
+            bus.write_long(sp, aux_out);
+            bus.write_long(sp + 4, ctrl_handle);
+            bus.write_word(sp + 8, 0xFFFF);
+            assert!(d.dispatch_quickdraw(true, 0x244, cpu, bus).unwrap().is_ok());
+            (bus.read_long(aux_out), bus.read_word(sp + 8))
+        };
+
+        // Outside any native heap the handle is unknown: NIL and FALSE.
+        assert_eq!(get_aux_ctl(&mut d, &mut cpu, &mut bus), (0, 0));
+
+        d.process_memory_manager().borrow_mut().publish_native_allocator(
+            crate::process_context::ProcessNativeHeapState {
+                heap_base,
+                heap_cursor: heap_base + 0x100,
+                heap_limit: heap_base + 0x200,
+                last_mem_error: 0,
+                heap_maximized: false,
+                master_pointer_blocks_requested: 0,
+            },
+            &[],
+            &[],
+            &[],
+        );
+        let (aux_handle, result) = get_aux_ctl(&mut d, &mut cpu, &mut bus);
+        assert_ne!(aux_handle, 0);
+        assert_eq!(result, 0x0100);
+        let aux_ptr = bus.read_long(aux_handle);
+        assert_eq!(bus.read_long(aux_ptr + 4), ctrl_handle, "acOwner");
+        assert_ne!(bus.read_long(aux_ptr + 8), 0, "acCTable");
+        // Later calls return the same record.
+        assert_eq!(get_aux_ctl(&mut d, &mut cpu, &mut bus), (aux_handle, 0x0100));
     }
 
     #[test]
