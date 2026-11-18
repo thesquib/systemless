@@ -1303,19 +1303,12 @@ impl super::TrapDispatcher {
                 // Per IM:I I-166, SetOrigin offsets visRgn but NOT clipRgn.
                 // "the pen and clipRgn 'stick' to the coordinate system"
                 // visRgn is at port offset 24; clipRgn at 28 is left unchanged.
+                // A non-rectangular visRgn (a window partly covered by another)
+                // must have its scanline data offset too, not just its
+                // bounding box, or clipping drifts away from the covered area.
                 let vis_handle = bus.read_long(port_ptr + 24);
                 if vis_handle != 0 {
-                    let vis_ptr = bus.read_long(vis_handle);
-                    if vis_ptr != 0 {
-                        let rt = bus.read_word(vis_ptr + 2) as i16;
-                        let rl = bus.read_word(vis_ptr + 4) as i16;
-                        let rb = bus.read_word(vis_ptr + 6) as i16;
-                        let rr = bus.read_word(vis_ptr + 8) as i16;
-                        bus.write_word(vis_ptr + 2, rt.wrapping_add(dv) as u16);
-                        bus.write_word(vis_ptr + 4, rl.wrapping_add(dh) as u16);
-                        bus.write_word(vis_ptr + 6, rb.wrapping_add(dv) as u16);
-                        bus.write_word(vis_ptr + 8, rr.wrapping_add(dh) as u16);
-                    }
+                    Self::offset_region(bus, vis_handle, dh, dv);
                 }
                 Ok(())
             }
@@ -13674,10 +13667,18 @@ impl super::TrapDispatcher {
                 let sp = cpu.read_reg(Register::A7);
                 let ctrl_handle = bus.read_long(sp + 4);
                 let aux_ptr = bus.read_long(sp);
-                let aux_handle = self
-                    .control_aux_state(ctrl_handle)
-                    .map(|state| state.handle)
-                    .unwrap_or(0);
+                let aux_handle = match self.control_aux_state(ctrl_handle) {
+                    Some(state) => state.handle,
+                    // A native (PowerPC) process creates its controls in its
+                    // own heap, so they were never tracked here. A 68K CDEF
+                    // it calls through Mixed Mode still asks for their
+                    // AuxCtlRec (WarCraft II's tab and button CDEFs) and
+                    // must see one, as for any System 7 control.
+                    None if self.is_native_process_control(bus, ctrl_handle) => {
+                        self.ensure_control_aux_record(bus, ctrl_handle)
+                    }
+                    None => 0,
+                };
                 if aux_ptr != 0 {
                     bus.write_long(aux_ptr, aux_handle);
                 }
@@ -18557,7 +18558,67 @@ impl super::TrapDispatcher {
         if pm_ptr == 0 || bus.get_alloc_size(pm_ptr).is_none() {
             return None;
         }
-        Some(CachedCopyBitmapInfo {
+        Some(Self::copy_bitmap_from_pixmap_fields(bus, pm_ptr))
+    }
+
+    /// A color port owned by a native (PowerPC) process keeps its PixMap in
+    /// the process Memory Manager's native heap, which the classic allocator
+    /// does not track. Classic code the process calls through Mixed Mode,
+    /// such as a 68K CDEF passing `&thePort->portBits` to CopyBits, still
+    /// names that port. Imaging With QuickDraw (1994), pp. 4-10--4-12 and
+    /// 3-112--3-113: CopyBits dereferences a cGrafPort's portPixMap.
+    fn native_process_pixmap_info(
+        &self,
+        bus: &MacMemoryBus,
+        pm_handle: u32,
+    ) -> Option<CachedCopyBitmapInfo> {
+        // A PixMap record is 50 bytes. Inside Macintosh: Imaging With
+        // QuickDraw (1994), p. 4-46.
+        const PIXMAP_RECORD_SIZE: u32 = 50;
+        if pm_handle == 0 || !Self::guest_range_in_ram(bus, pm_handle, 4) {
+            return None;
+        }
+        let pm_ptr = bus.read_long(pm_handle);
+        if pm_ptr == 0 || !Self::guest_range_in_ram(bus, pm_ptr, PIXMAP_RECORD_SIZE) {
+            return None;
+        }
+        let memory_manager = self.process_memory_manager();
+        let memory_manager = memory_manager.borrow();
+        if !memory_manager.native_heap_contains(pm_handle, 4)
+            || !memory_manager.native_heap_contains(pm_ptr, PIXMAP_RECORD_SIZE)
+        {
+            return None;
+        }
+        let info = Self::copy_bitmap_from_pixmap_fields(bus, pm_ptr);
+        // rowBytes bit 15 marks a PixMap rather than a BitMap.
+        let is_pixmap = bus.read_word(pm_ptr + 4) & 0x8000 != 0
+            && matches!(info.pixel_size, 1 | 2 | 4 | 8 | 16 | 32)
+            && info.base != 0
+            && info.row_bytes != 0;
+        is_pixmap.then_some(info)
+    }
+
+    /// Whether `ctrl_handle` names a control record a native (PowerPC)
+    /// process built in its own heap. Such controls carry no classic
+    /// allocation records, so only the heap bounds identify them.
+    fn is_native_process_control(&self, bus: &MacMemoryBus, ctrl_handle: u32) -> bool {
+        // The fixed part of a ControlRecord ends at contrlTitle (offset 40).
+        const CONTROL_RECORD_HEADER_SIZE: u32 = 40;
+        if ctrl_handle == 0 || !Self::guest_range_in_ram(bus, ctrl_handle, 4) {
+            return false;
+        }
+        let ctrl_ptr = bus.read_long(ctrl_handle);
+        if ctrl_ptr == 0 || !Self::guest_range_in_ram(bus, ctrl_ptr, CONTROL_RECORD_HEADER_SIZE) {
+            return false;
+        }
+        let memory_manager = self.process_memory_manager();
+        let memory_manager = memory_manager.borrow();
+        memory_manager.native_heap_contains(ctrl_handle, 4)
+            && memory_manager.native_heap_contains(ctrl_ptr, CONTROL_RECORD_HEADER_SIZE)
+    }
+
+    fn copy_bitmap_from_pixmap_fields(bus: &MacMemoryBus, pm_ptr: u32) -> CachedCopyBitmapInfo {
+        CachedCopyBitmapInfo {
             base: Self::offscreen_pixmap_base_ptr(bus, pm_ptr),
             row_bytes: (bus.read_word(pm_ptr + 4) & 0x3FFF) as u32,
             bounds_top: bus.read_word(pm_ptr + 6) as i16,
@@ -18566,7 +18627,7 @@ impl super::TrapDispatcher {
             bounds_right: bus.read_word(pm_ptr + 12) as i16,
             pixel_size: bus.read_word(pm_ptr + 32) as u32,
             ctab_handle: bus.read_long(pm_ptr + 42),
-        })
+        }
     }
 
     fn cache_portbits_pixmap_handle(&mut self, bus: &MacMemoryBus, bits_ptr: u32, pm_handle: u32) {
@@ -20495,7 +20556,7 @@ impl super::TrapDispatcher {
         !Self::looks_like_68k_entry_point(bus, port)
     }
 
-    fn guest_range_in_ram(bus: &MacMemoryBus, addr: u32, len: u32) -> bool {
+    pub(super) fn guest_range_in_ram(bus: &MacMemoryBus, addr: u32, len: u32) -> bool {
         addr.checked_add(len)
             .is_some_and(|end| end <= bus.ram_size())
     }
@@ -22192,8 +22253,9 @@ impl super::TrapDispatcher {
         if (raw_word & 0xC000) == 0xC000 {
             let pm_handle = normalize_base(bus.read_long(bits_ptr));
             let direct_pm_ptr = Self::pixmap_ptr_from_handle(bus, pm_handle);
-            let direct_info =
-                direct_pm_ptr.and_then(|pm_ptr| Self::cached_copy_bitmap_from_pixmap(bus, pm_ptr));
+            let direct_info = direct_pm_ptr
+                .and_then(|pm_ptr| Self::cached_copy_bitmap_from_pixmap(bus, pm_ptr))
+                .or_else(|| self.native_process_pixmap_info(bus, pm_handle));
             let cached_info = self.disposed_gworld_portbits.get(&bits_ptr).copied();
             let resolved_info = direct_info.or(cached_info);
             let Some(info) = resolved_info else {
@@ -23001,7 +23063,7 @@ impl super::TrapDispatcher {
         Some(new_ptr)
     }
 
-    fn write_region(
+    pub(super) fn write_region(
         bus: &mut MacMemoryBus,
         rgn_handle: u32,
         bbox: Option<(i16, i16, i16, i16)>,
@@ -25593,12 +25655,60 @@ impl super::TrapDispatcher {
             self.ensure_dialog_background_saved_for_screen_port(bus, port);
         }
 
+        // The bounding boxes above only trim the fill. A non-rectangular
+        // visRgn or clipRgn (for example a window partly covered by a dialog)
+        // also has to mask individual pixels, as QuickDraw clips every drawing
+        // operation to visRgn and clipRgn. Inside Macintosh Volume I, I-149.
+        let (vis_rgn_handle, clip_rgn_handle) = if skips_region_clip {
+            (0, 0)
+        } else {
+            (
+                bus.read_long(port.wrapping_add(24)),
+                bus.read_long(port.wrapping_add(28)),
+            )
+        };
+        let vis_region_complex = vis_rgn_handle != 0 && Self::region_is_complex(bus, vis_rgn_handle);
+        let clip_region_complex =
+            clip_rgn_handle != 0 && Self::region_is_complex(bus, clip_rgn_handle);
+        let vis_region_cache = if vis_region_complex {
+            Self::build_region_membership_cache(bus, vis_rgn_handle, top, bottom)
+        } else {
+            None
+        };
+        let clip_region_cache = if clip_region_complex {
+            Self::build_region_membership_cache(bus, clip_rgn_handle, top, bottom)
+        } else {
+            None
+        };
+
         for y in top..bottom {
             let dy = (y - bounds_top) as u32;
             let tile_y = i32::from(y).rem_euclid(src_height) as u32;
             for x in left..right {
                 let dx = (x - bounds_left) as u32;
                 if dx >= dst_row_bytes {
+                    continue;
+                }
+                if vis_region_complex
+                    && !Self::region_contains_point_cached(
+                        bus,
+                        vis_rgn_handle,
+                        vis_region_cache.as_ref(),
+                        y,
+                        x,
+                    )
+                {
+                    continue;
+                }
+                if clip_region_complex
+                    && !Self::region_contains_point_cached(
+                        bus,
+                        clip_rgn_handle,
+                        clip_region_cache.as_ref(),
+                        y,
+                        x,
+                    )
+                {
                     continue;
                 }
                 let tile_x = i32::from(x).rem_euclid(src_width) as u32;
