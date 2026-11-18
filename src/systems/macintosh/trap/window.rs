@@ -49,6 +49,10 @@ impl super::TrapDispatcher {
     const USER_WINDOW_KIND: u16 = 8;
     const WINDOW_KIND_OFFSET: u32 = 108;
     const WINDOW_VISIBLE_OFFSET: u32 = 110;
+    /// Pascal TRUE as the Window Manager stores it in wVisible. ShowWindow
+    /// pushes #1 for ShowHide ("set boolean WVISIBLE to $01, not $FF",
+    /// WindowMgr.a, 28-Oct-85), and apps such as Moria compare it with 1.
+    const WINDOW_VISIBLE_TRUE: u8 = 0x01;
     pub(super) const WINDOW_HILITED_OFFSET: u32 = 111;
     const WINDOW_GO_AWAY_FLAG_OFFSET: u32 = 112;
     const WINDOW_SPARE_FLAG_OFFSET: u32 = 113;
@@ -2813,7 +2817,7 @@ impl super::TrapDispatcher {
         );
         bus.write_byte(
             window_ptr + Self::WINDOW_VISIBLE_OFFSET,
-            if visible { 0xFF } else { 0x00 },
+            if visible { Self::WINDOW_VISIBLE_TRUE } else { 0x00 },
         );
         bus.write_byte(window_ptr + Self::WINDOW_HILITED_OFFSET, 0);
         bus.write_byte(
@@ -3205,8 +3209,9 @@ impl super::TrapDispatcher {
         // parameter is applied. If that parameter moves it behind existing
         // windows, its freshly drawn pixels have clobbered the windows that
         // remain in front. Add the overlap to each affected window's update
-        // region so its application can repaint the exposed content.
-        if let Some(rect) = covered_rect {
+        // region so its application can repaint the exposed content. A window
+        // created hidden drew nothing, so it clobbered nothing.
+        if let Some(rect) = covered_rect.filter(|_| self.window_visible(bus, window_ptr)) {
             let windows = self.window_list.to_vec();
             for &window in &windows {
                 if window == window_ptr {
@@ -3438,8 +3443,12 @@ impl super::TrapDispatcher {
             bus.write_byte(closed_window + Self::WINDOW_HILITED_OFFSET, 0x00);
         }
 
+        // Only a visible window can become the active window. When every
+        // remaining window is hidden (for example a THINK Class Library
+        // clipboard window), nothing is highlighted or activated
+        // (Inside Macintosh Volume I, I-283 and I-286).
         let new_front = self.front_window;
-        if new_front != 0 {
+        if self.window_visible(bus, new_front) {
             bus.write_byte(new_front + Self::WINDOW_HILITED_OFFSET, 0xFF);
             self.queue_window_activation_event(bus, new_front, true);
             self.draw_single_window_chrome_inline(bus, new_front, true);
@@ -4719,7 +4728,10 @@ impl super::TrapDispatcher {
                     // The Window Manager derives its content region from the
                     // current port rectangle when revealing it (IM:I I-284, I-289).
                     self.resync_window_geometry_from_port_rect(bus, the_window);
-                    bus.write_byte(the_window + Self::WINDOW_VISIBLE_OFFSET, 0xFF);
+                    bus.write_byte(
+                        the_window + Self::WINDOW_VISIBLE_OFFSET,
+                        Self::WINDOW_VISIBLE_TRUE,
+                    );
                     self.set_window_vis_from_content(bus, the_window, true);
                     if !was_visible {
                         self.save_window_under_pixels(bus, the_window);
@@ -5673,7 +5685,10 @@ impl super::TrapDispatcher {
                 let sp = cpu.read_reg(Register::A7);
                 // Byte predecrement through A7 reserves two bytes but writes at
                 // the new A7 address. The second byte is unused stack padding.
-                let show_flag = bus.read_byte(sp) != 0;
+                // The ROM stores this byte verbatim in wVisible, and only
+                // its low bit decides the state (WindowMgr.a ShowHide).
+                let show_byte = bus.read_byte(sp);
+                let show_flag = show_byte & 1 != 0;
                 let the_window = bus.read_long(sp + 2);
                 if std::env::var_os("SYSTEMLESS_TRACE_INVAL").is_some() {
                     eprintln!(
@@ -5699,10 +5714,10 @@ impl super::TrapDispatcher {
                     } else {
                         Vec::new()
                     };
-                    bus.write_byte(
-                        the_window + Self::WINDOW_VISIBLE_OFFSET,
-                        if show_flag { 0xFF } else { 0x00 },
-                    );
+                    let visible_byte = bus.read_byte(the_window + Self::WINDOW_VISIBLE_OFFSET);
+                    if (visible_byte ^ show_byte) & 1 != 0 {
+                        bus.write_byte(the_window + Self::WINDOW_VISIBLE_OFFSET, show_byte);
+                    }
                     self.set_window_vis_from_content(bus, the_window, show_flag);
                     if show_flag {
                         if !was_visible {

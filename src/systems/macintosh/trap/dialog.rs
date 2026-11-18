@@ -133,6 +133,9 @@ enum TeRepaint {
     Full,
     CaretLine,
     FromOffset(usize),
+    /// TEUpdate: redraw every line, erasing the full-width strip of each
+    /// line that meets the update rectangle (top, left, bottom, right).
+    Update((i16, i16, i16, i16)),
 }
 
 fn trace_dialog_procs_enabled() -> bool {
@@ -3048,6 +3051,30 @@ impl super::TrapDispatcher {
         base != 0 && row_bytes != 0 && top < bottom && left < right
     }
 
+    /// Whether `port` replaces the standard rectangle bottleneck.
+    ///
+    /// grafProcs is the last field of GrafPort and CGrafPort (offset 104) and
+    /// rectProc is its third slot (offset 8); NIL or the StdRect gateway that
+    /// SetStdProcs/SetStdCProcs install means the standard proc (IM:I
+    /// I-197--I-198; IM:V V-77).
+    fn port_has_custom_rect_proc(bus: &MacMemoryBus, port: u32) -> bool {
+        if port == 0 || !Self::guest_range_in_ram(bus, port, 108) {
+            return false;
+        }
+        let graf_procs = bus.read_long(port + 104);
+        if graf_procs == 0 || !Self::guest_range_in_ram(bus, graf_procs, 12) {
+            return false;
+        }
+        let rect_proc = bus.read_long(graf_procs + 8);
+        let custom = rect_proc != 0 && bus.system_trap_gateway(0xA8A0) != Some(rect_proc);
+        if trace_textedit_enabled() {
+            eprintln!(
+                "[TE] TEUpdate port=${port:08X} grafProcs=${graf_procs:08X} rectProc=${rect_proc:08X} custom={custom}"
+            );
+        }
+        custom
+    }
+
     fn draw_te_contents(
         &mut self,
         cpu: &mut impl CpuOps,
@@ -3082,18 +3109,6 @@ impl super::TrapDispatcher {
         // Imaging With QuickDraw (1994), pp. 2-9--2-10.
         let (port_top, port_left) = self.port_bounds_top_left(bus, te_port);
         let just = bus.read_word(te_ptr + Self::TE_JUST_OFFSET) as i16;
-        let (font, face, size, color, _, _) = self.te_primary_style(bus, te_handle);
-        let styled_runs = if Self::te_is_styled_record(bus, te_ptr) {
-            self.te_style_runs(bus, te_handle, text_bytes.len())
-        } else {
-            Vec::new()
-        };
-        let uses_styled_runs = !styled_runs.is_empty() && Self::te_is_styled_record(bus, te_ptr);
-        let old_font = self.tx_font;
-        let old_face = self.tx_face;
-        let old_size = self.tx_size;
-        let old_fg = self.fg_color;
-        let old_loc = self.pn_loc;
         let previous_port = *self.current_port;
         let previous_gdevice = *self.current_gdevice;
         let switched_port = te_port != 0 && te_port != previous_port;
@@ -3107,6 +3122,24 @@ impl super::TrapDispatcher {
         if te_port != 0 {
             self.set_current_port_state(bus, cpu, te_port, None);
         }
+        // StdEntry selects teGrafPort before drawing, so an unstyled record
+        // draws in that port's foreground colour, never the caller's. Read
+        // the style, and the state restored below, only after the switch.
+        // Apple TextEdit.a, StyleTrap: `Move.L teGrafPort(A3),-(SP)`;
+        // `_SetPort`.
+        let (font, face, size, color, _, _) = self.te_primary_style(bus, te_handle);
+        let styled_runs = if Self::te_is_styled_record(bus, te_ptr) {
+            self.te_style_runs(bus, te_handle, text_bytes.len())
+        } else {
+            Vec::new()
+        };
+        let uses_styled_runs = !styled_runs.is_empty() && Self::te_is_styled_record(bus, te_ptr);
+        let old_font = self.tx_font;
+        let old_face = self.tx_face;
+        let old_size = self.tx_size;
+        let old_fg = self.fg_color;
+        let old_loc = self.pn_loc;
+        let saved_clip = self.te_install_view_clip(bus, te_port, view_rect);
         if trace_textedit_enabled() {
             let (vis_top, vis_left, vis_bottom, vis_right) = {
                 let vis_handle = bus.read_long(*self.current_port + 24);
@@ -3304,6 +3337,50 @@ impl super::TrapDispatcher {
                 ShapeOp::Erase,
             );
         }
+        if let TeRepaint::Update(update_rect) = repaint {
+            // TEUpdate -> Refresh -> DoDraw erases each line it redraws
+            // before drawing it (DoErase on teSelRect, which ChkBounds widens
+            // to UnboundLeft..UnboundRight); StdEntry clips the drawing to
+            // viewRect. PrepLine stops before DoErase when the line holds no
+            // characters, so an empty record erases nothing, and space below
+            // the last line is left alone: "TEUpdate does not erase the
+            // update rectangle" (IM I-387). Apple TextEdit.a,
+            // DoDraw/PrepLine/xDoErase/ChkBounds.
+            //
+            // That EraseRect runs through the port's grafProcs.rectProc; a
+            // replacement proc owns the erase, so leave it alone. All strips
+            // are erased before any line is drawn so a glyph that overhangs
+            // its line keeps its pixels in the next line's strip.
+            if !Self::port_has_custom_rect_proc(bus, te_port) {
+                let mut line_top = dest_rect.0;
+                for (index, &(start, end)) in lines.iter().enumerate() {
+                    let line_bottom =
+                        line_top.saturating_add(Self::te_height_for_line(bus, te_handle, index));
+                    if start < end && line_bottom > update_rect.0 && line_top < update_rect.2 {
+                        if let Some((top, left, bottom, right)) = Self::rect_intersection(
+                            (line_top, view_rect.1, line_bottom, view_rect.3),
+                            view_rect,
+                        ) {
+                            self.draw_rect(
+                                cpu,
+                                bus,
+                                &Rect {
+                                    top,
+                                    left,
+                                    bottom,
+                                    right,
+                                },
+                                ShapeOp::Erase,
+                            );
+                        }
+                    }
+                    if line_top >= view_rect.2 {
+                        break;
+                    }
+                    line_top = line_bottom;
+                }
+            }
+        }
         let mut top = dest_rect.0;
         let mut visible_lines = Vec::new();
         let mut visual_lines = Vec::new();
@@ -3480,16 +3557,28 @@ impl super::TrapDispatcher {
                     // still draw at destRect.left + TE_LINE_LEFT_INSET.
                     selection_left = selection_left.saturating_sub(Self::TE_LINE_LEFT_INSET);
                 }
+                // StdEntry clips every TextEdit call to viewRect (and the
+                // port's clipRgn), so a line taller than the view never
+                // highlights past it. Painting outside viewRect leaves pixels
+                // that the next viewRect-clipped erase cannot remove. Apple
+                // TextEdit.a, StyleTrap: `Pea teViewRect(A3); _ClipRect;
+                // _SectRgn`.
+                let Some((top, left, bottom, right)) = Self::rect_intersection(
+                    (line_top, selection_left, line_bottom, selection_right),
+                    view_rect,
+                ) else {
+                    continue;
+                };
                 if self.ui_theme_id() == UiThemeId::ClassicSystem7 {
                     if te_active {
                         self.draw_rect(
                             cpu,
                             bus,
                             &Rect {
-                                top: line_top,
-                                left: selection_left,
-                                bottom: line_bottom,
-                                right: selection_right,
+                                top,
+                                left,
+                                bottom,
+                                right,
                             },
                             ShapeOp::Invert,
                         );
@@ -3500,10 +3589,10 @@ impl super::TrapDispatcher {
                     // while active ranges keep normal highlighted selection chrome.
                     self.draw_theme_text_selection(
                         bus,
-                        line_top.wrapping_sub(port_top),
-                        selection_left.wrapping_sub(port_left),
-                        line_bottom.wrapping_sub(port_top),
-                        selection_right.wrapping_sub(port_left),
+                        top.wrapping_sub(port_top),
+                        left.wrapping_sub(port_left),
+                        bottom.wrapping_sub(port_top),
+                        right.wrapping_sub(port_left),
                         te_active,
                     );
                 }
@@ -3536,9 +3625,57 @@ impl super::TrapDispatcher {
             );
         }
 
+        if let Some(clip) = saved_clip {
+            bus.write_long(te_port + 28, clip);
+        }
         if switched_port {
             self.set_current_port_state(bus, cpu, previous_port, Some(previous_gdevice));
         }
+    }
+
+    /// StdEntry saves the port's clipRgn, clips to viewRect and intersects
+    /// that with the saved clip, so nothing a TextEdit call draws lands
+    /// outside the view; the caller's clip is restored on exit. Returns the
+    /// clipRgn handle to put back. Apple TextEdit.a, StyleTrap/StdExit2.
+    fn te_install_view_clip(
+        &mut self,
+        bus: &mut MacMemoryBus,
+        te_port: u32,
+        view_rect: (i16, i16, i16, i16),
+    ) -> Option<u32> {
+        if te_port == 0 {
+            return None;
+        }
+        let clip = bus.read_long(te_port + 28);
+        if clip == 0 || bus.read_long(clip) == 0 {
+            return None;
+        }
+        let (view_rgn, sect_rgn) = match self.te_view_clip_regions {
+            Some(regions) => regions,
+            None => {
+                let view_rgn = Self::allocate_handle_with_data(bus, 10);
+                let sect_rgn = Self::allocate_handle_with_data(bus, 10);
+                if view_rgn == 0 || sect_rgn == 0 {
+                    return None;
+                }
+                self.te_view_clip_regions = Some((view_rgn, sect_rgn));
+                (view_rgn, sect_rgn)
+            }
+        };
+        let view = (view_rect.0 < view_rect.2 && view_rect.1 < view_rect.3).then_some(view_rect);
+        if !Self::write_region(bus, view_rgn, view, &[])
+            || !Self::write_region_boolean_op(
+                bus,
+                sect_rgn,
+                clip,
+                view_rgn,
+                crate::quickdraw::raster::region_rows::RegionBooleanOp::Intersection,
+            )
+        {
+            return None;
+        }
+        bus.write_long(te_port + 28, sect_rgn);
+        Some(clip)
     }
 
     fn te_feature_bit(&self, te_handle: u32, feature: u16) -> bool {
@@ -6217,7 +6354,7 @@ impl super::TrapDispatcher {
         // items. DrawDialog must still render those items (MTE 1992, 6-142).
         if !skip_pictures && !user_item_backups.is_empty() {
             for item in items {
-                if item.is_picture() && item.resource_id != 0 {
+                if item.is_picture() {
                     self.draw_dialog_picture_item(bus, bounds, item, dialog_ptr);
                 }
             }
@@ -6908,7 +7045,7 @@ impl super::TrapDispatcher {
                 DIALOG_ITEM_PICTURE => {
                     // Items reaching here overlap the dialog rect (the
                     // fully-outside clip happens above the match).
-                    if !skip_pictures && item.resource_id != 0 {
+                    if !skip_pictures {
                         self.draw_dialog_picture_item(bus, bounds, item, dialog_ptr);
                     }
                 }
@@ -7679,8 +7816,13 @@ impl super::TrapDispatcher {
                 // not necessarily its final output, so leave the snapshot
                 // stale until ModalDialog resumes and captures the completed
                 // callback. Macintosh Toolbox Essentials (1992), pp. 6-135,
-                // 6-142.
-                tracking.rendered_pixels_final = !filter_capture_pending;
+                // 6-142. The same holds for the update pass that calls each
+                // userItem procedure in turn: a picture drawn by an early
+                // item must not finalize the snapshot while later items are
+                // still queued, or the next frame restores it over their
+                // output. Inside Macintosh Volume I, I-405.
+                tracking.rendered_pixels_final =
+                    !filter_capture_pending && tracking.draw_procs_done;
             }
         }
     }
@@ -15136,10 +15278,26 @@ impl super::TrapDispatcher {
                                 .get(line_index)
                                 .copied()
                                 .unwrap_or(0);
-                            let (top, x) = self.te_char_to_point(bus, te_handle, clamped);
-                            let y = top.saturating_add(Self::te_ascent_for_line(
-                                bus, te_handle, line_index,
-                            ));
+                            let (_, x) = self.te_char_to_point(bus, te_handle, clamped);
+                            // iTEGetPoint returns teSelRect.bottom, the bottom
+                            // of the line rectangle LineRect builds, not the
+                            // baseline. An offset at or past teLength uses
+                            // the line holding the last character (GetLine on
+                            // teLength - 1), so a trailing CR stays on its
+                            // own line. Apple TextEdit.a, iTEGetPoint.
+                            let point_line = if text_len > 0 && clamped == text_len as usize {
+                                Self::te_char_to_line_index(bus, te_handle, clamped - 1)
+                            } else {
+                                line_index
+                            };
+                            let dest_top = Self::te_read_rect(
+                                bus,
+                                te_ptr + Self::TE_DEST_RECT_OFFSET,
+                            )
+                            .0;
+                            let y = (0..=point_line).fold(dest_top, |y, line| {
+                                y.saturating_add(Self::te_height_for_line(bus, te_handle, line))
+                            });
                             if trace_textedit_enabled() {
                                 let starts = Self::te_line_starts(bus, te_handle);
                                 let pc = cpu.read_reg(Register::PC);
@@ -16034,7 +16192,15 @@ impl super::TrapDispatcher {
                             view_rect.3
                         );
                     }
-                    self.draw_te_contents(cpu, bus, te_handle, false);
+                    let update_rect_ptr = bus.read_long(sp + 4);
+                    let update_rect = Self::te_read_rect(bus, update_rect_ptr);
+                    self.draw_te_contents_region(
+                        cpu,
+                        bus,
+                        te_handle,
+                        false,
+                        TeRepaint::Update(update_rect),
+                    );
                     let te_port = bus.read_long(te_ptr + Self::TE_IN_PORT_OFFSET);
                     self.refresh_visible_dialog_snapshot_for_port(bus, te_port);
                 }

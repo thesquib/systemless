@@ -3210,7 +3210,7 @@ fn ppc_new_alert_dialog(
             *last_resource_error = PPC_RES_NOT_FOUND_ERR;
             return 0;
         };
-        let alert = &vfs_resources[alert_index].data;
+        let alert = &ppc_vfs_resource_current_bytes(memory, &vfs_resources[alert_index]);
         if alert.len() < 12 {
             *last_resource_error = PPC_PARAM_ERR;
             return 0;
@@ -3398,7 +3398,10 @@ fn ppc_get_new_dialog(
         *last_resource_error = PPC_RES_NOT_FOUND_ERR;
         return 0;
     };
-    let Some(template) = ppc_parse_dialog_template(&vfs_resources[dlog_index].data) else {
+    // Applications commonly centre an already-loaded 'DLOG' before calling
+    // GetNewDialog (Five Stones offsets its registration dialog's rect).
+    let dlog_bytes = ppc_vfs_resource_current_bytes(memory, &vfs_resources[dlog_index]);
+    let Some(template) = ppc_parse_dialog_template(&dlog_bytes) else {
         *last_resource_error = PPC_PARAM_ERR;
         return 0;
     };
@@ -5195,7 +5198,25 @@ fn ppc_draw_dialog_items(
     let default_item = memory
         .read_u16_be(dialog.wrapping_add(DIALOG_DEFAULT_ITEM_OFFSET))
         .unwrap_or(1) as usize;
-    for (index, item) in items.iter().enumerate() {
+    // Control items are Control Manager controls. DITL controls are created in
+    // item order and NewControl prepends each to the window's control list,
+    // so DrawControls draws them in reverse item order with the earliest
+    // control frontmost. Draw the other items first, then the controls in
+    // that order, as the classic Dialog Manager does. Inside Macintosh
+    // Volume I (1985), pp. I-319 and I-322; Macintosh Toolbox Essentials
+    // (1992), pp. 5-87--5-88.
+    let is_control = |item: &PpcDialogItemView| {
+        matches!(
+            dialog_item_base_type(item.item_type),
+            DIALOG_ITEM_BUTTON..=DIALOG_ITEM_RESOURCE_CONTROL
+        )
+    };
+    let draw_order = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !is_control(item))
+        .chain(items.iter().enumerate().rev().filter(|(_, item)| is_control(item)));
+    for (index, item) in draw_order {
         if text_handle.is_some_and(|handle| {
             item.handle != handle
                 || !matches!(
